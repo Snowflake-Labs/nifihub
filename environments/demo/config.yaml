@@ -1,0 +1,82 @@
+# yaml-language-server: $schema=../schema.json
+# Declarative environment configuration — demo for Postgres CDC
+account:
+  name: demo
+  github_environment: demo
+
+deployments:
+  - name: NIFIHUB_DEMO_DEPLOYMENT
+    deployment_type: SNOWFLAKE
+    display_name: "NiFi Hub Demo Deployment"
+    comment: "Demo deployment for Postgres CDC"
+    runtimes:
+      - name: MY_POSTGRES_RUNTIME
+        database: OPENFLOW
+        schema: OPENFLOW
+        node_type: MEDIUM
+        min_nodes: 1
+        max_nodes: 1
+        suspend: false
+        execute_as_role: OPENFLOW_RUNTIME_ROLE
+        display_name: "My Postgres Runtime"
+        comment: "Example runtime for Postgres CDC"
+        sensitive_param_pattern: ".*PASSWORD.*|.*SECRET.*|.*_PWD"
+        network_rules:
+          - name: GITHUB_API
+            type: HOST_PORT
+            mode: EGRESS
+            values:
+              - "api.github.com:443"
+          - name: POSTGRES
+            type: HOST_PORT
+            mode: EGRESS
+            values:
+              - "risg2zyhxreknjsaavwurs6szi.sfsehol-summit-26-de225-wmhtyx.us-west-2.aws.postgres.snowflake.app:5432"
+        flow_registries:
+          - name: nifihub
+            type: org.apache.nifi.github.GitHubFlowRegistryClient
+            properties:
+              Repository Owner: srgarman2
+              Repository Name: nifihub
+              Authentication Type: PERSONAL_ACCESS_TOKEN
+              Personal Access Token: ${{ secrets.NIFIHUB_REGISTRY_PAT }}
+              Default Branch: main
+              Repository Path: flows
+        flows:
+          - name: "CDC Postgres Demo - Data Generator"
+            registry: nifihub
+            bucket: data-generator
+            flow: postgres-cdc-demo
+            version: latest
+            start: false
+            assets:
+              - name: "postgresql-42.7.10.jar"
+                url: "https://jdbc.postgresql.org/download/postgresql-42.7.10.jar"
+                parameter: "Database Driver"
+            provided_parameter_contexts: ".*POSTGRES"
+            parameters:
+              Database Connection URL: "#{POSTGRES_URL}" # coming from Snowflake Secrets Parameter Provider
+              Database Name: "postgres"
+              Database User: "snowflake_admin"
+              Database Password: "#{POSTGRES_PWD}" # coming from Snowflake Secrets Parameter Provider
+              Schema Name: "demo_postgres"
+        connectors:
+          - name: MY_POSTGRES_CONNECTOR
+            definition: OPENFLOW_POSTGRES_CDC
+            display_name: "My Postgres CDC Connector"
+            comment: "CDC from Postgres to Snowflake"
+            start: false
+            assets:
+              - name: "postgresql-42.7.10.jar"
+                url: "https://jdbc.postgresql.org/download/postgresql-42.7.10.jar"
+                parameter: "Source Database Driver"
+            parameters:
+              Source Database Publication Name: "demo_publication"
+              Source Database Connection URL: "jdbc:postgresql://risg2zyhxreknjsaavwurs6szi.sfsehol-summit-26-de225-wmhtyx.us-west-2.aws.postgres.snowflake.app:5432/postgres?sslmode=require"
+              Source Database User: "snowflake_admin"
+              Source Database Password: "DEMO_DATABASE.POSTGRES.POSTGRES_PWD"
+              Included Comma Separated Source Table Names: "demo_postgres.customers,demo_postgres.orders,demo_postgres.order_items"
+              Snowflake Destination Database: "DEMO_DATABASE"
+              Snowflake Warehouse: "DEFAULT_WH"
+              Table Storage Format: "STANDARD"
+              Object Identifier Resolution: "CASE_INSENSITIVE"
