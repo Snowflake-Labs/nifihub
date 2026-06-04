@@ -21,6 +21,8 @@ import re
 
 import yaml
 
+from manage_parameters import resolve_value
+
 
 _SECRET_RE = re.compile(r'^\$\{\{\s*secrets\.')
 _UUID_RE = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', re.IGNORECASE)
@@ -282,6 +284,24 @@ def diff_connectors(live_connectors, desired_connectors):
         desired_start = desired_c.get("start", False)
         if live_running != desired_start:
             changes["start"] = {"live": live_running, "desired": desired_start}
+
+        # Compare connector parameters
+        live_params = live_c.get("parameters", {})
+        desired_params = desired_c.get("parameters", {})
+        param_changes = {}
+        for param_name, desired_val in (desired_params or {}).items():
+            if not desired_val and desired_val != 0:
+                continue
+            try:
+                resolved = resolve_value(desired_val)
+            except Exception:
+                resolved = desired_val
+            live_val = live_params.get(param_name, "")
+            if _norm(live_val) != _norm(resolved):
+                param_changes[param_name] = {"live": live_val, "desired": desired_val}
+        if param_changes:
+            changes["parameters"] = param_changes
+
         if changes:
             modified.append({"name": desired_c["name"], "changes": changes, "live": live_c, "desired": desired_c})
 

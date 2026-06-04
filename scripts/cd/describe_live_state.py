@@ -22,6 +22,29 @@ import yaml
 
 from validate_pr import snow_sql
 from describe_nifi_state import describe_nifi_state
+from manage_connectors import get_connector_config
+
+
+def _extract_connector_params(config_json):
+    """Extract parameter values from a connector config.json into a flat dict.
+
+    Returns {param_name: value} where value is:
+    - The raw string for STRING_LITERAL parameters
+    - The fully qualified secret name for SECRET_REFERENCE parameters
+    ASSET_REFERENCE parameters are skipped (managed via assets, not parameters).
+    """
+    if not config_json:
+        return {}
+    params = {}
+    for section in config_json.get("configuration", []):
+        for prop_name, prop_obj in section.get("properties", {}).items():
+            vtype = prop_obj.get("valueType", "STRING_LITERAL")
+            if vtype == "STRING_LITERAL":
+                params[prop_name] = prop_obj.get("value", "") or ""
+            elif vtype == "SECRET_REFERENCE":
+                params[prop_name] = prop_obj.get("fullyQualifiedSecretName", "") or ""
+            # ASSET_REFERENCE: skip — assets are compared separately
+    return params
 
 
 def _conn():
@@ -225,12 +248,22 @@ def build_live_state(config_path, conn):
             ]
 
             for c in rt_connectors:
+                c_name = _get(c, "name")
+                c_database = _get(c, "database_name") or rt_db
+                c_schema = _get(c, "schema_name") or rt_schema
+                live_params = {}
+                try:
+                    config_json = get_connector_config(c_name, c_database, c_schema, **conn)
+                    live_params = _extract_connector_params(config_json)
+                except Exception as e:
+                    print(f"[live] Could not fetch config for connector {c_name}: {e}", file=sys.stderr)
                 rt_entry["connectors"].append({
-                    "name": _get(c, "name"),
+                    "name": c_name,
                     "definition": _get(c, "connector_definition") or "",
                     "status": _get(c, "status") or "UNKNOWN",
                     "display_name": _get(c, "display_name") or "",
                     "comment": _get(c, "comment") or "",
+                    "parameters": live_params,
                 })
 
             rt_cfg_match = next(

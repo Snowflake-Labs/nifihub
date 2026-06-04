@@ -153,8 +153,19 @@ def format_runtimes_section(rt_info):
         if conn_changes.get("modified"):
             lines.append("**Connectors to modify:**")
             for c_mod in conn_changes["modified"]:
-                changes_str = ", ".join(f"{k}: {v['live']}→{v['desired']}" for k, v in c_mod.get("changes", {}).items())
-                lines.append(f"- :pencil2: `{c_mod['name']}`: {changes_str}")
+                name = c_mod["name"]
+                changes = c_mod.get("changes", {})
+                field_changes = {k: v for k, v in changes.items() if k != "parameters"}
+                param_changes = changes.get("parameters", {})
+                parts = [f"{k}: `{v['desired']}`" for k, v in field_changes.items()]
+                if param_changes:
+                    parts.append(f"{len(param_changes)} parameter(s) changed")
+                lines.append(f"- :pencil2: `{name}`: {', '.join(parts) if parts else 'changes detected'}")
+                if param_changes:
+                    lines.append("  | Parameter | Desired |")
+                    lines.append("  |---|---|")
+                    for p_name, p_vals in param_changes.items():
+                        lines.append(f"  | `{p_name}` | `{p_vals['desired']}` |")
             lines.append("")
         if conn_changes.get("deleted"):
             lines.append("**Connectors to delete:**")
