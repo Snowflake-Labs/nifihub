@@ -55,7 +55,7 @@
 
         <!-- NiFi versions -->
         <nifi.version>2.9.0</nifi.version>
-        <nifi-api.version>2.8.0</nifi-api.version>
+        <nifi-api.version>2.9.0</nifi-api.version>
         <nifi.nar.maven.plugin.version>2.3.0</nifi.nar.maven.plugin.version>
 
         <!-- Logging -->
