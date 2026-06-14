@@ -219,7 +219,7 @@ jobs:
 
       - name: Upload Coverage to Codecov
         if: always()
-        uses: codecov/codecov-action@v6
+        uses: codecov/codecov-action@v7
         with:
           flags: ${{ hashFiles(format('{0}/pom.xml', matrix.bundle)) }}
           directory: ${{ matrix.bundle }}
