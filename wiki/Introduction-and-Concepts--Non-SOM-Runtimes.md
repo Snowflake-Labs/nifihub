@@ -79,7 +79,7 @@ runtimes:
 | `type` | Yes | Authentication type. Currently only `username_password` is supported. |
 | `username` | Yes | NiFi username. Supports `${{ vars.NAME }}` syntax. |
 | `password` | Yes | NiFi password. Supports `${{ secrets.NAME }}` syntax. |
-| `verify_ssl` | No | Set `false` to disable SSL verification (local dev only). Default: `true`. |
+| `verify_ssl` | No | SSL verification mode. `true` (default) — verify against system CA store. `false` — disable verification (local dev / self-signed certs only). String path — path to a custom CA bundle (e.g. `/path/to/ca-bundle.crt`). Never set `false` in production. |
 
 ---
 

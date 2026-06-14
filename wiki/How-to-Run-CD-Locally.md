@@ -251,8 +251,25 @@ The credentials are **never hardcoded** in `config.yaml`. They are referenced vi
 
 ## Troubleshooting
 
+**SSL verification (`verify_ssl`):**
+
+| Value | Behavior |
+|---|---|
+| `true` (default) | Verify certificate against the system CA store |
+| `false` | Disable SSL verification — use only for local dev with self-signed certs |
+| `"/path/to/ca-bundle.crt"` | Verify against a custom CA certificate bundle (e.g. internal PKI) |
+
+Example with a custom CA bundle:
+```yaml
+nifi_auth:
+  type: username_password
+  username: ${{ vars.NIFI_USERNAME }}
+  password: ${{ secrets.NIFI_PASSWORD }}
+  verify_ssl: "/etc/ssl/certs/my-company-ca.crt"
+```
+
 **SSL certificate error (`CERTIFICATE_VERIFY_FAILED`)**
-Add `verify_ssl: false` to the `nifi_auth` block. Only use this for local development with self-signed certificates.
+Add `verify_ssl: false` to the `nifi_auth` block. Only use this for local development with self-signed certificates. For production NiFi instances with a custom CA, use `verify_ssl: "/path/to/ca-bundle.crt"` instead.
 
 **Connection refused**
 Verify NiFi is running: `docker logs local-nifi | tail -20`. Check that the port matches the `url` field.

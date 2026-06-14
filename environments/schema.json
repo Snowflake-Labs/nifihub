@@ -104,9 +104,7 @@
               "description": "NiFi password. Supports ${{ secrets.NAME }} syntax to reference GitHub Environment secrets."
             },
             "verify_ssl": {
-              "type": "boolean",
-              "default": true,
-              "description": "Whether to verify SSL certificates. Set to false for local instances with self-signed certificates or plain HTTP. Never disable in production."
+              "description": "SSL verification for the NiFi HTTPS endpoint. Accepts three values: true (default — verify against system CA store), false (disable verification, local dev only), or a string path to a custom CA certificate bundle (e.g. '/path/to/ca-bundle.crt'). Never disable in production."
             }
           }
         },
