@@ -184,11 +184,37 @@ def fetch_auto_provisioned_provider(sensitive_pattern=".*"):
 def delete_parameter_providers(pp_specs, runtime_url, nifi_pat, nifi_auth=None):
     configure_nifi(runtime_url, pat=nifi_pat, nifi_auth=nifi_auth)
     api = nipyapi.nifi.ParameterProvidersApi()
+    pc_api = nipyapi.nifi.ParameterContextsApi()
     for pp_spec in pp_specs:
         name = pp_spec["name"]
         pp = find_parameter_provider(name)
         if not pp:
             print(f"[pp] '{name}' not found, skipping delete")
             continue
+        # NiFi refuses to delete a provider that is still referenced by
+        # parameter contexts. Remove the provider from all contexts first.
+        try:
+            all_contexts = pc_api.get_parameter_contexts()
+            for ctx in (all_contexts.parameter_contexts or []):
+                ctx_detail = pc_api.get_parameter_context(id=ctx.id)
+                ref = ctx_detail.component.parameter_provider_configuration
+                if ref and ref.parameter_provider_id == pp.id:
+                    # Disassociate by clearing the provider reference
+                    from nipyapi.nifi.models import ParameterContextEntity, ParameterContextDTO
+                    updated = ParameterContextEntity(
+                        id=ctx.id,
+                        revision=ctx_detail.revision,
+                        component=ParameterContextDTO(
+                            id=ctx.id,
+                            name=ctx_detail.component.name,
+                            parameters=ctx_detail.component.parameters or [],
+                            inherited_parameter_contexts=ctx_detail.component.inherited_parameter_contexts or [],
+                            parameter_provider_configuration=None,
+                        ),
+                    )
+                    pc_api.update_parameter_context(id=ctx.id, body=updated)
+                    print(f"[pp] Removed provider ref from context '{ctx_detail.component.name}'")
+        except Exception as e:
+            print(f"[pp] Warning: could not remove provider refs for '{name}': {e}")
         api.remove_parameter_provider(pp.id, version=str(pp.revision.version))
         print(f"[pp] Deleted '{name}'")
