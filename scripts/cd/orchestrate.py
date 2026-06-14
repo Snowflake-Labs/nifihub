@@ -502,9 +502,9 @@ def apply_deployment_modifications(modified_deps, conn, errors):
                 _delete_connectors(rt.get("connectors", []), rt["database"], rt["schema"], conn)
                 runtime_url = _runtime_url(rt, conn)
                 if runtime_url:
+                    _delete_flows(rt.get("flows", []), rt, runtime_url)
                     _delete_parameter_providers(rt.get("parameter_providers", []), runtime_url)
                     _delete_controller_services(rt.get("controller_services", []), runtime_url)
-                    _delete_flows(rt.get("flows", []), rt, runtime_url)
                 if _has_som_api(rt):
                     delete_runtime(rt["name"], rt["database"], rt["schema"], **conn)
                     delete_runtime_eai(
@@ -577,6 +577,10 @@ def apply_runtime_modification(mod, conn):
     _reconcile_flows(rt, runtime_url, provider_context_names=pp_context_names)
     _reconcile_connectors(rt, conn)
 
+    flow_changes = mod.get("flow_changes", {})
+    if flow_changes.get("deleted"):
+        _delete_flows(flow_changes["deleted"], rt, runtime_url)
+
     pp_changes = mod.get("parameter_provider_changes", {})
     if pp_changes.get("deleted"):
         _delete_parameter_providers(pp_changes["deleted"], runtime_url)
@@ -584,10 +588,6 @@ def apply_runtime_modification(mod, conn):
     cs_changes = mod.get("controller_service_changes", {})
     if cs_changes.get("deleted"):
         _delete_controller_services(cs_changes["deleted"], runtime_url)
-
-    flow_changes = mod.get("flow_changes", {})
-    if flow_changes.get("deleted"):
-        _delete_flows(flow_changes["deleted"], rt, runtime_url)
 
     connector_changes = mod.get("connector_changes", {})
     if connector_changes.get("deleted"):
