@@ -68,6 +68,9 @@ NiFi Hub uses a **GitOps** model for managing Openflow infrastructure. The `envi
 | Network Rules & EAIs | Created automatically from YAML entries to allow runtime egress access |
 | Openflow Runtimes | Created with EAI bindings; polled until ACTIVE |
 | Flow Registry Clients | Git-based clients configured via NiFi REST API |
+| Controller-level Controller Services | Created/updated/deleted via NiFi REST API; used by parameter providers and reporting tasks (`controller_services`) |
+| Root PG Controller Services | Created/updated/deleted via NiFi REST API; accessible to all flow processors in the runtime (`root_pg_controller_services`) |
+| Parameter Providers | Created/updated/deleted via NiFi REST API |
 | Imported Flows | Pulled from the Git registry at a specified version |
 
 ### PR Validation

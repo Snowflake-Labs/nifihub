@@ -165,7 +165,14 @@
         },
         "controller_services": {
           "type": "array",
-          "description": "Controller-level controller services to provision on this runtime (created at root process group scope).",
+          "description": "Controller-level controller services to provision on this runtime. These are created at the NiFi controller scope (not inside any process group) and are visible to parameter providers and reporting tasks. Use this for services that must be referenced by a parameter provider (e.g. SnowflakeConnectionService).",
+          "items": {
+            "$ref": "#/definitions/controller_service"
+          }
+        },
+        "root_pg_controller_services": {
+          "type": "array",
+          "description": "Controller services to provision inside the root process group of this runtime. These are accessible to all flow processors deployed to the runtime. Use this for services shared across multiple flows that do not need to be at the NiFi controller level (e.g. StandardRestrictedSSLContextService, StandardHttpContextMap).",
           "items": {
             "$ref": "#/definitions/controller_service"
           }

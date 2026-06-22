@@ -103,6 +103,41 @@ def diff_nifi_controller_services(live_cs, desired_cs):
     return {"created": created, "modified": modified, "deleted": deleted, "unchanged": unchanged}
 
 
+def diff_nifi_root_pg_controller_services(live_cs, desired_cs):
+    """Diff root process group-scoped controller services (no auto-provisioned exclusions)."""
+    live_idx = {cs["name"].upper(): cs for cs in (live_cs or [])}
+    desired_idx = {cs["name"].upper(): cs for cs in (desired_cs or [])}
+
+    created = [v for k, v in desired_idx.items() if k not in live_idx]
+    deleted = [v for k, v in live_idx.items() if k not in desired_idx]
+    modified = []
+    unchanged = []
+
+    for name_upper, desired in desired_idx.items():
+        if name_upper not in live_idx:
+            continue
+        live = live_idx[name_upper]
+        changes = {}
+        if _norm(live.get("type", "")).lower() != _norm(desired.get("type", "")).lower():
+            changes["type"] = {"live": live.get("type"), "desired": desired.get("type")}
+        live_props = live.get("properties", {})
+        desired_props = desired.get("properties", {})
+        for k, v in desired_props.items():
+            if _is_secret_ref(v):
+                continue
+            live_v = live_props.get(k, "")
+            if _UUID_RE.match(str(live_v)):
+                continue
+            if _norm(live_v) != _norm(v):
+                changes[f"property:{k}"] = {"live": live_v, "desired": v}
+        if changes:
+            modified.append({"name": desired["name"], "changes": changes})
+        else:
+            unchanged.append(desired["name"])
+
+    return {"created": created, "modified": modified, "deleted": deleted, "unchanged": unchanged}
+
+
 def diff_nifi_parameter_providers(live_pp, desired_pp):
     live_idx = {pp["name"].upper(): pp for pp in (live_pp or [])}
     desired_idx = {pp["name"].upper(): pp for pp in (desired_pp or [])}
@@ -231,6 +266,10 @@ def diff_nifi_state(live_nifi, desired_rt):
         live_nifi.get("controller_services", []),
         desired_rt.get("controller_services", [])
     )
+    root_pg_cs_diff = diff_nifi_root_pg_controller_services(
+        live_nifi.get("root_pg_controller_services", []),
+        desired_rt.get("root_pg_controller_services", [])
+    )
     pp_diff = diff_nifi_parameter_providers(
         live_nifi.get("parameter_providers", []),
         desired_rt.get("parameter_providers", [])
@@ -255,6 +294,7 @@ def diff_nifi_state(live_nifi, desired_rt):
 
     return {
         "controller_services": cs_diff,
+        "root_pg_controller_services": root_pg_cs_diff,
         "parameter_providers": pp_diff,
         "flow_registries": reg_diff,
         "flows": flow_diff,
@@ -423,7 +463,7 @@ def diff_live(live_state, config_path):
                 nifi_diff = rt_diff.get("nifi", {})
                 nifi_has_changes = False
                 if nifi_diff and not nifi_diff.get("error"):
-                    for section in ("controller_services", "parameter_providers", "flow_registries", "flows"):
+                    for section in ("controller_services", "root_pg_controller_services", "parameter_providers", "flow_registries", "flows"):
                         sd = nifi_diff.get(section, {})
                         if sd.get("created") or sd.get("modified") or sd.get("deleted"):
                             nifi_has_changes = True
@@ -458,7 +498,7 @@ def diff_live(live_state, config_path):
             nifi_diff = rt_diff.get("nifi", {})
             nifi_has_changes = False
             if nifi_diff and not nifi_diff.get("error"):
-                for section in ("controller_services", "parameter_providers", "flow_registries", "flows"):
+                for section in ("controller_services", "root_pg_controller_services", "parameter_providers", "flow_registries", "flows"):
                     sd = nifi_diff.get(section, {})
                     if sd.get("created") or sd.get("modified") or sd.get("deleted"):
                         nifi_has_changes = True

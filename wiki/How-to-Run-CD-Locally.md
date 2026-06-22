@@ -98,7 +98,7 @@ This demonstrates that NiFi Hub's GitOps tooling is portable — the same `confi
 
 When a runtime has a `url:` field, the CD pipeline:
 - **Skips** all Snowflake SQL operations (no `CREATE/ALTER OPENFLOW RUNTIME`, EAI, network rules)
-- **Still runs** NiFi API reconciliation (flow registries, flows, parameters, controller services)
+- **Still runs** NiFi API reconciliation (flow registries, flows, parameters, controller-level and root PG controller services)
 
 Authentication uses `nifi_auth` instead of `NIFI_RUNTIME_PAT`. See [Non-SOM Runtimes](Introduction-and-Concepts--Non-SOM-Runtimes) for the full model.
 
