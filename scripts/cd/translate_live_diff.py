@@ -83,6 +83,10 @@ def _translate_nifi_changes(nifi_diff):
         "controller_service_changes": cs_changes,
         "parameter_provider_changes": pp_changes,
         "flow_registries_changed": flow_registries_changed,
+        "flow_registry_changes": {
+            "created": reg_diff.get("created", []),
+            "deleted": reg_diff.get("deleted", []),
+        },
     }
 
 
@@ -131,8 +135,11 @@ def translate(live_diff):
         changed_fields = _remap_changed_fields(dep.get("dep_changes", {}))
 
         rt_info = dep.get("runtimes", {})
+        # url_managed runtimes are always reconciled (no SOM state to diff — NiFi
+        # content is applied on every run via apply_runtime_create non-SOM path).
+        url_managed = rt_info.get("url_managed", [])
         runtime_changes = {
-            "created": rt_info.get("to_create", []),
+            "created": rt_info.get("to_create", []) + url_managed,
             "modified": [_translate_runtime_mod(m) for m in rt_info.get("to_modify", [])],
             "deleted": rt_info.get("to_delete", []),
         }
@@ -145,14 +152,16 @@ def translate(live_diff):
 
     for dep in deps.get("unchanged", []):
         rt_info = dep.get("runtimes", {})
+        url_managed = rt_info.get("url_managed", [])
         has_rt_changes = (
             rt_info.get("to_create")
             or rt_info.get("to_modify")
             or rt_info.get("to_delete")
+            or url_managed
         )
         if has_rt_changes:
             runtime_changes = {
-                "created": rt_info.get("to_create", []),
+                "created": rt_info.get("to_create", []) + url_managed,
                 "modified": [_translate_runtime_mod(m) for m in rt_info.get("to_modify", [])],
                 "deleted": rt_info.get("to_delete", []),
             }

@@ -408,11 +408,47 @@ def diff_live(live_state, config_path):
             rt_name_upper = rt_cfg["name"].upper()
             desired_rt_names.add(rt_name_upper)
 
-            if rt_cfg.get("url"):
-                rt_results["url_managed"].append(rt_cfg)
-                continue
-
             live_rt = live_runtimes.get(rt_name_upper)
+
+            if rt_cfg.get("url"):
+                if not live_rt:
+                    # No live state yet — treat as to_create so orchestrate.py
+                    # runs the initial NiFi reconciliation (non-SOM path).
+                    rt_results["url_managed"].append(rt_cfg)
+                    continue
+                # Live state exists — diff the NiFi content normally.
+                # SOM fields (node_type, network_rules, etc.) are ignored for
+                # URL-managed runtimes since the pipeline doesn't manage them.
+                rt_diff = diff_runtime(live_rt, rt_cfg)
+                nifi_diff = rt_diff.get("nifi", {})
+                nifi_has_changes = False
+                if nifi_diff and not nifi_diff.get("error"):
+                    for section in ("controller_services", "parameter_providers", "flow_registries", "flows"):
+                        sd = nifi_diff.get(section, {})
+                        if sd.get("created") or sd.get("modified") or sd.get("deleted"):
+                            nifi_has_changes = True
+                            break
+                    if not nifi_has_changes:
+                        for flow_name, pdiff in nifi_diff.get("parameters", {}).items():
+                            if pdiff.get("changes"):
+                                nifi_has_changes = True
+                                break
+                if nifi_has_changes:
+                    rt_results["to_modify"].append({
+                        "name": rt_cfg["name"],
+                        "live": live_rt,
+                        "desired": rt_cfg,
+                        "diff": rt_diff,
+                    })
+                else:
+                    rt_results["unchanged"].append({
+                        "name": rt_cfg["name"],
+                        "status": live_rt.get("status", "ACTIVE"),
+                        "live": live_rt,
+                        "diff": rt_diff,
+                        "nifi": nifi_diff,
+                    })
+                continue
 
             if not live_rt:
                 rt_results["to_create"].append(rt_cfg)

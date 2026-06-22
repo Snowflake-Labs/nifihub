@@ -23,6 +23,24 @@ import yaml
 from validate_pr import snow_sql
 from describe_nifi_state import describe_nifi_state
 from manage_connectors import get_connector_config
+from manage_flows import configure_nifi
+
+
+def _resolve_nifi_auth(rt_cfg):
+    """Build a resolved nifi_auth dict from a runtime config entry, or None."""
+    nifi_auth_cfg = rt_cfg.get("nifi_auth")
+    if not nifi_auth_cfg or nifi_auth_cfg.get("type") != "username_password":
+        return None
+    try:
+        from manage_parameters import resolve_value
+        return {
+            "type": "username_password",
+            "username": resolve_value(nifi_auth_cfg["username"]),
+            "password": resolve_value(nifi_auth_cfg["password"]),
+            "verify_ssl": nifi_auth_cfg.get("verify_ssl", True),
+        }
+    except Exception:
+        return None
 
 
 def _extract_connector_params(config_json):
@@ -200,6 +218,56 @@ def build_live_state(config_path, conn):
                 break
 
         if not live_dep:
+            # If all runtimes in this deployment have a 'url' field, the deployment
+            # is URL-managed (non-SOM) and won't appear in Snowflake. Synthesize a
+            # live entry so the diff can query NiFi directly instead of treating
+            # everything as "to_create".
+            dep_runtimes_cfg = dep_cfg.get("runtimes", [])
+            all_url_managed = dep_runtimes_cfg and all(r.get("url") for r in dep_runtimes_cfg)
+            if not all_url_managed:
+                continue
+            # Build a synthetic live deployment entry representing the current NiFi state
+            dep_entry = {
+                "name": dep_name,
+                "deployment_type": dep_cfg.get("deployment_type", "SNOWFLAKE"),
+                "display_name": dep_cfg.get("display_name", ""),
+                "comment": dep_cfg.get("comment", ""),
+                "status": "ACTIVE",
+                "runtimes": [],
+            }
+            for rt_cfg in dep_runtimes_cfg:
+                rt_name = rt_cfg["name"]
+                rt_url = rt_cfg["url"]
+                runtime_api_url = rt_url.rstrip("/")
+                if not runtime_api_url.endswith("/nifi-api"):
+                    runtime_api_url += "/nifi-api"
+                nifi_auth = _resolve_nifi_auth(rt_cfg)
+                nifi_pat = os.environ.get("NIFI_RUNTIME_PAT", "")
+                rt_entry = {
+                    "name": rt_name,
+                    "database": rt_cfg.get("database", ""),
+                    "schema": rt_cfg.get("schema", ""),
+                    "status": "ACTIVE",
+                    "node_type": "",
+                    "min_nodes": 0,
+                    "max_nodes": 0,
+                    "execute_as_role": rt_cfg.get("execute_as_role", ""),
+                    "display_name": rt_cfg.get("display_name", ""),
+                    "comment": rt_cfg.get("comment", ""),
+                    "network_rules": [],
+                    "connectors": [],
+                }
+                if rt_cfg.get("reconcile") is False:
+                    rt_entry["nifi"] = None
+                else:
+                    try:
+                        nifi_state = describe_nifi_state(runtime_api_url, pat=nifi_pat, nifi_auth=nifi_auth)
+                        rt_entry["nifi"] = nifi_state
+                    except Exception as e:
+                        print(f"[live] NiFi API error for {rt_name}: {e}", file=sys.stderr)
+                        rt_entry["nifi"] = {"error": str(e)}
+                dep_entry["runtimes"].append(rt_entry)
+            live_state["deployments"].append(dep_entry)
             continue
 
         dep_entry = {
@@ -273,9 +341,10 @@ def build_live_state(config_path, conn):
             skip_nifi = rt_cfg_match and rt_cfg_match.get("reconcile") is False
 
             nifi_pat = os.environ.get("NIFI_RUNTIME_PAT", "")
+            nifi_auth = _resolve_nifi_auth(rt_cfg_match) if rt_cfg_match else None
             if skip_nifi:
                 rt_entry["nifi"] = None
-            elif rt_status.upper() == "ACTIVE" and nifi_pat:
+            elif rt_status.upper() == "ACTIVE" and (nifi_pat or nifi_auth):
                 server_url = (_get(rt_desc, "server_url") if rt_desc else None) or ""
                 if not server_url and rt_cfg_match:
                     server_url = rt_cfg_match.get("url", "")
@@ -286,7 +355,7 @@ def build_live_state(config_path, conn):
                     elif not runtime_api_url.endswith("/nifi-api"):
                         runtime_api_url += "/nifi-api"
                     try:
-                        nifi_state = describe_nifi_state(runtime_api_url, nifi_pat)
+                        nifi_state = describe_nifi_state(runtime_api_url, pat=nifi_pat, nifi_auth=nifi_auth)
                         rt_entry["nifi"] = nifi_state
                     except Exception as e:
                         print(f"[live] NiFi API error for {rt_name}: {e}", file=sys.stderr)

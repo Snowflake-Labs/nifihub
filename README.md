@@ -243,6 +243,34 @@ runtimes:
 
 When `url` is present, the pipeline skips all SOM SQL operations (no deployment creation, no runtime create/alter/suspend/resume, no EAI or network rule management). It connects directly to the NiFi REST API at the given URL to manage flow registries, flows, parameters, controller services, and parameter providers.
 
+For open-source Apache NiFi instances that use username/password login (rather than Snowflake Bearer tokens), add a `nifi_auth` block:
+
+```yaml
+nifi_auth:
+  type: username_password
+  username: ${{ vars.NIFI_USERNAME }}
+  password: ${{ secrets.NIFI_PASSWORD }}
+  verify_ssl: false   # for self-signed certificates
+```
+
+See the [Non-SOM Runtimes wiki page](../../wiki/Introduction-and-Concepts--Non-SOM-Runtimes) for full details.
+
+### Running the CD Pipeline Locally
+
+The CD pipeline scripts can be run directly from your machine without pushing to `main`:
+
+```bash
+# Preview changes (no apply)
+python scripts/run-cd.py environments/demo/config.yaml --dry-run
+
+# Apply changes
+python scripts/run-cd.py environments/demo/config.yaml
+```
+
+This runs the same describe → diff → translate → orchestrate pipeline used by GitHub Actions, and works against any NiFi endpoint including local Apache NiFi instances.
+
+See the [Running CD Locally wiki page](../../wiki/How-to-Run-CD-Locally) for the full guide, environment variable reference, and a step-by-step walkthrough using Docker NiFi.
+
 ## CI/CD Workflows
 
 | Workflow | Trigger | Purpose |
@@ -255,7 +283,7 @@ When `url` is present, the pipeline skips all SOM SQL operations (no deployment 
 | Auto Release | Push to `main` changing `extensions/**/pom.xml` | Automatic release when SNAPSHOT suffix is removed |
 | Release Bundle | Manual dispatch | Release a bundle to GitHub Releases (fallback) |
 | Wiki Docs | Push to `main` changing `extensions/` | Generate and publish extension documentation to the wiki |
-| Environment CD | Push to `main` changing `environments/` | Apply Openflow changes via live state diff |
+| Environment CD | Push to `main` changing `environments/` or manual trigger | Apply Openflow changes via live state diff |
 | Environment CD Validate | PR modifying `environments/` | Live state diff + change plan posted as PR comment |
 
 ### Flow Deploy CI

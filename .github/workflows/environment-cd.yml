@@ -4,6 +4,12 @@ on:
   push:
     branches: [main]
     paths: ['environments/**/config.yaml']
+  workflow_dispatch:
+    inputs:
+      environment_name:
+        description: 'Environment name to deploy (subdirectory under environments/). Leave empty to deploy all changed environments.'
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -26,7 +32,19 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
         run: |
           pip install pyyaml -q
-          python scripts/cd/detect_environments.py "$GITHUB_OUTPUT"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ inputs.environment_name }}" ]; then
+            ENV="${{ inputs.environment_name }}"
+            CONFIG="environments/${ENV}/config.yaml"
+            if [ ! -f "$CONFIG" ]; then
+              echo "Error: $CONFIG not found" >&2
+              exit 1
+            fi
+            GITHUB_ENV_NAME=$(python -c "import yaml; c=yaml.safe_load(open('$CONFIG')); print(c['account']['github_environment'])")
+            echo "items=[{\"config_env\":\"${ENV}\",\"github_env\":\"${GITHUB_ENV_NAME}\"}]" >> "$GITHUB_OUTPUT"
+            echo "has_changes=true" >> "$GITHUB_OUTPUT"
+          else
+            python scripts/cd/detect_environments.py "$GITHUB_OUTPUT"
+          fi
 
   apply:
     needs: detect

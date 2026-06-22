@@ -47,6 +47,18 @@
       "description": "Regex pattern to classify parameters from the auto-provisioned Snowflake Parameter Provider as sensitive. Defaults to '.*' (all sensitive).",
       "default": ".*"
     },
+    "nifi_auth": {
+      "type": "object",
+      "description": "Authentication configuration for the NiFi REST API. If omitted, the NIFI_RUNTIME_PAT environment variable is used (Bearer token). Set this for CI runtimes pointing at OSS NiFi instances that use username/password login.",
+      "additionalProperties": false,
+      "required": ["type", "username", "password"],
+      "properties": {
+        "type": { "type": "string", "enum": ["username_password"] },
+        "username": { "type": "string" },
+        "password": { "type": "string" },
+        "verify_ssl": { "type": "boolean", "default": true, "description": "Boolean only (CI runtimes are always SPCS — CA bundle path not applicable here; use environments/schema.json for local/BYOC configs that need a custom CA path)." }
+      }
+    },
     "provided_parameter_contexts": {
       "type": "string",
       "description": "Regex pattern to filter which parameter contexts from providers are added as inherited. Only contexts with names matching this pattern are added. If not specified, no provider contexts are inherited."

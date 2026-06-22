@@ -76,8 +76,8 @@ def get_flow_parameters(pg_id):
     return params
 
 
-def describe_nifi_state(runtime_url, pat):
-    configure_nifi(runtime_url, pat)
+def describe_nifi_state(runtime_url, pat=None, nifi_auth=None):
+    configure_nifi(runtime_url, pat=pat, nifi_auth=nifi_auth)
 
     registries = list_registry_clients()
     reg_id_map = _registry_id_to_name(registries)

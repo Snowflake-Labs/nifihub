@@ -31,7 +31,7 @@ from manage_runtime import (
     suspend_runtime, resume_runtime
 )
 from manage_parameters import resolve_value
-from setup_registry_client import setup as setup_registry
+from setup_registry_client import setup as setup_registry, find_registry_client, delete_registry_client
 from manage_flows import reconcile_flows, delete_flows, find_flow_pg_by_name, configure_nifi, start_flow, stop_flow
 from manage_parameters import reconcile_flow_parameters, add_inherited_parameter_contexts, apply_parameter_overrides
 from manage_assets import reconcile_flow_assets
@@ -58,7 +58,32 @@ def get_conn():
 def get_nifi_conn():
     return {
         "runtime_url": os.environ.get("NIFI_RUNTIME_URL", ""),
-        "nifi_pat": os.environ["NIFI_RUNTIME_PAT"],
+        "nifi_pat": os.environ.get("NIFI_RUNTIME_PAT", ""),
+    }
+
+
+def _get_nifi_pat():
+    """Return NIFI_RUNTIME_PAT env var, or empty string if not set.
+    When nifi_auth is configured on a runtime (username/password mode), this
+    value is unused and it is safe for it to be absent.
+    """
+    return os.environ.get("NIFI_RUNTIME_PAT", "")
+
+
+def _get_nifi_auth(rt):
+    """Resolve and return the nifi_auth dict for a runtime, or None.
+
+    When nifi_auth is present, credentials are resolved from GH_SECRETS_JSON /
+    GH_VARS_JSON so that ${{ secrets.X }} / ${{ vars.X }} syntax works.
+    """
+    nifi_auth = rt.get("nifi_auth")
+    if not nifi_auth:
+        return None
+    return {
+        "type": nifi_auth["type"],
+        "username": resolve_value(nifi_auth["username"]),
+        "password": resolve_value(nifi_auth["password"]),
+        "verify_ssl": nifi_auth.get("verify_ssl", True),
     }
 
 
@@ -123,27 +148,28 @@ def _reconcile_controller_services(rt, runtime_url):
     services = rt.get("controller_services", [])
     if not services:
         return
-    nifi_pat = os.environ["NIFI_RUNTIME_PAT"]
-    reconcile_controller_services(services, runtime_url, nifi_pat)
+    nifi_pat = _get_nifi_pat()
+    reconcile_controller_services(services, runtime_url, nifi_pat, nifi_auth=_get_nifi_auth(rt))
 
 
-def _delete_controller_services(services, runtime_url):
+def _delete_controller_services(services, runtime_url, nifi_auth=None):
     """Delete controller services explicitly removed from config."""
     if not services:
         return
-    nifi_pat = os.environ["NIFI_RUNTIME_PAT"]
-    delete_controller_services(services, runtime_url, nifi_pat)
+    nifi_pat = _get_nifi_pat()
+    delete_controller_services(services, runtime_url, nifi_pat, nifi_auth=nifi_auth)
 
 
 def _reconcile_parameter_providers(rt, runtime_url):
     """Reconcile all desired parameter providers on the runtime, plus the auto-provisioned one."""
     providers = rt.get("parameter_providers", [])
-    nifi_pat = os.environ["NIFI_RUNTIME_PAT"]
+    nifi_pat = _get_nifi_pat()
+    nifi_auth = _get_nifi_auth(rt)
     from manage_flows import configure_nifi
-    configure_nifi(runtime_url, nifi_pat)
+    configure_nifi(runtime_url, pat=nifi_pat, nifi_auth=nifi_auth)
     all_context_names = []
     if providers:
-        names = reconcile_parameter_providers(providers, runtime_url, nifi_pat)
+        names = reconcile_parameter_providers(providers, runtime_url, nifi_pat, nifi_auth=nifi_auth)
         if names:
             all_context_names.extend(names)
     sensitive_pattern = rt.get("sensitive_param_pattern", ".*")
@@ -153,23 +179,40 @@ def _reconcile_parameter_providers(rt, runtime_url):
     return all_context_names
 
 
-def _delete_parameter_providers(providers, runtime_url):
+def _delete_parameter_providers(providers, runtime_url, nifi_auth=None):
     """Delete parameter providers explicitly removed from config."""
     if not providers:
         return
-    nifi_pat = os.environ["NIFI_RUNTIME_PAT"]
-    delete_parameter_providers(providers, runtime_url, nifi_pat)
+    nifi_pat = _get_nifi_pat()
+    delete_parameter_providers(providers, runtime_url, nifi_pat, nifi_auth=nifi_auth)
 
 
 def _setup_flow_registries(rt, runtime_url):
     """Provision all Flow Registry Clients declared on a runtime."""
-    nifi_pat = os.environ["NIFI_RUNTIME_PAT"]
+    nifi_pat = _get_nifi_pat()
+    nifi_auth = _get_nifi_auth(rt)
     for rc in rt.get("flow_registries", []):
         properties = {k: resolve_value(v) for k, v in rc.get("properties", {}).items()}
         setup_registry(
             rc["name"], properties, runtime_url, nifi_pat,
             type_override=rc.get("type"),
+            nifi_auth=nifi_auth,
         )
+
+
+def _delete_flow_registries(to_delete, runtime_url, rt):
+    """Delete Flow Registry Clients that were removed from config."""
+    if not to_delete:
+        return
+    nifi_pat = _get_nifi_pat()
+    nifi_auth = _get_nifi_auth(rt)
+    configure_nifi(runtime_url, pat=nifi_pat, nifi_auth=nifi_auth)
+    for rc in to_delete:
+        existing = find_registry_client(rc["name"])
+        if existing:
+            delete_registry_client(existing)
+        else:
+            print(f"[registry] '{rc['name']}' not found, skipping delete")
 
 
 def _default_registry(rt):
@@ -183,17 +226,18 @@ def _reconcile_flows(rt, runtime_url, provider_context_names=None):
     flows = rt.get("flows", [])
     if not flows:
         return
-    nifi_pat = os.environ["NIFI_RUNTIME_PAT"]
+    nifi_pat = _get_nifi_pat()
+    nifi_auth = _get_nifi_auth(rt)
     default_reg = _default_registry(rt)
     groups = defaultdict(list)
     for f in flows:
         groups[f.get("registry", default_reg)].append(f)
     for registry_name, group in groups.items():
-        reconcile_flows(group, registry_name, runtime_url, nifi_pat)
+        reconcile_flows(group, registry_name, runtime_url, nifi_pat, nifi_auth=nifi_auth)
 
     if provider_context_names:
         import re
-        configure_nifi(runtime_url, nifi_pat)
+        configure_nifi(runtime_url, pat=nifi_pat, nifi_auth=nifi_auth)
         for flow_spec in flows:
             pattern = flow_spec.get("provided_parameter_contexts")
             if not pattern:
@@ -208,7 +252,7 @@ def _reconcile_flows(rt, runtime_url, provider_context_names=None):
 
     flows_with_assets = [f for f in flows if f.get("assets")]
     if flows_with_assets:
-        configure_nifi(runtime_url, nifi_pat)
+        configure_nifi(runtime_url, pat=nifi_pat, nifi_auth=nifi_auth)
         for flow_spec in flows_with_assets:
             pg = find_flow_pg_by_name(flow_spec["name"])
             if pg:
@@ -218,7 +262,7 @@ def _reconcile_flows(rt, runtime_url, provider_context_names=None):
 
     flows_with_params = [f for f in flows if f.get("parameters")]
     if flows_with_params:
-        configure_nifi(runtime_url, nifi_pat)
+        configure_nifi(runtime_url, pat=nifi_pat, nifi_auth=nifi_auth)
         for flow_spec in flows_with_params:
             pg = find_flow_pg_by_name(flow_spec["name"])
             if pg:
@@ -228,7 +272,7 @@ def _reconcile_flows(rt, runtime_url, provider_context_names=None):
 
     flows_with_overrides = [f for f in flows if f.get("parameter_overrides")]
     if flows_with_overrides:
-        configure_nifi(runtime_url, nifi_pat)
+        configure_nifi(runtime_url, pat=nifi_pat, nifi_auth=nifi_auth)
         for flow_spec in flows_with_overrides:
             pg = find_flow_pg_by_name(flow_spec["name"])
             if pg:
@@ -238,7 +282,7 @@ def _reconcile_flows(rt, runtime_url, provider_context_names=None):
 
     flows_to_start = [f for f in flows if f.get("start")]
     if flows_to_start:
-        configure_nifi(runtime_url, nifi_pat)
+        configure_nifi(runtime_url, pat=nifi_pat, nifi_auth=nifi_auth)
         for flow_spec in flows_to_start:
             pg = find_flow_pg_by_name(flow_spec["name"])
             if pg:
@@ -248,7 +292,7 @@ def _reconcile_flows(rt, runtime_url, provider_context_names=None):
 
     flows_to_stop = [f for f in flows if "start" in f and not f["start"]]
     if flows_to_stop:
-        configure_nifi(runtime_url, nifi_pat)
+        configure_nifi(runtime_url, pat=nifi_pat, nifi_auth=nifi_auth)
         for flow_spec in flows_to_stop:
             pg = find_flow_pg_by_name(flow_spec["name"])
             if pg:
@@ -261,13 +305,13 @@ def _delete_flows(flows, rt, runtime_url):
     """Delete process groups for flows explicitly removed from config."""
     if not flows:
         return
-    nifi_pat = os.environ["NIFI_RUNTIME_PAT"]
+    nifi_pat = _get_nifi_pat()
     default_reg = _default_registry(rt)
     groups = defaultdict(list)
     for f in flows:
         groups[f.get("registry", default_reg)].append(f)
     for registry_name, group in groups.items():
-        delete_flows(group, registry_name, runtime_url, nifi_pat)
+        delete_flows(group, registry_name, runtime_url, nifi_pat, nifi_auth=_get_nifi_auth(rt))
 
 
 def _reconcile_connectors(rt, conn):
@@ -471,9 +515,9 @@ def apply_deployment_modifications(modified_deps, conn, errors):
                 _delete_connectors(rt.get("connectors", []), rt["database"], rt["schema"], conn)
                 runtime_url = _runtime_url(rt, conn)
                 if runtime_url:
-                    _delete_parameter_providers(rt.get("parameter_providers", []), runtime_url)
-                    _delete_controller_services(rt.get("controller_services", []), runtime_url)
                     _delete_flows(rt.get("flows", []), rt, runtime_url)
+                    _delete_parameter_providers(rt.get("parameter_providers", []), runtime_url, nifi_auth=_get_nifi_auth(rt))
+                    _delete_controller_services(rt.get("controller_services", []), runtime_url, nifi_auth=_get_nifi_auth(rt))
                 if _has_som_api(rt):
                     delete_runtime(rt["name"], rt["database"], rt["schema"], **conn)
                     delete_runtime_eai(
@@ -546,17 +590,21 @@ def apply_runtime_modification(mod, conn):
     _reconcile_flows(rt, runtime_url, provider_context_names=pp_context_names)
     _reconcile_connectors(rt, conn)
 
-    pp_changes = mod.get("parameter_provider_changes", {})
-    if pp_changes.get("deleted"):
-        _delete_parameter_providers(pp_changes["deleted"], runtime_url)
-
-    cs_changes = mod.get("controller_service_changes", {})
-    if cs_changes.get("deleted"):
-        _delete_controller_services(cs_changes["deleted"], runtime_url)
-
     flow_changes = mod.get("flow_changes", {})
     if flow_changes.get("deleted"):
         _delete_flows(flow_changes["deleted"], rt, runtime_url)
+
+    pp_changes = mod.get("parameter_provider_changes", {})
+    if pp_changes.get("deleted"):
+        _delete_parameter_providers(pp_changes["deleted"], runtime_url, nifi_auth=_get_nifi_auth(rt))
+
+    cs_changes = mod.get("controller_service_changes", {})
+    if cs_changes.get("deleted"):
+        _delete_controller_services(cs_changes["deleted"], runtime_url, nifi_auth=_get_nifi_auth(rt))
+
+    reg_changes = mod.get("flow_registry_changes", {})
+    if reg_changes.get("deleted"):
+        _delete_flow_registries(reg_changes["deleted"], runtime_url, rt)
 
     connector_changes = mod.get("connector_changes", {})
     if connector_changes.get("deleted"):
@@ -572,9 +620,9 @@ def apply_deployment_deletes(deleted_deps, conn, errors):
             try:
                 runtime_url = _runtime_url(rt, conn)
                 if runtime_url:
-                    _delete_parameter_providers(rt.get("parameter_providers", []), runtime_url)
-                    _delete_controller_services(rt.get("controller_services", []), runtime_url)
                     _delete_flows(rt.get("flows", []), rt, runtime_url)
+                    _delete_parameter_providers(rt.get("parameter_providers", []), runtime_url, nifi_auth=_get_nifi_auth(rt))
+                    _delete_controller_services(rt.get("controller_services", []), runtime_url, nifi_auth=_get_nifi_auth(rt))
                 _delete_connectors(rt.get("connectors", []), rt["database"], rt["schema"], conn)
 
                 if _has_som_api(rt):

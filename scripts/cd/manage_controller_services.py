@@ -101,9 +101,9 @@ def _properties_match(cs, desired_props):
     return all(current.get(k) == v for k, v in desired_props.items())
 
 
-def reconcile_controller_services(services, runtime_url, nifi_pat):
+def reconcile_controller_services(services, runtime_url, nifi_pat, nifi_auth=None):
     """Idempotent reconcile: create missing services, update mismatched properties, ensure all are ENABLED."""
-    configure_nifi(runtime_url, nifi_pat)
+    configure_nifi(runtime_url, pat=nifi_pat, nifi_auth=nifi_auth)
     for svc_spec in services:
         name = svc_spec["name"]
         desired_props = svc_spec.get("properties", {})
@@ -127,9 +127,9 @@ def reconcile_controller_services(services, runtime_url, nifi_pat):
             print(f"[cs] '{name}' already ENABLED")
 
 
-def delete_controller_services(services, runtime_url, nifi_pat):
+def delete_controller_services(services, runtime_url, nifi_pat, nifi_auth=None):
     """Disable and delete controller services."""
-    configure_nifi(runtime_url, nifi_pat)
+    configure_nifi(runtime_url, pat=nifi_pat, nifi_auth=nifi_auth)
     for svc_spec in services:
         name = svc_spec["name"]
         cs = find_controller_service_by_name(name)

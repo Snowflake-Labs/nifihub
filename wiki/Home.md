@@ -12,6 +12,8 @@ A community-driven repository of independently-versioned Apache NiFi extension b
 | Learn how flows are versioned with Git | [GitHub Registry Client](Introduction-and-Concepts--GitHub-Registry-Client) |
 | Understand what CI checks run on PRs | [CI Pipeline](Introduction-and-Concepts--CI) |
 | Deploy NiFi infrastructure declaratively | [CD Pipeline](Introduction-and-Concepts--CD) |
+| Run the CD pipeline locally or against a local NiFi | [Running CD Locally](How-to-Run-CD-Locally) |
+| Use the pipeline with a non-Snowflake NiFi instance | [Non-SOM Runtimes](Introduction-and-Concepts--Non-SOM-Runtimes) |
 | Download a NAR or import a flow | [How to Use This Repo](How-to-Use-This-Repo) |
 | Add a new extension bundle or flow | [How to Contribute](How-to-Contribute) |
 | Browse processor and controller service docs | [Components](Components) |

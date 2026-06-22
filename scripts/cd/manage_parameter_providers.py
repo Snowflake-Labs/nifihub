@@ -150,8 +150,8 @@ def reconcile_parameter_provider(pp_spec):
     return _apply(pp.id, sensitive_pattern)
 
 
-def reconcile_parameter_providers(pp_specs, runtime_url, nifi_pat):
-    configure_nifi(runtime_url, nifi_pat)
+def reconcile_parameter_providers(pp_specs, runtime_url, nifi_pat, nifi_auth=None):
+    configure_nifi(runtime_url, pat=nifi_pat, nifi_auth=nifi_auth)
     all_context_names = []
     for pp_spec in pp_specs:
         names = reconcile_parameter_provider(pp_spec)
@@ -181,14 +181,45 @@ def fetch_auto_provisioned_provider(sensitive_pattern=".*"):
     return _apply(pp.id, sensitive_pattern) or []
 
 
-def delete_parameter_providers(pp_specs, runtime_url, nifi_pat):
-    configure_nifi(runtime_url, nifi_pat)
+def delete_parameter_providers(pp_specs, runtime_url, nifi_pat, nifi_auth=None):
+    configure_nifi(runtime_url, pat=nifi_pat, nifi_auth=nifi_auth)
     api = nipyapi.nifi.ParameterProvidersApi()
     for pp_spec in pp_specs:
         name = pp_spec["name"]
         pp = find_parameter_provider(name)
         if not pp:
             print(f"[pp] '{name}' not found, skipping delete")
+            continue
+        # NiFi refuses to delete a provider that is still referenced by
+        # parameter contexts. Delete those contexts first.
+        # These are "provided" contexts — auto-created when the provider
+        # applied its parameter groups. Deleting them is safe as long as
+        # they are not referenced by any process group as its active context.
+        try:
+            import time as _time
+            flow_api = nipyapi.nifi.FlowApi()
+            pc_api = nipyapi.nifi.ParameterContextsApi()
+            all_contexts = flow_api.get_parameter_contexts()
+            for ctx_ref in (all_contexts.parameter_contexts or []):
+                ctx = pc_api.get_parameter_context(id=ctx_ref.id)
+                cfg = ctx.component.parameter_provider_configuration
+                # cfg is a ParameterProviderConfigurationEntity; the provider
+                # id is at cfg.id (the entity id), not cfg.parameter_provider_id
+                if cfg and cfg.id == pp.id:
+                    try:
+                        pc_api.delete_parameter_context(
+                            id=ctx.id,
+                            version=str(ctx.revision.version),
+                        )
+                        print(f"[pp] Deleted provided context '{ctx.component.name}'")
+                    except Exception as ctx_err:
+                        # Context may be in use by a process group — skip
+                        print(f"[pp] Could not delete context '{ctx.component.name}': {ctx_err}")
+        except Exception as e:
+            print(f"[pp] Warning: could not clean up contexts for '{name}': {e}")
+        # Re-fetch to get latest revision before deleting
+        pp = find_parameter_provider(name)
+        if not pp:
             continue
         api.remove_parameter_provider(pp.id, version=str(pp.revision.version))
         print(f"[pp] Deleted '{name}'")

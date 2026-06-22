@@ -20,15 +20,7 @@ import sys
 
 import nipyapi
 
-
-def configure_nifi(runtime_url, pat):
-    api_url = runtime_url.rstrip("/")
-    if api_url.endswith("/nifi"):
-        api_url = api_url[:-5]
-    if not api_url.endswith("/nifi-api"):
-        api_url += "/nifi-api"
-    nipyapi.config.nifi_config.host = api_url
-    nipyapi.config.nifi_config.api_key["bearerAuth"] = f"Bearer {pat}"
+from manage_flows import configure_nifi as _configure_nifi
 
 
 def list_registry_clients():
@@ -104,7 +96,7 @@ def update_registry_client(existing, properties):
     return result
 
 
-def setup(name, properties, runtime_url, nifi_pat, type_override=None):
+def setup(name, properties, runtime_url, nifi_pat, type_override=None, nifi_auth=None):
     """Provision or update a Flow Registry Client on the given runtime.
 
     If the existing client has a different type, it is deleted and recreated
@@ -117,8 +109,9 @@ def setup(name, properties, runtime_url, nifi_pat, type_override=None):
         runtime_url: NiFi runtime base URL.
         nifi_pat: Bearer token for NiFi API authentication.
         type_override: Optional fully-qualified Java type. Auto-detected if None.
+        nifi_auth: Optional nifi_auth dict for username/password auth.
     """
-    configure_nifi(runtime_url, nifi_pat)
+    _configure_nifi(runtime_url, pat=nifi_pat, nifi_auth=nifi_auth)
     desired_type = _resolve_type(type_override)
     existing = find_registry_client(name)
     if existing:

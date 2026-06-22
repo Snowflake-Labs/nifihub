@@ -84,6 +84,30 @@
           "format": "uri",
           "description": "NiFi runtime URL (without /nifi-api suffix). When set, SOM SQL-based runtime lifecycle management (CREATE/ALTER/DELETE, EAI, network rules, suspend/resume) is skipped entirely. Only NiFi API operations (registries, flows, parameters, controller services) are performed."
         },
+        "nifi_auth": {
+          "type": "object",
+          "description": "Authentication configuration for the NiFi REST API. If omitted, the NIFI_RUNTIME_PAT environment variable is used (Bearer token — standard for Snowflake Openflow). Set this when connecting to an open-source Apache NiFi instance that uses username/password login.",
+          "additionalProperties": false,
+          "required": ["type", "username", "password"],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": ["username_password"],
+              "description": "Authentication type. Currently only username_password is supported."
+            },
+            "username": {
+              "type": "string",
+              "description": "NiFi username. Supports ${{ vars.NAME }} syntax to reference GitHub Environment variables."
+            },
+            "password": {
+              "type": "string",
+              "description": "NiFi password. Supports ${{ secrets.NAME }} syntax to reference GitHub Environment secrets."
+            },
+            "verify_ssl": {
+              "description": "SSL verification for the NiFi HTTPS endpoint. Accepts three values: true (default — verify against system CA store), false (disable verification, local dev only), or a string path to a custom CA certificate bundle (e.g. '/path/to/ca-bundle.crt'). Never disable in production."
+            }
+          }
+        },
         "node_type": {
           "type": "string",
           "enum": ["SMALL", "MEDIUM", "LARGE"]

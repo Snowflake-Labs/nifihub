@@ -85,6 +85,30 @@ This gives reviewers a clear picture of the infrastructure impact before merging
 
 When the PR merges to `main`, the **Environment CD** workflow applies the change plan to the target Snowflake account. Each environment runs in a separate GitHub Environment with its own credentials (`SNOWFLAKE_ACCOUNT_URL`, `SNOWFLAKE_USER`, `SNOWFLAKE_PAT`, `SNOWFLAKE_ROLE`).
 
+### Triggering CD Manually
+
+The Environment CD workflow can also be triggered manually without pushing a config change:
+
+**From the GitHub UI:** Go to Actions → Environment CD → Run workflow → enter the environment name.
+
+**From the GitHub CLI:**
+```bash
+gh workflow run environment-cd.yml --field environment_name=demo
+```
+
+This is useful for force-reconciling after a manual change on the runtime, or for re-running the pipeline after a script fix.
+
+### Running Locally
+
+The same pipeline can be run directly from your machine using `scripts/run-cd.py`:
+
+```bash
+python scripts/run-cd.py environments/demo/config.yaml --dry-run   # preview only
+python scripts/run-cd.py environments/demo/config.yaml              # apply
+```
+
+See [Running CD Locally](How-to-Run-CD-Locally) for full instructions including how to run against a local Apache NiFi instance.
+
 ### Forking for Your Own Environment
 
 1. Fork this repository
