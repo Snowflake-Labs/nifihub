@@ -31,7 +31,7 @@ jobs:
     name: Flow Diff
     steps:
       - name: Checkout PR Code
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           ref: ${{ github.event.pull_request.head.ref }}
           fetch-depth: 0
@@ -58,7 +58,7 @@ jobs:
 
       - name: Checkout Original Code
         if: steps.files.outputs.has_flows == 'true'
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           fetch-depth: 2
           path: original-code
@@ -81,7 +81,7 @@ jobs:
     name: Flow Validation Tests
     steps:
       - name: Checkout Code
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -129,7 +129,7 @@ jobs:
     runs-on: ubuntu-latest
     name: Post Deploy Instructions
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: ${{ github.event.pull_request.head.ref }}
           fetch-depth: 0

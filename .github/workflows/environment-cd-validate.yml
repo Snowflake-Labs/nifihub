@@ -15,7 +15,7 @@ jobs:
       environments: ${{ steps.diff.outputs.environments }}
       has_changes: ${{ steps.diff.outputs.has_changes }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -52,7 +52,7 @@ jobs:
     environment: ${{ matrix.env_name }}
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
