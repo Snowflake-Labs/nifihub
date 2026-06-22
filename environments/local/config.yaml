@@ -1,0 +1,35 @@
+# yaml-language-server: $schema=../schema.json
+# Local Apache NiFi instance — for testing and demonstration
+account:
+  name: local
+  github_environment: local
+
+deployments:
+  - name: LOCAL_DEPLOYMENT
+    deployment_type: SNOWFLAKE
+    runtimes:
+      - name: LOCAL_NIFI
+        database: ""
+        schema: ""
+        url: "https://localhost:8443"
+        nifi_auth:
+          type: username_password
+          username: ${{ vars.NIFI_USERNAME }}
+          password: ${{ secrets.NIFI_PASSWORD }}
+          verify_ssl: false
+        flow_registries:
+          - name: nifihub
+            type: org.apache.nifi.github.GitHubFlowRegistryClient
+            properties:
+              Repository Owner: Snowflake-Labs
+              Repository Name: nifihub
+              Authentication Type: NONE
+              Default Branch: main
+              Repository Path: flows
+        flows:
+          - name: "Hello World"
+            registry: nifihub
+            bucket: examples
+            flow: hello-world
+            version: latest
+            start: true
