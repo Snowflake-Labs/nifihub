@@ -45,7 +45,8 @@ runtimes:
 - Flow Registry Clients (GitHub registry client setup)
 - Flow checkout and versioning
 - Parameter contexts and parameter values
-- Controller services
+- Controller-level controller services (`controller_services` — used by parameter providers)
+- Root process group controller services (`root_pg_controller_services` — shared across all flows)
 - Parameter providers (including the auto-provisioned Snowflake Parameter Provider, if available)
 - Flow start/stop state
 

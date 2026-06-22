@@ -20,7 +20,7 @@ import sys
 import nipyapi
 
 from manage_flows import configure_nifi, list_process_groups
-from manage_controller_services import list_controller_services
+from manage_controller_services import list_controller_services, list_root_pg_controller_services
 from setup_registry_client import list_registry_clients
 import manage_parameter_providers  # noqa: F401 — triggers monkey patch
 
@@ -92,6 +92,16 @@ def describe_nifi_state(runtime_url, pat=None, nifi_auth=None):
             "properties": _clean_properties(cs.component.properties),
         })
 
+    root_pg_cs_list = list_root_pg_controller_services()
+    root_pg_controller_services = []
+    for cs in root_pg_cs_list:
+        root_pg_controller_services.append({
+            "name": cs.component.name,
+            "type": cs.component.type,
+            "state": cs.component.state,
+            "properties": _clean_properties(cs.component.properties),
+        })
+
     pp_list = list_parameter_providers()
     parameter_providers = []
     for pp in pp_list:
@@ -149,6 +159,7 @@ def describe_nifi_state(runtime_url, pat=None, nifi_auth=None):
 
     return {
         "controller_services": controller_services,
+        "root_pg_controller_services": root_pg_controller_services,
         "parameter_providers": parameter_providers,
         "flow_registries": flow_registries,
         "flows": flows,

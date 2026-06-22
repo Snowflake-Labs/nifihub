@@ -19,6 +19,24 @@ Each `config.yaml` defines one Snowflake account's Openflow resources. Changes m
 
 ### Account
 
+```yaml
+# Controller-level: required for parameter providers and reporting tasks
+controller_services:
+  - name: SnowflakeConnection
+    type: com.snowflake.openflow.runtime.services.snowflake.SnowflakeConnectionService
+    properties:
+      Authentication Strategy: SNOWFLAKE_MANAGED
+
+# Root process group: shared across all flows in this runtime
+root_pg_controller_services:
+  - name: SharedSSLContext
+    type: org.apache.nifi.ssl.StandardRestrictedSSLContextService
+    properties:
+      TrustStore Filename: /etc/ssl/certs/ca-certificates.crt
+      TrustStore Type: JKS
+      Keystore Password: ${{ secrets.KEYSTORE_PASSWORD }}
+```
+
 | Field | Required | Description |
 |-------|----------|-------------|
 | `name` | Yes | Human-readable account name (used in logs and comments) |
@@ -55,7 +73,8 @@ Only one deployment per account is allowed.
 | `comment` | No | Description (max 1024 chars) |
 | `network_rules` | No | Array of network rule definitions |
 | `flow_registries` | No | Array of Flow Registry Client definitions |
-| `controller_services` | No | Array of controller-level services (root process group scope) |
+| `controller_services` | No | Array of controller-level services — visible to parameter providers and reporting tasks; shared across the entire NiFi instance. See [Controller Services](#controller-services). |
+|| `root_pg_controller_services` | No | Array of root process group-scoped services — accessible to all flow processors deployed to this runtime. See [Controller Services](#controller-services). |
 | `parameter_providers` | No | Array of parameter provider definitions |
 | `flows` | No | Array of flow definitions |
 | `connectors` | No | Array of Openflow connector definitions |
@@ -77,7 +96,15 @@ Only one deployment per account is allowed.
 | `type` | No | Fully-qualified Java type. If omitted, the first available Git-based type is used. |
 | `properties` | Yes | Key-value properties passed to the registry client API. Sensitive values (e.g. Personal Access Token) are injected from GitHub Environment secrets using `${{ secrets.NAME }}` syntax. |
 
-### Controller Service
+### Controller Services
+
+NiFi has two scopes for controller services. Use the right key depending on what needs to reference the service:
+
+> **`controller_services`** — Created at the NiFi controller level (`POST /controller/controller-services`). Visible to parameter providers and reporting tasks across the entire instance. Use this when a service must be referenced by a **parameter provider** (e.g. `SnowflakeConnectionService` consumed by `SnowflakeParameterProvider`). Controller service names in parameter provider `properties` are automatically resolved to their NiFi UUIDs at apply time.
+>
+> **`root_pg_controller_services`** — Created inside the root process group (`POST /process-groups/root/controller-services`). Accessible to processors in all flows deployed to this runtime, but not visible outside the process group hierarchy. Use this for services shared across multiple flows that do not need to be at the NiFi controller level (e.g. `StandardRestrictedSSLContextService`, `StandardHttpContextMap`).
+
+Both keys accept the same object structure:
 
 | Field | Required | Description |
 |-------|----------|-------------|

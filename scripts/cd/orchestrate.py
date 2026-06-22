@@ -35,7 +35,10 @@ from setup_registry_client import setup as setup_registry, find_registry_client,
 from manage_flows import reconcile_flows, delete_flows, find_flow_pg_by_name, configure_nifi, start_flow, stop_flow
 from manage_parameters import reconcile_flow_parameters, add_inherited_parameter_contexts, apply_parameter_overrides
 from manage_assets import reconcile_flow_assets
-from manage_controller_services import reconcile_controller_services, delete_controller_services
+from manage_controller_services import (
+    reconcile_controller_services, delete_controller_services,
+    reconcile_root_pg_controller_services, delete_root_pg_controller_services,
+)
 from manage_parameter_providers import reconcile_parameter_providers, delete_parameter_providers, fetch_auto_provisioned_provider
 from manage_connectors import (
     create_connector, connector_exists, describe_connector,
@@ -158,6 +161,23 @@ def _delete_controller_services(services, runtime_url, nifi_auth=None):
         return
     nifi_pat = _get_nifi_pat()
     delete_controller_services(services, runtime_url, nifi_pat, nifi_auth=nifi_auth)
+
+
+def _reconcile_root_pg_controller_services(rt, runtime_url):
+    """Reconcile all desired root process group-scoped controller services."""
+    services = rt.get("root_pg_controller_services", [])
+    if not services:
+        return
+    nifi_pat = _get_nifi_pat()
+    reconcile_root_pg_controller_services(services, runtime_url, nifi_pat, nifi_auth=_get_nifi_auth(rt))
+
+
+def _delete_root_pg_controller_services(services, runtime_url, nifi_auth=None):
+    """Delete root PG controller services explicitly removed from config."""
+    if not services:
+        return
+    nifi_pat = _get_nifi_pat()
+    delete_root_pg_controller_services(services, runtime_url, nifi_pat, nifi_auth=nifi_auth)
 
 
 def _reconcile_parameter_providers(rt, runtime_url):
@@ -452,6 +472,7 @@ def apply_runtime_create(deployment_name, rt, conn):
 
     _setup_flow_registries(rt, runtime_url)
     _reconcile_controller_services(rt, runtime_url)
+    _reconcile_root_pg_controller_services(rt, runtime_url)
     pp_context_names = _reconcile_parameter_providers(rt, runtime_url)
     _reconcile_flows(rt, runtime_url, provider_context_names=pp_context_names)
     _reconcile_connectors(rt, conn)
@@ -518,6 +539,7 @@ def apply_deployment_modifications(modified_deps, conn, errors):
                     _delete_flows(rt.get("flows", []), rt, runtime_url)
                     _delete_parameter_providers(rt.get("parameter_providers", []), runtime_url, nifi_auth=_get_nifi_auth(rt))
                     _delete_controller_services(rt.get("controller_services", []), runtime_url, nifi_auth=_get_nifi_auth(rt))
+                    _delete_root_pg_controller_services(rt.get("root_pg_controller_services", []), runtime_url, nifi_auth=_get_nifi_auth(rt))
                 if _has_som_api(rt):
                     delete_runtime(rt["name"], rt["database"], rt["schema"], **conn)
                     delete_runtime_eai(
@@ -586,6 +608,7 @@ def apply_runtime_modification(mod, conn):
 
     _setup_flow_registries(rt, runtime_url)
     _reconcile_controller_services(rt, runtime_url)
+    _reconcile_root_pg_controller_services(rt, runtime_url)
     pp_context_names = _reconcile_parameter_providers(rt, runtime_url)
     _reconcile_flows(rt, runtime_url, provider_context_names=pp_context_names)
     _reconcile_connectors(rt, conn)
@@ -601,6 +624,10 @@ def apply_runtime_modification(mod, conn):
     cs_changes = mod.get("controller_service_changes", {})
     if cs_changes.get("deleted"):
         _delete_controller_services(cs_changes["deleted"], runtime_url, nifi_auth=_get_nifi_auth(rt))
+
+    root_pg_cs_changes = mod.get("root_pg_controller_service_changes", {})
+    if root_pg_cs_changes.get("deleted"):
+        _delete_root_pg_controller_services(root_pg_cs_changes["deleted"], runtime_url, nifi_auth=_get_nifi_auth(rt))
 
     reg_changes = mod.get("flow_registry_changes", {})
     if reg_changes.get("deleted"):
@@ -623,6 +650,7 @@ def apply_deployment_deletes(deleted_deps, conn, errors):
                     _delete_flows(rt.get("flows", []), rt, runtime_url)
                     _delete_parameter_providers(rt.get("parameter_providers", []), runtime_url, nifi_auth=_get_nifi_auth(rt))
                     _delete_controller_services(rt.get("controller_services", []), runtime_url, nifi_auth=_get_nifi_auth(rt))
+                    _delete_root_pg_controller_services(rt.get("root_pg_controller_services", []), runtime_url, nifi_auth=_get_nifi_auth(rt))
                 _delete_connectors(rt.get("connectors", []), rt["database"], rt["schema"], conn)
 
                 if _has_som_api(rt):
