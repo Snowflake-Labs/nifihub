@@ -199,6 +199,7 @@ def format_nifi_section(nifi_diff, summary_only=False):
         return lines
 
     cs_diff = nifi_diff.get("controller_services", {})
+    rpcs_diff = nifi_diff.get("root_pg_controller_services", {})
     pp_diff = nifi_diff.get("parameter_providers", {})
     reg_diff = nifi_diff.get("flow_registries", {})
     flow_diff = nifi_diff.get("flows", {})
@@ -206,17 +207,20 @@ def format_nifi_section(nifi_diff, summary_only=False):
 
     has_nifi_changes = any(
         d.get("created") or d.get("modified") or d.get("deleted")
-        for d in [cs_diff, pp_diff, reg_diff, flow_diff]
+        for d in [cs_diff, rpcs_diff, pp_diff, reg_diff, flow_diff]
     ) or any(p.get("changes") for p in param_diffs.values())
 
     if summary_only and not has_nifi_changes:
         cs_count = len(cs_diff.get("unchanged", []))
+        rpcs_count = len(rpcs_diff.get("unchanged", []))
         pp_count = len(pp_diff.get("unchanged", []))
         reg_count = len(reg_diff.get("unchanged", []))
         flow_count = len(flow_diff.get("unchanged", []))
         parts = []
         if cs_count:
             parts.append(f"{cs_count} controller service(s)")
+        if rpcs_count:
+            parts.append(f"{rpcs_count} root-PG controller service(s)")
         if pp_count:
             parts.append(f"{pp_count} parameter provider(s)")
         if reg_count:
@@ -240,6 +244,20 @@ def format_nifi_section(nifi_diff, summary_only=False):
             changes_str = ", ".join(cs_mod.get("changes", {}).keys())
             lines.append(f"| {cs_mod['name']} | — | :pencil2: {changes_str} |")
         for cs in cs_diff.get("deleted", []):
+            lines.append(f"| {cs['name']} | {cs.get('type', '?')} | :wastebasket: to remove |")
+        lines.append("")
+
+    if rpcs_diff.get("created") or rpcs_diff.get("modified") or rpcs_diff.get("deleted") or rpcs_diff.get("unchanged"):
+        lines.append("| Root PG Controller Service | Type | Status |")
+        lines.append("|---|---|---|")
+        for name in rpcs_diff.get("unchanged", []):
+            lines.append(f"| {name} | — | :white_check_mark: no changes |")
+        for cs in rpcs_diff.get("created", []):
+            lines.append(f"| {cs['name']} | {cs.get('type', '?')} | :new: to create |")
+        for cs_mod in rpcs_diff.get("modified", []):
+            changes_str = ", ".join(cs_mod.get("changes", {}).keys())
+            lines.append(f"| {cs_mod['name']} | — | :pencil2: {changes_str} |")
+        for cs in rpcs_diff.get("deleted", []):
             lines.append(f"| {cs['name']} | {cs.get('type', '?')} | :wastebasket: to remove |")
         lines.append("")
 

@@ -41,8 +41,9 @@ def list_controller_services():
 
 
 def find_controller_service_by_name(name):
+    target = name.upper()
     for cs in list_controller_services():
-        if cs.component.name == name:
+        if cs.component.name.upper() == target:
             return cs
     return None
 
@@ -54,7 +55,7 @@ def _refresh(name):
     return cs
 
 
-def _set_state(cs, state):
+def _set_state(cs, state, refresh_fn=None, timeout=60, interval=2):
     api = nipyapi.nifi.ControllerServicesApi()
     body = nipyapi.nifi.ControllerServiceRunStatusEntity(
         revision=cs.revision,
@@ -62,8 +63,17 @@ def _set_state(cs, state):
     )
     api.update_run_status1(id=cs.id, body=body)
     print(f"[cs] '{cs.component.name}' -> {state}")
-    time.sleep(2)
-    return _refresh(cs.component.name)
+    fn = refresh_fn or _refresh
+    name = cs.component.name
+    deadline = time.time() + timeout
+    while True:
+        cs = fn(name)
+        if cs.component.state == state:
+            return cs
+        if time.time() >= deadline:
+            print(f"[cs] WARNING: '{name}' still {cs.component.state} after {timeout}s (target {state})")
+            return cs
+        time.sleep(interval)
 
 
 def _create(svc_spec):
@@ -143,18 +153,107 @@ def delete_controller_services(services, runtime_url, nifi_pat, nifi_auth=None):
         print(f"[cs] Deleted '{name}'")
 
 
+# ---------------------------------------------------------------------------
+# Root process group-scoped controller services
+# ---------------------------------------------------------------------------
+
+def list_root_pg_controller_services():
+    """List controller services created inside the root process group."""
+    api = nipyapi.nifi.FlowApi()
+    result = api.get_controller_services_from_group(id='root')
+    return result.controller_services or []
+
+
+def find_root_pg_controller_service_by_name(name):
+    target = name.upper()
+    for cs in list_root_pg_controller_services():
+        if cs.component.name.upper() == target:
+            return cs
+    return None
+
+
+def _refresh_root_pg(name):
+    cs = find_root_pg_controller_service_by_name(name)
+    if cs is None:
+        raise RuntimeError(f"Root PG controller service '{name}' disappeared unexpectedly")
+    return cs
+
+
+def _create_root_pg(svc_spec):
+    api = nipyapi.nifi.ProcessGroupsApi()
+    body = nipyapi.nifi.ControllerServiceEntity(
+        revision=nipyapi.nifi.RevisionDTO(version=0),
+        component=nipyapi.nifi.ControllerServiceDTO(
+            name=svc_spec["name"],
+            type=svc_spec["type"],
+            properties=svc_spec.get("properties", {}),
+        ),
+    )
+    result = api.create_controller_service(id='root', body=body)
+    print(f"[root-pg-cs] Created '{svc_spec['name']}' (id={result.id})")
+    return result
+
+
+def reconcile_root_pg_controller_services(services, runtime_url, nifi_pat, nifi_auth=None):
+    """Idempotent reconcile for root process group-scoped controller services."""
+    configure_nifi(runtime_url, pat=nifi_pat, nifi_auth=nifi_auth)
+    for svc_spec in services:
+        name = svc_spec["name"]
+        desired_props = svc_spec.get("properties", {})
+        cs = find_root_pg_controller_service_by_name(name)
+
+        if not cs:
+            _create_root_pg(svc_spec)
+            cs = _refresh_root_pg(name)
+        else:
+            if not _properties_match(cs, desired_props):
+                if cs.component.state == "ENABLED":
+                    cs = _set_state(cs, "DISABLED", refresh_fn=_refresh_root_pg)
+                cs = _update_properties(cs, desired_props)
+                cs = _refresh_root_pg(name)
+            else:
+                print(f"[root-pg-cs] '{name}' properties up-to-date")
+
+        if cs.component.state != "ENABLED":
+            _set_state(cs, "ENABLED", refresh_fn=_refresh_root_pg)
+        else:
+            print(f"[root-pg-cs] '{name}' already ENABLED")
+
+
+def delete_root_pg_controller_services(services, runtime_url, nifi_pat, nifi_auth=None):
+    """Disable and delete root process group-scoped controller services."""
+    configure_nifi(runtime_url, pat=nifi_pat, nifi_auth=nifi_auth)
+    for svc_spec in services:
+        name = svc_spec["name"]
+        cs = find_root_pg_controller_service_by_name(name)
+        if not cs:
+            print(f"[root-pg-cs] '{name}' not found, skipping delete")
+            continue
+        if cs.component.state == "ENABLED":
+            _set_state(cs, "DISABLED", refresh_fn=_refresh_root_pg)
+        api = nipyapi.nifi.ControllerServicesApi()
+        api.remove_controller_service(id=cs.id, version=str(cs.revision.version))
+        print(f"[root-pg-cs] Deleted '{name}'")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Manage controller services on NiFi runtime")
     parser.add_argument("action", choices=["reconcile", "delete"])
     parser.add_argument("--services", required=True, help="JSON array of controller service specs")
     parser.add_argument("--runtime-url", required=True)
     parser.add_argument("--nifi-pat", required=True)
+    parser.add_argument("--scope", choices=["controller", "root-pg"], default="controller",
+                        help="Scope: controller-level (default) or root process group-scoped")
     args = parser.parse_args()
     services = json.loads(args.services)
+    if args.scope == "root-pg":
+        reconcile_fn, delete_fn = reconcile_root_pg_controller_services, delete_root_pg_controller_services
+    else:
+        reconcile_fn, delete_fn = reconcile_controller_services, delete_controller_services
     if args.action == "reconcile":
-        reconcile_controller_services(services, args.runtime_url, args.nifi_pat)
+        reconcile_fn(services, args.runtime_url, args.nifi_pat)
     elif args.action == "delete":
-        delete_controller_services(services, args.runtime_url, args.nifi_pat)
+        delete_fn(services, args.runtime_url, args.nifi_pat)
 
 
 if __name__ == "__main__":

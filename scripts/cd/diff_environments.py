@@ -55,7 +55,7 @@ def diff_runtimes(old_runtimes, new_runtimes):
         new_rt = mod["new"]
         changed_fields = {}
         for key in set(list(old_rt.keys()) + list(new_rt.keys())):
-            if key in ("flows", "network_rules", "flow_registries", "controller_services", "parameter_providers", "connectors"):
+            if key in ("flows", "network_rules", "flow_registries", "controller_services", "root_pg_controller_services", "parameter_providers", "connectors"):
                 continue
             if old_rt.get(key) != new_rt.get(key):
                 changed_fields[key] = {"old": old_rt.get(key), "new": new_rt.get(key)}
@@ -76,6 +76,10 @@ def diff_runtimes(old_runtimes, new_runtimes):
         new_cs = new_rt.get("controller_services", [])
         controller_service_changes = diff_controller_services(old_cs, new_cs)
 
+        old_root_pg_cs = old_rt.get("root_pg_controller_services", [])
+        new_root_pg_cs = new_rt.get("root_pg_controller_services", [])
+        root_pg_controller_service_changes = diff_controller_services(old_root_pg_cs, new_root_pg_cs)
+
         old_pp = old_rt.get("parameter_providers", [])
         new_pp = new_rt.get("parameter_providers", [])
         parameter_provider_changes = diff_controller_services(old_pp, new_pp)
@@ -91,6 +95,7 @@ def diff_runtimes(old_runtimes, new_runtimes):
             "changed_fields": changed_fields,
             "flow_changes": flow_changes,
             "controller_service_changes": controller_service_changes,
+            "root_pg_controller_service_changes": root_pg_controller_service_changes,
             "parameter_provider_changes": parameter_provider_changes,
             "connector_changes": connector_changes,
             "network_rule_changes": {

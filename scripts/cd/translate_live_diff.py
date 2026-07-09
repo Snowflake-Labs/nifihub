@@ -46,11 +46,13 @@ def _translate_nifi_changes(nifi_diff):
         return {
             "flow_changes": {"created": [], "modified": [], "deleted": []},
             "controller_service_changes": {"created": [], "modified": [], "deleted": []},
+            "root_pg_controller_service_changes": {"created": [], "modified": [], "deleted": []},
             "parameter_provider_changes": {"created": [], "modified": [], "deleted": []},
             "flow_registries_changed": False,
         }
 
     cs_diff = nifi_diff.get("controller_services", {})
+    root_pg_cs_diff = nifi_diff.get("root_pg_controller_services", {})
     pp_diff = nifi_diff.get("parameter_providers", {})
     reg_diff = nifi_diff.get("flow_registries", {})
     flow_diff = nifi_diff.get("flows", {})
@@ -72,6 +74,12 @@ def _translate_nifi_changes(nifi_diff):
         "deleted": cs_diff.get("deleted", []),
     }
 
+    root_pg_cs_changes = {
+        "created": root_pg_cs_diff.get("created", []),
+        "modified": [{"old": m, "new": m} for m in root_pg_cs_diff.get("modified", [])],
+        "deleted": root_pg_cs_diff.get("deleted", []),
+    }
+
     pp_changes = {
         "created": pp_diff.get("created", []),
         "modified": [{"old": m, "new": m} for m in pp_diff.get("modified", [])],
@@ -81,6 +89,7 @@ def _translate_nifi_changes(nifi_diff):
     return {
         "flow_changes": flow_changes,
         "controller_service_changes": cs_changes,
+        "root_pg_controller_service_changes": root_pg_cs_changes,
         "parameter_provider_changes": pp_changes,
         "flow_registries_changed": flow_registries_changed,
         "flow_registry_changes": {

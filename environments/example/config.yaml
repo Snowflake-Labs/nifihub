@@ -204,6 +204,12 @@ deployments:
             type: com.snowflake.openflow.runtime.services.snowflake.SnowflakeConnectionService
             properties:
               Authentication Strategy: SNOWFLAKE_MANAGED
+        root_pg_controller_services:
+          - name: SharedSSLContext
+            type: org.apache.nifi.ssl.StandardRestrictedSSLContextService
+            properties:
+              TrustStore Filename: /etc/ssl/certs/ca-certificates.crt
+              TrustStore Type: JKS
         flows:
           - name: "CDC Postgres Demo - Data Generator"
             registry: nifihub
