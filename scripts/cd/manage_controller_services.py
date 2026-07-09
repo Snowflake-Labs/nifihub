@@ -41,8 +41,9 @@ def list_controller_services():
 
 
 def find_controller_service_by_name(name):
+    target = name.upper()
     for cs in list_controller_services():
-        if cs.component.name == name:
+        if cs.component.name.upper() == target:
             return cs
     return None
 
@@ -54,7 +55,7 @@ def _refresh(name):
     return cs
 
 
-def _set_state(cs, state, refresh_fn=None):
+def _set_state(cs, state, refresh_fn=None, timeout=60, interval=2):
     api = nipyapi.nifi.ControllerServicesApi()
     body = nipyapi.nifi.ControllerServiceRunStatusEntity(
         revision=cs.revision,
@@ -62,9 +63,17 @@ def _set_state(cs, state, refresh_fn=None):
     )
     api.update_run_status1(id=cs.id, body=body)
     print(f"[cs] '{cs.component.name}' -> {state}")
-    time.sleep(2)
     fn = refresh_fn or _refresh
-    return fn(cs.component.name)
+    name = cs.component.name
+    deadline = time.time() + timeout
+    while True:
+        cs = fn(name)
+        if cs.component.state == state:
+            return cs
+        if time.time() >= deadline:
+            print(f"[cs] WARNING: '{name}' still {cs.component.state} after {timeout}s (target {state})")
+            return cs
+        time.sleep(interval)
 
 
 def _create(svc_spec):
@@ -156,8 +165,9 @@ def list_root_pg_controller_services():
 
 
 def find_root_pg_controller_service_by_name(name):
+    target = name.upper()
     for cs in list_root_pg_controller_services():
-        if cs.component.name == name:
+        if cs.component.name.upper() == target:
             return cs
     return None
 
@@ -232,12 +242,18 @@ def main():
     parser.add_argument("--services", required=True, help="JSON array of controller service specs")
     parser.add_argument("--runtime-url", required=True)
     parser.add_argument("--nifi-pat", required=True)
+    parser.add_argument("--scope", choices=["controller", "root-pg"], default="controller",
+                        help="Scope: controller-level (default) or root process group-scoped")
     args = parser.parse_args()
     services = json.loads(args.services)
+    if args.scope == "root-pg":
+        reconcile_fn, delete_fn = reconcile_root_pg_controller_services, delete_root_pg_controller_services
+    else:
+        reconcile_fn, delete_fn = reconcile_controller_services, delete_controller_services
     if args.action == "reconcile":
-        reconcile_controller_services(services, args.runtime_url, args.nifi_pat)
+        reconcile_fn(services, args.runtime_url, args.nifi_pat)
     elif args.action == "delete":
-        delete_controller_services(services, args.runtime_url, args.nifi_pat)
+        delete_fn(services, args.runtime_url, args.nifi_pat)
 
 
 if __name__ == "__main__":

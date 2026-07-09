@@ -74,7 +74,7 @@ Only one deployment per account is allowed.
 | `network_rules` | No | Array of network rule definitions |
 | `flow_registries` | No | Array of Flow Registry Client definitions |
 | `controller_services` | No | Array of controller-level services — visible to parameter providers and reporting tasks; shared across the entire NiFi instance. See [Controller Services](#controller-services). |
-|| `root_pg_controller_services` | No | Array of root process group-scoped services — accessible to all flow processors deployed to this runtime. See [Controller Services](#controller-services). |
+| `root_pg_controller_services` | No | Array of root process group-scoped services — accessible to all flow processors deployed to this runtime. See [Controller Services](#controller-services). |
 | `parameter_providers` | No | Array of parameter provider definitions |
 | `flows` | No | Array of flow definitions |
 | `connectors` | No | Array of Openflow connector definitions |
