@@ -55,14 +55,14 @@
 
         <!-- NiFi versions -->
         <nifi.version>2.10.0</nifi.version>
-        <nifi-api.version>2.9.0</nifi-api.version>
+        <nifi-api.version>2.10.0</nifi-api.version>
         <nifi.nar.maven.plugin.version>2.3.0</nifi.nar.maven.plugin.version>
 
         <!-- Logging -->
         <org.slf4j.version>2.0.18</org.slf4j.version>
 
         <!-- Testing -->
-        <junit.version>6.1.1</junit.version>
+        <junit.version>6.1.2</junit.version>
         <mockito.version>5.23.0</mockito.version>
 
         <!-- Quality tools -->
