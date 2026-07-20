@@ -55,7 +55,7 @@
 
         <!-- NiFi versions -->
         <nifi.version>2.10.0</nifi.version>
-        <nifi-api.version>2.9.0</nifi-api.version>
+        <nifi-api.version>2.10.0</nifi-api.version>
         <nifi.nar.maven.plugin.version>2.3.0</nifi.nar.maven.plugin.version>
 
         <!-- Logging -->
@@ -67,7 +67,7 @@
 
         <!-- Quality tools -->
         <pmd.version>7.26.0</pmd.version>
-        <checkstyle.version>13.7.0</checkstyle.version>
+        <checkstyle.version>13.8.0</checkstyle.version>
         <jacoco.version>0.8.15</jacoco.version>
         <surefire.version>3.5.6</surefire.version>
     </properties>
