@@ -62,12 +62,12 @@
         <org.slf4j.version>2.0.18</org.slf4j.version>
 
         <!-- Testing -->
-        <junit.version>6.1.1</junit.version>
+        <junit.version>6.1.2</junit.version>
         <mockito.version>5.23.0</mockito.version>
 
         <!-- Quality tools -->
         <pmd.version>7.26.0</pmd.version>
-        <checkstyle.version>13.7.0</checkstyle.version>
+        <checkstyle.version>13.8.0</checkstyle.version>
         <jacoco.version>0.8.15</jacoco.version>
         <surefire.version>3.5.6</surefire.version>
     </properties>
