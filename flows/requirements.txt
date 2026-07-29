@@ -1,3 +1,3 @@
-nipyapi>=1.5.1
+nipyapi>=1.7.0
 pytest>=9.1.1
 requests>=2.34.2
