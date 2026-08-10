@@ -2,7 +2,7 @@
   "flowContents": {
     "identifier": "hello-world-example",
     "instanceIdentifier": "1a8f8295-019d-1000-ffff-ffffe15f00d4",
-    "name": "Hello World",
+    "name": "Hello World 1",
     "comments": "A minimal example flow that generates a FlowFile and logs its attributes.",
     "position": {
       "x": 0,
