@@ -225,7 +225,7 @@ The CD pipeline supports two modes depending on whether your Snowflake account h
 
 **SOM-enabled accounts** (default): The pipeline manages the full lifecycle of deployments and runtimes via Snowflake SQL (`CREATE/ALTER/DROP OPENFLOW DEPLOYMENT`, `CREATE/ALTER/SUSPEND/RESUME OPENFLOW RUNTIME`). It also manages network rules, EAIs, and connectors via SQL. This is the standard mode — you declare runtimes with `node_type`, `min_nodes`, `max_nodes`, etc. and the pipeline provisions them.
 
-**Non-SOM accounts** (URL-managed): If your account does not support SOM, runtimes must be pre-provisioned outside of this pipeline. To use the CD pipeline for NiFi-level resource management only (flow registries, flows, parameters, controller services), add a `url` field to the runtime configuration pointing to the existing NiFi API endpoint:
+**Non-SOM accounts** (URL-managed): If your account does not support SOM, runtimes must be pre-provisioned outside of this pipeline. To use the CD pipeline for NiFi-level resource management only (flow registries, flows, parameters, controller services, and service bindings), add a `url` field to the runtime configuration pointing to the existing NiFi API endpoint:
 
 ```yaml
 runtimes:
@@ -241,7 +241,7 @@ runtimes:
         # ...
 ```
 
-When `url` is present, the pipeline skips all SOM SQL operations (no deployment creation, no runtime create/alter/suspend/resume, no EAI or network rule management). It connects directly to the NiFi REST API at the given URL to manage flow registries, flows, parameters, controller services, and parameter providers.
+When `url` is present, the pipeline skips all SOM SQL operations (no deployment creation, no runtime create/alter/suspend/resume, no EAI or network rule management). It connects directly to the NiFi REST API at the given URL to manage flow registries, flows, parameters, controller services, service bindings, and parameter providers.
 
 For open-source Apache NiFi instances that use username/password login (rather than Snowflake Bearer tokens), add a `nifi_auth` block:
 

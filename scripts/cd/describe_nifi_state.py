@@ -21,6 +21,7 @@ import nipyapi
 
 from manage_flows import configure_nifi, list_process_groups
 from manage_controller_services import list_controller_services, list_root_pg_controller_services
+from manage_service_bindings import build_root_pg_service_uuid_to_name_map, describe_flow_service_bindings
 from setup_registry_client import list_registry_clients
 import manage_parameter_providers  # noqa: F401 — triggers monkey patch
 
@@ -76,7 +77,7 @@ def get_flow_parameters(pg_id):
     return params
 
 
-def describe_nifi_state(runtime_url, pat=None, nifi_auth=None):
+def describe_nifi_state(runtime_url, pat=None, nifi_auth=None, desired_flows=None):
     configure_nifi(runtime_url, pat=pat, nifi_auth=nifi_auth)
 
     registries = list_registry_clients()
@@ -96,11 +97,13 @@ def describe_nifi_state(runtime_url, pat=None, nifi_auth=None):
     root_pg_controller_services = []
     for cs in root_pg_cs_list:
         root_pg_controller_services.append({
+            "id": cs.component.id,
             "name": cs.component.name,
             "type": cs.component.type,
             "state": cs.component.state,
             "properties": _clean_properties(cs.component.properties),
         })
+    root_pg_service_uuid_to_name = build_root_pg_service_uuid_to_name_map(root_pg_controller_services)
 
     pp_list = list_parameter_providers()
     parameter_providers = []
@@ -122,6 +125,9 @@ def describe_nifi_state(runtime_url, pat=None, nifi_auth=None):
     process_groups = list_process_groups()
     flows = []
     parameters = {}
+    desired_flows_by_name = {
+        flow["name"].upper(): flow for flow in (desired_flows or []) if flow.get("name")
+    }
 
     for pg in process_groups:
         vci = pg.component.version_control_information
@@ -147,6 +153,15 @@ def describe_nifi_state(runtime_url, pat=None, nifi_auth=None):
             flow_entry["running"] = True
         else:
             flow_entry["running"] = False
+
+        desired_flow = desired_flows_by_name.get(pg.component.name.upper(), {})
+        if desired_flow.get("service_bindings"):
+            flow_entry["service_bindings"] = describe_flow_service_bindings(
+                pg.id,
+                pg.component.name,
+                desired_flow.get("service_bindings", []),
+                root_pg_service_uuid_to_name,
+            )
 
         flows.append(flow_entry)
 

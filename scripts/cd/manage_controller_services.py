@@ -78,11 +78,20 @@ def _set_state(cs, state, refresh_fn=None, timeout=60, interval=2):
 
 def _create(svc_spec):
     api = nipyapi.nifi.ControllerApi()
+    bundle_spec = svc_spec.get("bundle")
+    bundle = None
+    if bundle_spec:
+        bundle = nipyapi.nifi.BundleDTO(
+            group=bundle_spec["group"],
+            artifact=bundle_spec["artifact"],
+            version=bundle_spec["version"],
+        )
     body = nipyapi.nifi.ControllerServiceEntity(
         revision=nipyapi.nifi.RevisionDTO(version=0),
         component=nipyapi.nifi.ControllerServiceDTO(
             name=svc_spec["name"],
             type=svc_spec["type"],
+            bundle=bundle,
             properties=svc_spec.get("properties", {}),
         ),
     )
@@ -181,11 +190,20 @@ def _refresh_root_pg(name):
 
 def _create_root_pg(svc_spec):
     api = nipyapi.nifi.ProcessGroupsApi()
+    bundle_spec = svc_spec.get("bundle")
+    bundle = None
+    if bundle_spec:
+        bundle = nipyapi.nifi.BundleDTO(
+            group=bundle_spec["group"],
+            artifact=bundle_spec["artifact"],
+            version=bundle_spec["version"],
+        )
     body = nipyapi.nifi.ControllerServiceEntity(
         revision=nipyapi.nifi.RevisionDTO(version=0),
         component=nipyapi.nifi.ControllerServiceDTO(
             name=svc_spec["name"],
             type=svc_spec["type"],
+            bundle=bundle,
             properties=svc_spec.get("properties", {}),
         ),
     )

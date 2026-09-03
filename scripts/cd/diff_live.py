@@ -240,6 +240,114 @@ def diff_nifi_flows(live_flows, desired_flows):
     return {"created": created, "modified": modified, "deleted": deleted, "unchanged": unchanged}
 
 
+def diff_nifi_service_bindings(live_flows, desired_flows):
+    live_idx = {f["name"].upper(): f for f in (live_flows or [])}
+    created = []
+    modified = []
+    deleted = []
+    unchanged = []
+    health = []
+    blocked = []
+
+    for desired_flow in desired_flows or []:
+        desired_bindings = desired_flow.get("service_bindings", [])
+        if not desired_bindings:
+            continue
+
+        live_flow = live_idx.get(desired_flow["name"].upper(), {})
+        live_bindings = {
+            binding.get("target"): binding
+            for binding in live_flow.get("service_bindings", [])
+        }
+
+        for desired_binding in desired_bindings:
+            live_binding = live_bindings.get(desired_binding["target"], {})
+            target_kind = live_binding.get("target_kind", "unknown")
+            process_group_path = live_binding.get("process_group_path", desired_flow["name"])
+            validation_status = live_binding.get("validation_status")
+            validation_errors = list(live_binding.get("validation_errors", []))
+            issues = list(live_binding.get("issues", []))
+            live_properties = live_binding.get("properties", {})
+            live_state = live_binding.get("state", "known")
+
+            if live_state != "known":
+                blocked.append({
+                    "flow": desired_flow["name"],
+                    "target": desired_binding["target"],
+                    "target_kind": target_kind,
+                    "process_group_path": process_group_path,
+                    "status": validation_status or "UNKNOWN",
+                    "messages": issues or ["Live binding state could not be read safely"],
+                })
+                continue
+
+            health_messages = []
+            if issues:
+                health_messages.extend(issues)
+            if validation_status and str(validation_status).upper() != "VALID":
+                health_messages.extend(validation_errors or [validation_status])
+            for property_name, property_state in live_properties.items():
+                warning = property_state.get("warning")
+                if warning:
+                    health_messages.append(f"{property_name}: {warning}")
+            if health_messages:
+                health.append({
+                    "flow": desired_flow["name"],
+                    "target": desired_binding["target"],
+                    "status": validation_status or "UNKNOWN",
+                    "messages": health_messages,
+                })
+
+            for property_name, desired_service in desired_binding.get("properties", {}).items():
+                property_state = live_properties.get(property_name, {})
+                live_service = property_state.get("service")
+                warning = property_state.get("warning")
+                base_entry = {
+                    "flow": desired_flow["name"],
+                    "target": desired_binding["target"],
+                    "target_kind": target_kind,
+                    "process_group_path": process_group_path,
+                    "property": property_name,
+                }
+                if desired_service is None:
+                    if property_state.get("configured"):
+                        deleted.append({
+                            **base_entry,
+                            "live": live_service,
+                            "desired": None,
+                            "action": "remove",
+                        })
+                    else:
+                        unchanged.append({**base_entry, "desired": None})
+                    continue
+                if live_service == desired_service and not warning:
+                    unchanged.append({**base_entry, "desired": desired_service})
+                    continue
+                action = "create"
+                bucket = created
+                if warning:
+                    action = "repair"
+                    bucket = modified
+                elif live_service is not None and live_service != desired_service:
+                    action = "change"
+                    bucket = modified
+                bucket.append({
+                    **base_entry,
+                    "live": live_service,
+                    "desired": desired_service,
+                    "action": action,
+                })
+
+    return {
+        "created": created,
+        "modified": modified,
+        "deleted": deleted,
+        "unchanged": unchanged,
+        "health": health,
+        "blocked": blocked,
+    }
+
+
 def diff_nifi_parameters(live_params, desired_params):
     changes = {}
     unchanged = []
@@ -282,6 +390,10 @@ def diff_nifi_state(live_nifi, desired_rt):
         live_nifi.get("flows", []),
         desired_rt.get("flows", [])
     )
+    service_binding_diff = diff_nifi_service_bindings(
+        live_nifi.get("flows", []),
+        desired_rt.get("flows", [])
+    )
 
     param_diffs = {}
     live_params = live_nifi.get("parameters", {})
@@ -299,6 +411,7 @@ def diff_nifi_state(live_nifi, desired_rt):
         "flow_registries": reg_diff,
         "flows": flow_diff,
         "parameters": param_diffs,
+        "service_bindings": service_binding_diff,
     }
 
 
@@ -463,9 +576,9 @@ def diff_live(live_state, config_path):
                 nifi_diff = rt_diff.get("nifi", {})
                 nifi_has_changes = False
                 if nifi_diff and not nifi_diff.get("error"):
-                    for section in ("controller_services", "root_pg_controller_services", "parameter_providers", "flow_registries", "flows"):
+                    for section in ("controller_services", "root_pg_controller_services", "parameter_providers", "flow_registries", "flows", "service_bindings"):
                         sd = nifi_diff.get(section, {})
-                        if sd.get("created") or sd.get("modified") or sd.get("deleted"):
+                        if sd.get("created") or sd.get("modified") or sd.get("deleted") or sd.get("health") or sd.get("blocked"):
                             nifi_has_changes = True
                             break
                     if not nifi_has_changes:
@@ -498,9 +611,9 @@ def diff_live(live_state, config_path):
             nifi_diff = rt_diff.get("nifi", {})
             nifi_has_changes = False
             if nifi_diff and not nifi_diff.get("error"):
-                for section in ("controller_services", "root_pg_controller_services", "parameter_providers", "flow_registries", "flows"):
+                for section in ("controller_services", "root_pg_controller_services", "parameter_providers", "flow_registries", "flows", "service_bindings"):
                     sd = nifi_diff.get(section, {})
-                    if sd.get("created") or sd.get("modified") or sd.get("deleted"):
+                    if sd.get("created") or sd.get("modified") or sd.get("deleted") or sd.get("health") or sd.get("blocked"):
                         nifi_has_changes = True
                         break
                 if not nifi_has_changes:

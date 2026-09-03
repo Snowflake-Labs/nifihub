@@ -47,6 +47,7 @@ runtimes:
 - Parameter contexts and parameter values
 - Controller-level controller services (`controller_services` — used by parameter providers)
 - Root process group controller services (`root_pg_controller_services` — shared across all flows)
+- Service bindings from root-PG controller services to processors or flow-local controller services (`flows[].service_bindings`)
 - Parameter providers (including the auto-provisioned Snowflake Parameter Provider, if available)
 - Flow start/stop state
 
@@ -70,8 +71,17 @@ runtimes:
       verify_ssl: false   # set false for local self-signed certificates
 
     flow_registries: [...]
-    flows: [...]
+    root_pg_controller_services: [...]
+    flows:
+      - name: MY_FLOW
+        bucket: examples
+        flow: my-flow
+        version: latest
+        start: true
+        service_bindings: [...]
 ```
+
+Bound flows use the same `service_bindings` contract as SOM-managed runtimes. Declare referenced services under `root_pg_controller_services`, set `start` explicitly, and see the [complete environment schema reference](../environments/README.md#service-bindings) for validation and lifecycle behavior.
 
 ### nifi_auth Fields
 

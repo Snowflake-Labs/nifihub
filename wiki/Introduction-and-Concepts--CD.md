@@ -72,6 +72,7 @@ NiFi Hub uses a **GitOps** model for managing Openflow infrastructure. The `envi
 | Root PG Controller Services | Created/updated/deleted via NiFi REST API; accessible to all flow processors in the runtime (`root_pg_controller_services`) |
 | Parameter Providers | Created/updated/deleted via NiFi REST API |
 | Imported Flows | Pulled from the Git registry at a specified version |
+| Flow Service Bindings | Reconciled after import and parameter/asset application, binding root-PG controller services onto processor or flow-local controller service properties (`flows[].service_bindings`) |
 
 ### PR Validation
 
@@ -82,11 +83,22 @@ When a PR modifies an environment config, the **Environment CD Validate** workfl
 3. Runs connectivity checks against the target Snowflake account
 4. Posts a **change plan** comment on the PR showing exactly what resources will be created, modified, or deleted
 
+For bound flows, the change plan reports service-binding drift, binding-health warnings, and fail-closed live-read blockers using controller service names rather than live UUIDs.
+
 This gives reviewers a clear picture of the infrastructure impact before merging.
 
 ### Applying Changes
 
 When the PR merges to `main`, the **Environment CD** workflow applies the change plan to the target Snowflake account. Each environment runs in a separate GitHub Environment with its own credentials (`SNOWFLAKE_ACCOUNT_URL`, `SNOWFLAKE_USER`, `SNOWFLAKE_PAT`, `SNOWFLAKE_ROLE`).
+
+When `service_bindings` are declared on a flow, the apply sequence is:
+
+1. import or update the versioned flow
+2. apply inherited parameter contexts, assets, parameters, and overrides
+3. reconcile service bindings against the current imported components
+4. start or stop the flow according to the explicit `start` field
+
+Binding reconciliation runs on every apply, including unchanged YAML, so out-of-band drift is repaired. Any binding mutation quiesces the whole flow first, then validates the target and rolls back on failure. Root process group controller-service `bundle` coordinates are creation-time selectors only; existing services are not rebound to a different bundle.
 
 ### Triggering CD Manually
 

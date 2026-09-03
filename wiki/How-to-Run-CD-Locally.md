@@ -98,7 +98,7 @@ This demonstrates that NiFi Hub's GitOps tooling is portable — the same `confi
 
 When a runtime has a `url:` field, the CD pipeline:
 - **Skips** all Snowflake SQL operations (no `CREATE/ALTER OPENFLOW RUNTIME`, EAI, network rules)
-- **Still runs** NiFi API reconciliation (flow registries, flows, parameters, controller-level and root PG controller services)
+- **Still runs** NiFi API reconciliation (flow registries, flows, parameters, controller-level and root PG controller services, and service bindings)
 
 Authentication uses `nifi_auth` instead of `NIFI_RUNTIME_PAT`. See [Non-SOM Runtimes](Introduction-and-Concepts--Non-SOM-Runtimes) for the full model.
 
@@ -185,7 +185,9 @@ python scripts/run-cd.py environments/local/config.yaml
 1. **Describe** — no Snowflake SQL for the URL-managed runtime; NiFi state is read via REST API
 2. **Diff** — compares live NiFi state (flow registries, flows) against desired config
 3. **Translate** — URL-managed runtimes are always included in the apply list
-4. **Apply** — creates the `nifihub` registry client in NiFi and deploys the Hello World flow
+4. **Apply** — creates the `nifihub` registry client in NiFi, deploys the flow, reconciles any declared `service_bindings`, and then applies the final start/stop state
+
+If your local config uses `service_bindings`, declare the referenced controller services under `root_pg_controller_services` and set `start` explicitly on the flow. A binding change will stop the flow, update the target processor or controller service, validate it, and then let the final flow start logic restore the declared state. If NiFi Hub cannot read the live binding state safely, it fails closed and refuses to plan or apply binding changes for that runtime.
 
 After the run, open `https://localhost:8443/nifi` and you should see the Hello World flow running on the canvas.
 

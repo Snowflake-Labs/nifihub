@@ -261,7 +261,12 @@ def build_live_state(config_path, conn):
                     rt_entry["nifi"] = None
                 else:
                     try:
-                        nifi_state = describe_nifi_state(runtime_api_url, pat=nifi_pat, nifi_auth=nifi_auth)
+                        nifi_state = describe_nifi_state(
+                            runtime_api_url,
+                            pat=nifi_pat,
+                            nifi_auth=nifi_auth,
+                            desired_flows=rt_cfg.get("flows", []),
+                        )
                         rt_entry["nifi"] = nifi_state
                     except Exception as e:
                         print(f"[live] NiFi API error for {rt_name}: {e}", file=sys.stderr)
@@ -355,7 +360,12 @@ def build_live_state(config_path, conn):
                     elif not runtime_api_url.endswith("/nifi-api"):
                         runtime_api_url += "/nifi-api"
                     try:
-                        nifi_state = describe_nifi_state(runtime_api_url, pat=nifi_pat, nifi_auth=nifi_auth)
+                        nifi_state = describe_nifi_state(
+                            runtime_api_url,
+                            pat=nifi_pat,
+                            nifi_auth=nifi_auth,
+                            desired_flows=rt_cfg_match.get("flows", []) if rt_cfg_match else [],
+                        )
                         rt_entry["nifi"] = nifi_state
                     except Exception as e:
                         print(f"[live] NiFi API error for {rt_name}: {e}", file=sys.stderr)

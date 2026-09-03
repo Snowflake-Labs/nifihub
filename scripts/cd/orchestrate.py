@@ -40,6 +40,7 @@ from manage_controller_services import (
     reconcile_root_pg_controller_services, delete_root_pg_controller_services,
 )
 from manage_parameter_providers import reconcile_parameter_providers, delete_parameter_providers, fetch_auto_provisioned_provider
+from manage_service_bindings import reconcile_service_bindings
 from manage_connectors import (
     create_connector, connector_exists, describe_connector,
     apply_connector_config, get_connector_config, put_connector_config,
@@ -299,6 +300,18 @@ def _reconcile_flows(rt, runtime_url, provider_context_names=None):
                 apply_parameter_overrides(pg.id, flow_spec["parameter_overrides"], pg_name=flow_spec["name"])
             else:
                 print(f"[params] PG '{flow_spec['name']}' not found — skipping overrides")
+
+    flows_with_bindings = [f for f in flows if f.get("service_bindings")]
+    if flows_with_bindings:
+        configure_nifi(runtime_url, pat=nifi_pat, nifi_auth=nifi_auth)
+        for flow_spec in flows_with_bindings:
+            reconcile_service_bindings(
+                flow_spec,
+                rt.get("root_pg_controller_services", []),
+                runtime_url,
+                nifi_pat,
+                nifi_auth=nifi_auth,
+            )
 
     flows_to_start = [f for f in flows if f.get("start")]
     if flows_to_start:
@@ -605,6 +618,14 @@ def apply_runtime_modification(mod, conn):
     if rt.get("suspend"):
         print(f"[orchestrate] Runtime {rt['name']} has suspend=true — skipping NiFi reconciliation")
         return
+
+    blocked_bindings = mod.get("service_binding_changes", {}).get("blocked", [])
+    if blocked_bindings:
+        details = "; ".join(
+            f"{entry['flow']} / {entry['target']}: {'; '.join(entry.get('messages', []))}"
+            for entry in blocked_bindings
+        )
+        raise RuntimeError(f"Service binding live-state read failed; refusing to apply runtime '{rt['name']}': {details}")
 
     _setup_flow_registries(rt, runtime_url)
     _reconcile_controller_services(rt, runtime_url)
