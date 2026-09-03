@@ -210,6 +210,27 @@ deployments:
             properties:
               TrustStore Filename: /etc/ssl/certs/ca-certificates.crt
               TrustStore Type: JKS
+          - name: SharedDBCPConnectionPool
+            type: org.apache.nifi.dbcp.DBCPConnectionPool
+            bundle:
+              group: org.apache.nifi
+              artifact: nifi-dbcp-service-nar
+              version: 2.9.0
+            properties:
+              Database Connection URL: "jdbc:postgresql://postgres.example.com:5432/mydb"
+              Database Driver Class Name: org.postgresql.Driver
+              Database Driver Locations: "#{Database Driver}"
+              Database User: my_user
+              Password: "#{POSTGRES_PWD}" # inherited from the Snowflake Secrets Parameter Provider via root_parameter_context
+              Validation Query Timeout: "#{Shared Query Timeout}"
+        root_parameter_context:
+          provided_parameter_contexts: ".*POSTGRES"
+          parameters:
+            Shared Query Timeout: "30 secs"
+          assets:
+            - name: "postgresql-42.7.10.jar"
+              url: "https://jdbc.postgresql.org/download/postgresql-42.7.10.jar"
+              parameter: "Database Driver"
         flows:
           - name: "CDC Postgres Demo - Data Generator"
             registry: nifihub
@@ -217,6 +238,10 @@ deployments:
             flow: postgres-cdc-demo
             version: latest
             start: true
+            service_bindings:
+              - target: ExecuteSQLStatement
+                properties:
+                  Connection Pooling Service: SharedDBCPConnectionPool
             assets:
               - name: "postgresql-42.7.10.jar"
                 url: "https://jdbc.postgresql.org/download/postgresql-42.7.10.jar"

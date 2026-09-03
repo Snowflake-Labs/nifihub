@@ -48,6 +48,13 @@ def _translate_nifi_changes(nifi_diff):
             "controller_service_changes": {"created": [], "modified": [], "deleted": []},
             "root_pg_controller_service_changes": {"created": [], "modified": [], "deleted": []},
             "parameter_provider_changes": {"created": [], "modified": [], "deleted": []},
+            "root_parameter_context_changes": {
+                "created": [], "modified": [], "deleted": [], "health": [], "blocked": [], "unchanged": [],
+                "inheritance": {"missing": [], "unchanged": [], "unmatched_pattern": False},
+                "parameters": {"changes": {}, "unchanged": []},
+                "context": {},
+            },
+            "service_binding_changes": {"created": [], "modified": [], "deleted": [], "health": [], "blocked": []},
             "flow_registries_changed": False,
         }
 
@@ -86,11 +93,35 @@ def _translate_nifi_changes(nifi_diff):
         "deleted": pp_diff.get("deleted", []),
     }
 
+    service_binding_diff = nifi_diff.get("service_bindings", {})
+    service_binding_changes = {
+        "created": service_binding_diff.get("created", []),
+        "modified": service_binding_diff.get("modified", []),
+        "deleted": service_binding_diff.get("deleted", []),
+        "health": service_binding_diff.get("health", []),
+        "blocked": service_binding_diff.get("blocked", []),
+    }
+    root_parameter_context_diff = nifi_diff.get("root_parameter_context", {})
+    root_parameter_context_changes = {
+        "created": root_parameter_context_diff.get("created", []),
+        "modified": root_parameter_context_diff.get("modified", []),
+        "deleted": root_parameter_context_diff.get("deleted", []),
+        "health": root_parameter_context_diff.get("health", []),
+        "blocked": root_parameter_context_diff.get("blocked", []),
+        "unchanged": root_parameter_context_diff.get("unchanged", []),
+        "root_process_group_id": root_parameter_context_diff.get("root_process_group_id"),
+        "context": root_parameter_context_diff.get("context", {}),
+        "inheritance": root_parameter_context_diff.get("inheritance", {"missing": [], "unchanged": [], "unmatched_pattern": False}),
+        "parameters": root_parameter_context_diff.get("parameters", {"changes": {}, "unchanged": []}),
+    }
+
     return {
         "flow_changes": flow_changes,
         "controller_service_changes": cs_changes,
         "root_pg_controller_service_changes": root_pg_cs_changes,
         "parameter_provider_changes": pp_changes,
+        "root_parameter_context_changes": root_parameter_context_changes,
+        "service_binding_changes": service_binding_changes,
         "flow_registries_changed": flow_registries_changed,
         "flow_registry_changes": {
             "created": reg_diff.get("created", []),

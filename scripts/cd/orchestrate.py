@@ -18,7 +18,6 @@ import argparse
 import json
 import os
 import sys
-import traceback
 from collections import defaultdict
 
 from manage_deployment import (
@@ -39,7 +38,10 @@ from manage_controller_services import (
     reconcile_controller_services, delete_controller_services,
     reconcile_root_pg_controller_services, delete_root_pg_controller_services,
 )
+from manage_root_parameter_context import reconcile_root_parameter_context
 from manage_parameter_providers import reconcile_parameter_providers, delete_parameter_providers, fetch_auto_provisioned_provider
+from manage_service_bindings import reconcile_service_bindings
+from safe_exceptions import format_safe_exception
 from manage_connectors import (
     create_connector, connector_exists, describe_connector,
     apply_connector_config, get_connector_config, put_connector_config,
@@ -172,6 +174,35 @@ def _reconcile_root_pg_controller_services(rt, runtime_url):
     reconcile_root_pg_controller_services(services, runtime_url, nifi_pat, nifi_auth=_get_nifi_auth(rt))
 
 
+def _format_blocked_entries(entries):
+    parts = []
+    for entry in entries:
+        labels = []
+        if entry.get("parameter"):
+            labels.append(str(entry["parameter"]))
+        if entry.get("name"):
+            labels.append(str(entry["name"]))
+        if not labels:
+            labels.append("<unknown>")
+        messages = [str(message) for message in entry.get("messages", [])] or ["blocked"]
+        parts.append(f"{' -> '.join(labels)}: {'; '.join(messages)}")
+    return "; ".join(parts)
+
+
+def _reconcile_root_parameter_context(rt, runtime_url, provider_context_names):
+    spec = rt.get("root_parameter_context")
+    if not spec:
+        return
+    nifi_pat = _get_nifi_pat()
+    reconcile_root_parameter_context(
+        spec,
+        runtime_url,
+        nifi_pat,
+        nifi_auth=_get_nifi_auth(rt),
+        provider_context_names=provider_context_names,
+    )
+
+
 def _delete_root_pg_controller_services(services, runtime_url, nifi_auth=None):
     """Delete root PG controller services explicitly removed from config."""
     if not services:
@@ -299,6 +330,18 @@ def _reconcile_flows(rt, runtime_url, provider_context_names=None):
                 apply_parameter_overrides(pg.id, flow_spec["parameter_overrides"], pg_name=flow_spec["name"])
             else:
                 print(f"[params] PG '{flow_spec['name']}' not found — skipping overrides")
+
+    flows_with_bindings = [f for f in flows if f.get("service_bindings")]
+    if flows_with_bindings:
+        configure_nifi(runtime_url, pat=nifi_pat, nifi_auth=nifi_auth)
+        for flow_spec in flows_with_bindings:
+            reconcile_service_bindings(
+                flow_spec,
+                rt.get("root_pg_controller_services", []),
+                runtime_url,
+                nifi_pat,
+                nifi_auth=nifi_auth,
+            )
 
     flows_to_start = [f for f in flows if f.get("start")]
     if flows_to_start:
@@ -428,9 +471,8 @@ def apply_deployment_creates(created_deps, conn, errors):
             try:
                 apply_runtime_create(dep["name"], rt, conn)
             except Exception as e:
-                msg = f"Runtime {rt['name']} create failed: {e}"
+                msg = f"Runtime {rt['name']} create failed: {format_safe_exception(e)}"
                 print(f"[orchestrate] ERROR: {msg}")
-                traceback.print_exc()
                 errors.append(msg)
 
 
@@ -472,8 +514,9 @@ def apply_runtime_create(deployment_name, rt, conn):
 
     _setup_flow_registries(rt, runtime_url)
     _reconcile_controller_services(rt, runtime_url)
-    _reconcile_root_pg_controller_services(rt, runtime_url)
     pp_context_names = _reconcile_parameter_providers(rt, runtime_url)
+    _reconcile_root_parameter_context(rt, runtime_url, pp_context_names)
+    _reconcile_root_pg_controller_services(rt, runtime_url)
     _reconcile_flows(rt, runtime_url, provider_context_names=pp_context_names)
     _reconcile_connectors(rt, conn)
 
@@ -500,9 +543,8 @@ def apply_deployment_modifications(modified_deps, conn, errors):
             try:
                 apply_runtime_create(dep["name"], rt, conn)
             except Exception as e:
-                msg = f"Runtime {rt['name']} create failed: {e}"
+                msg = f"Runtime {rt['name']} create failed: {format_safe_exception(e)}"
                 print(f"[orchestrate] ERROR: {msg}")
-                traceback.print_exc()
                 errors.append(msg)
 
         for mod in rtc.get("modified", []):
@@ -520,9 +562,8 @@ def apply_deployment_modifications(modified_deps, conn, errors):
                         continue
                 apply_runtime_modification(mod, conn)
             except Exception as e:
-                msg = f"Runtime {rt_new['name']} modify failed: {e}"
+                msg = f"Runtime {rt_new['name']} modify failed: {format_safe_exception(e)}"
                 print(f"[orchestrate] ERROR: {msg}")
-                traceback.print_exc()
                 errors.append(msg)
 
         for rt in rtc.get("deleted", []):
@@ -547,9 +588,8 @@ def apply_deployment_modifications(modified_deps, conn, errors):
                         database=rt["database"], schema=rt["schema"], **conn
                     )
             except Exception as e:
-                msg = f"Runtime {rt['name']} delete failed: {e}"
+                msg = f"Runtime {rt['name']} delete failed: {format_safe_exception(e)}"
                 print(f"[orchestrate] ERROR: {msg}")
-                traceback.print_exc()
                 errors.append(msg)
 
 
@@ -606,10 +646,26 @@ def apply_runtime_modification(mod, conn):
         print(f"[orchestrate] Runtime {rt['name']} has suspend=true — skipping NiFi reconciliation")
         return
 
+    blocked_bindings = mod.get("service_binding_changes", {}).get("blocked", [])
+    if blocked_bindings:
+        details = "; ".join(
+            f"{entry['flow']} / {entry['target']}: {'; '.join(entry.get('messages', []))}"
+            for entry in blocked_bindings
+        )
+        raise RuntimeError(f"Service binding live-state read failed; refusing to apply runtime '{rt['name']}': {details}")
+
+    blocked_root_parameter_context = mod.get("root_parameter_context_changes", {}).get("blocked", [])
+    if blocked_root_parameter_context:
+        raise RuntimeError(
+            "Root parameter context live-state read failed; refusing to apply runtime "
+            f"'{rt['name']}': {_format_blocked_entries(blocked_root_parameter_context)}"
+        )
+
     _setup_flow_registries(rt, runtime_url)
     _reconcile_controller_services(rt, runtime_url)
-    _reconcile_root_pg_controller_services(rt, runtime_url)
     pp_context_names = _reconcile_parameter_providers(rt, runtime_url)
+    _reconcile_root_parameter_context(rt, runtime_url, pp_context_names)
+    _reconcile_root_pg_controller_services(rt, runtime_url)
     _reconcile_flows(rt, runtime_url, provider_context_names=pp_context_names)
     _reconcile_connectors(rt, conn)
 
@@ -660,9 +716,8 @@ def apply_deployment_deletes(deleted_deps, conn, errors):
                         database=rt["database"], schema=rt["schema"], **conn
                     )
             except Exception as e:
-                msg = f"Runtime {rt['name']} delete failed: {e}"
+                msg = f"Runtime {rt['name']} delete failed: {format_safe_exception(e)}"
                 print(f"[orchestrate] ERROR: {msg}")
-                traceback.print_exc()
                 errors.append(msg)
 
         som_rts = [rt for rt in dep.get("runtimes_to_delete", []) if _has_som_api(rt)]

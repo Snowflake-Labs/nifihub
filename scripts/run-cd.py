@@ -35,17 +35,15 @@ Typical usage:
     python scripts/run-cd.py environments/demo/config.yaml --dry-run
 
     # Apply against a local Apache NiFi using username/password auth
-    # (SNOWFLAKE_* vars still needed for describe_live_state even if no SQL runs)
     export GH_SECRETS_JSON='{"NIFI_PASSWORD":"admin","NIFIHUB_REGISTRY_PAT":"ghp_..."}'
     export GH_VARS_JSON='{"NIFI_USERNAME":"admin"}'
     python scripts/run-cd.py environments/local/config.yaml
 
 Required environment variables:
-    SNOWFLAKE_ACCOUNT_URL   Snowflake account URL (required even for non-SOM runtimes,
-                            used by describe_live_state.py to list connectors)
-    SNOWFLAKE_USER          Snowflake username
-    SNOWFLAKE_PAT           Snowflake Programmatic Access Token
-    SNOWFLAKE_ROLE          Snowflake role (e.g. OPENFLOW_ADMIN)
+    SNOWFLAKE_ACCOUNT_URL   Snowflake account URL for SOM or mixed configs
+    SNOWFLAKE_USER          Snowflake username for SOM or mixed configs
+    SNOWFLAKE_PAT           Snowflake Programmatic Access Token for SOM or mixed configs
+    SNOWFLAKE_ROLE          Snowflake role for SOM or mixed configs (e.g. OPENFLOW_ADMIN)
     NIFI_RUNTIME_PAT        NiFi Bearer token — not required if nifi_auth is set
                             in config.yaml with type: username_password
     NIFIHUB_REGISTRY_PAT    GitHub PAT for Flow Registry Clients
@@ -53,6 +51,9 @@ Required environment variables:
 Optional environment variables:
     GH_SECRETS_JSON         JSON object of secrets (for ${{ secrets.NAME }} resolution)
     GH_VARS_JSON            JSON object of variables (for ${{ vars.NAME }} resolution)
+
+For URL-managed-only configs, the pipeline skips Snowflake discovery entirely and
+does not require any `SNOWFLAKE_*` environment variables.
 """
 import argparse
 import json
@@ -99,7 +100,7 @@ def main():
         live_diff = os.path.join(tmp, "live-diff.json")
         changes = os.path.join(tmp, "changes.json")
 
-        # Step 1: Describe live state (queries Snowflake + NiFi REST API)
+        # Step 1: Describe live state (queries NiFi, plus Snowflake for SOM or mixed configs)
         print("[run-cd] Step 1/4: Describing live state...", file=sys.stderr)
         with open(live_state, "w") as out:
             _run(

@@ -61,7 +61,13 @@ def _set_state(cs, state, refresh_fn=None, timeout=60, interval=2):
         revision=cs.revision,
         state=state,
     )
-    api.update_run_status1(id=cs.id, body=body)
+    update_run_status = _select_api_method(
+        api,
+        ["update_run_status2", "update_run_status1"],
+        "ControllerServicesApi",
+        "controller service run-status update",
+    )
+    update_run_status(id=cs.id, body=body)
     print(f"[cs] '{cs.component.name}' -> {state}")
     fn = refresh_fn or _refresh
     name = cs.component.name
@@ -76,13 +82,30 @@ def _set_state(cs, state, refresh_fn=None, timeout=60, interval=2):
         time.sleep(interval)
 
 
+def _require_state(cs, state):
+    if cs.component.state != state:
+        raise RuntimeError(
+            f"Controller service '{cs.component.name}' did not reach {state}; current state is {cs.component.state}"
+        )
+    return cs
+
+
 def _create(svc_spec):
     api = nipyapi.nifi.ControllerApi()
+    bundle_spec = svc_spec.get("bundle")
+    bundle = None
+    if bundle_spec:
+        bundle = nipyapi.nifi.BundleDTO(
+            group=bundle_spec["group"],
+            artifact=bundle_spec["artifact"],
+            version=bundle_spec["version"],
+        )
     body = nipyapi.nifi.ControllerServiceEntity(
         revision=nipyapi.nifi.RevisionDTO(version=0),
         component=nipyapi.nifi.ControllerServiceDTO(
             name=svc_spec["name"],
             type=svc_spec["type"],
+            bundle=bundle,
             properties=svc_spec.get("properties", {}),
         ),
     )
@@ -179,17 +202,41 @@ def _refresh_root_pg(name):
     return cs
 
 
+def _select_api_method(api, candidate_names, api_name, operation_name):
+    for candidate_name in candidate_names:
+        method = getattr(api, candidate_name, None)
+        if callable(method):
+            return method
+    names = ", ".join(candidate_names)
+    raise AttributeError(f"{api_name} does not provide a supported {operation_name} method ({names})")
+
+
 def _create_root_pg(svc_spec):
     api = nipyapi.nifi.ProcessGroupsApi()
+    bundle_spec = svc_spec.get("bundle")
+    bundle = None
+    if bundle_spec:
+        bundle = nipyapi.nifi.BundleDTO(
+            group=bundle_spec["group"],
+            artifact=bundle_spec["artifact"],
+            version=bundle_spec["version"],
+        )
     body = nipyapi.nifi.ControllerServiceEntity(
         revision=nipyapi.nifi.RevisionDTO(version=0),
         component=nipyapi.nifi.ControllerServiceDTO(
             name=svc_spec["name"],
             type=svc_spec["type"],
+            bundle=bundle,
             properties=svc_spec.get("properties", {}),
         ),
     )
-    result = api.create_controller_service(id='root', body=body)
+    create_controller_service = _select_api_method(
+        api,
+        ["create_controller_service1", "create_controller_service"],
+        "ProcessGroupsApi",
+        "root PG controller service creation",
+    )
+    result = create_controller_service(id='root', body=body)
     print(f"[root-pg-cs] Created '{svc_spec['name']}' (id={result.id})")
     return result
 
@@ -215,7 +262,7 @@ def reconcile_root_pg_controller_services(services, runtime_url, nifi_pat, nifi_
                 print(f"[root-pg-cs] '{name}' properties up-to-date")
 
         if cs.component.state != "ENABLED":
-            _set_state(cs, "ENABLED", refresh_fn=_refresh_root_pg)
+            _require_state(_set_state(cs, "ENABLED", refresh_fn=_refresh_root_pg), "ENABLED")
         else:
             print(f"[root-pg-cs] '{name}' already ENABLED")
 

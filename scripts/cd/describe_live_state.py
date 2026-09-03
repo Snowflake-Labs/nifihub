@@ -21,6 +21,7 @@ import sys
 import yaml
 
 from validate_pr import snow_sql
+from config_runtime_mode import all_configured_runtimes_are_url_managed, deployment_is_url_managed, load_config
 from describe_nifi_state import describe_nifi_state
 from manage_connectors import get_connector_config
 from manage_flows import configure_nifi
@@ -198,13 +199,12 @@ def get_network_rules_for_runtime(runtime_name, database, schema, conn):
     return rules
 
 
-def build_live_state(config_path, conn):
-    with open(config_path) as f:
-        config = yaml.safe_load(f) or {}
+def build_live_state(config_path, conn=None):
+    config = load_config(config_path)
 
-    all_live_deployments = list_deployments(conn)
-    all_live_runtimes = list_runtimes(conn)
-    all_live_connectors = list_connectors(conn)
+    all_live_deployments = list_deployments(conn) if conn else []
+    all_live_runtimes = list_runtimes(conn) if conn else []
+    all_live_connectors = list_connectors(conn) if conn else []
 
     live_state = {"deployments": []}
 
@@ -218,15 +218,9 @@ def build_live_state(config_path, conn):
                 break
 
         if not live_dep:
-            # If all runtimes in this deployment have a 'url' field, the deployment
-            # is URL-managed (non-SOM) and won't appear in Snowflake. Synthesize a
-            # live entry so the diff can query NiFi directly instead of treating
-            # everything as "to_create".
             dep_runtimes_cfg = dep_cfg.get("runtimes", [])
-            all_url_managed = dep_runtimes_cfg and all(r.get("url") for r in dep_runtimes_cfg)
-            if not all_url_managed:
+            if not deployment_is_url_managed(dep_cfg):
                 continue
-            # Build a synthetic live deployment entry representing the current NiFi state
             dep_entry = {
                 "name": dep_name,
                 "deployment_type": dep_cfg.get("deployment_type", "SNOWFLAKE"),
@@ -261,7 +255,13 @@ def build_live_state(config_path, conn):
                     rt_entry["nifi"] = None
                 else:
                     try:
-                        nifi_state = describe_nifi_state(runtime_api_url, pat=nifi_pat, nifi_auth=nifi_auth)
+                        nifi_state = describe_nifi_state(
+                            runtime_api_url,
+                            pat=nifi_pat,
+                            nifi_auth=nifi_auth,
+                            desired_flows=rt_cfg.get("flows", []),
+                            desired_root_parameter_context=rt_cfg.get("root_parameter_context"),
+                        )
                         rt_entry["nifi"] = nifi_state
                     except Exception as e:
                         print(f"[live] NiFi API error for {rt_name}: {e}", file=sys.stderr)
@@ -355,7 +355,13 @@ def build_live_state(config_path, conn):
                     elif not runtime_api_url.endswith("/nifi-api"):
                         runtime_api_url += "/nifi-api"
                     try:
-                        nifi_state = describe_nifi_state(runtime_api_url, pat=nifi_pat, nifi_auth=nifi_auth)
+                        nifi_state = describe_nifi_state(
+                            runtime_api_url,
+                            pat=nifi_pat,
+                            nifi_auth=nifi_auth,
+                            desired_flows=rt_cfg_match.get("flows", []) if rt_cfg_match else [],
+                            desired_root_parameter_context=rt_cfg_match.get("root_parameter_context") if rt_cfg_match else None,
+                        )
                         rt_entry["nifi"] = nifi_state
                     except Exception as e:
                         print(f"[live] NiFi API error for {rt_name}: {e}", file=sys.stderr)
@@ -379,7 +385,8 @@ def main():
         sys.exit(1)
 
     config_path = sys.argv[1]
-    conn = _conn()
+    config = load_config(config_path)
+    conn = None if all_configured_runtimes_are_url_managed(config) else _conn()
     state = build_live_state(config_path, conn)
     json.dump(state, sys.stdout, indent=2)
     print()

@@ -14,7 +14,7 @@ The NiFi Hub CD pipeline is implemented as a set of standalone Python scripts. Y
 
 - Python 3.12+
 - Dependencies installed: `pip install -r scripts/cd/requirements-cd.txt`
-- Snowflake CLI installed (`snow`) — required by `describe_live_state.py` even for non-SOM runtimes
+- Snowflake CLI installed (`snow`) — required for SOM or mixed configs; URL-managed-only configs can run without it
 - A running NiFi instance (Snowflake Openflow or local Apache NiFi)
 
 ---
@@ -59,7 +59,7 @@ With `--dry-run`, the pipeline stops after step 3 and prints the change plan JSO
 | `GH_SECRETS_JSON` | No | JSON object of secrets for `${{ secrets.NAME }}` resolution (default `{}`) |
 | `GH_VARS_JSON` | No | JSON object of variables for `${{ vars.NAME }}` resolution (default `{}`) |
 
-> **Note:** `SNOWFLAKE_*` variables are read by `describe_live_state.py` even for non-SOM runtimes (to list connectors). If your runtime uses `url:` and has no Snowflake connectors, you can set them to placeholder values.
+> **Note:** `SNOWFLAKE_*` variables are required only when at least one configured runtime is managed through Snowflake (SOM or mixed configs). URL-managed-only configs skip Snowflake discovery entirely.
 
 ---
 
@@ -98,7 +98,7 @@ This demonstrates that NiFi Hub's GitOps tooling is portable — the same `confi
 
 When a runtime has a `url:` field, the CD pipeline:
 - **Skips** all Snowflake SQL operations (no `CREATE/ALTER OPENFLOW RUNTIME`, EAI, network rules)
-- **Still runs** NiFi API reconciliation (flow registries, flows, parameters, controller-level and root PG controller services)
+- **Still runs** NiFi API reconciliation (flow registries, flows, parameters, controller-level and root PG controller services, and service bindings)
 
 Authentication uses `nifi_auth` instead of `NIFI_RUNTIME_PAT`. See [Non-SOM Runtimes](Introduction-and-Concepts--Non-SOM-Runtimes) for the full model.
 
@@ -166,13 +166,6 @@ deployments:
 export GH_SECRETS_JSON='{"NIFI_PASSWORD":"adminpassword","NIFIHUB_REGISTRY_PAT":"ghp_..."}'
 export GH_VARS_JSON='{"NIFI_USERNAME":"admin"}'
 
-# Snowflake vars (required by describe_live_state.py even though no SQL runs)
-# Set to placeholder values if you have no Snowflake account
-export SNOWFLAKE_ACCOUNT_URL="https://placeholder.snowflakecomputing.com"
-export SNOWFLAKE_USER="placeholder"
-export SNOWFLAKE_PAT="placeholder"
-export SNOWFLAKE_ROLE="SYSADMIN"
-
 # Run (dry run first to preview)
 python scripts/run-cd.py environments/local/config.yaml --dry-run
 
@@ -185,7 +178,30 @@ python scripts/run-cd.py environments/local/config.yaml
 1. **Describe** — no Snowflake SQL for the URL-managed runtime; NiFi state is read via REST API
 2. **Diff** — compares live NiFi state (flow registries, flows) against desired config
 3. **Translate** — URL-managed runtimes are always included in the apply list
-4. **Apply** — creates the `nifihub` registry client in NiFi and deploys the Hello World flow
+4. **Apply** — creates the `nifihub` registry client in NiFi, reconciles parameter providers, the root parameter context, and root controller services, deploys the flow, reconciles any declared `service_bindings`, and then applies the final start/stop state
+
+If your local config uses `service_bindings`, declare the referenced controller services under `root_pg_controller_services` and set `start` explicitly on the flow. A binding change will stop the flow, update the target processor or controller service, validate it, and then let the final flow start logic restore the declared state. If NiFi Hub cannot read the live binding state safely, it fails closed and refuses to plan or apply binding changes for that runtime.
+
+If a root controller service needs parameters (a provided secret, a shared value, or a file), declare them under `root_parameter_context` and reference them normally:
+
+```yaml
+root_parameter_context:
+  provided_parameter_contexts: ".*SECRETS"
+  parameters:
+    Shared Query Timeout: "30 secs"
+  assets:
+    - name: "mssql-jdbc-13.4.0.jre11.jar"
+      url: "https://example.invalid/mssql-jdbc-13.4.0.jre11.jar"
+      parameter: "Database Driver"
+root_pg_controller_services:
+  - name: SQL Server Pool
+    type: org.apache.nifi.dbcp.DBCPConnectionPool
+    properties:
+      Database Driver Locations: "#{Database Driver}"
+      Validation Query Timeout: "#{Shared Query Timeout}"
+```
+
+NiFi Hub uses the root process group's existing parameter context, or creates and attaches `Root Parameter Context` when none exists. Provider contexts matching the regex are inherited additively, direct parameters are created or updated as non-sensitive values, and assets are uploaded and bound. To update asset content, change the asset filename; removing a declaration leaves the inherited contexts, parameters, assets, and bindings intact.
 
 After the run, open `https://localhost:8443/nifi` and you should see the Hello World flow running on the canvas.
 
@@ -278,7 +294,7 @@ Verify NiFi is running: `docker logs local-nifi | tail -20`. Check that the port
 Check that `NIFI_USERNAME`/`NIFI_PASSWORD` match the credentials in `SINGLE_USER_CREDENTIALS_USERNAME`/`SINGLE_USER_CREDENTIALS_PASSWORD` used when starting the container.
 
 **`SNOWFLAKE_ACCOUNT_URL not set` or Snowflake connection errors**
-Even for non-SOM runtimes, `describe_live_state.py` tries to connect to Snowflake to list connectors and runtimes. Set the `SNOWFLAKE_*` variables to real or placeholder values. If you have no Snowflake account, set them to placeholders — the script will log errors but continue.
+This only applies when the config includes at least one SOM-managed runtime. URL-managed-only configs do not require any `SNOWFLAKE_*` variables.
 
 **`NIFI_RUNTIME_PAT` not set warning**
 This is expected when using `nifi_auth` in `config.yaml`. The `NIFI_RUNTIME_PAT` env var is not required when username/password auth is configured.
