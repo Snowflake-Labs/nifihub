@@ -57,6 +57,7 @@ Only one deployment per account is allowed.
 | `flow_registries` | No | Array of Flow Registry Client definitions |
 | `controller_services` | No | Array of controller-level services — visible to parameter providers and reporting tasks; shared across the entire NiFi instance. See [Controller Services](#controller-services). |
 | `root_pg_controller_services` | No | Array of root process group-scoped services — accessible to all flow processors deployed to this runtime. See [Controller Services](#controller-services). |
+| `root_parameter_context` | No | Parameter context managed on the root process group: inherited provider contexts, shared non-sensitive parameters, and assets for root-PG controller services. See [Root Parameter Context](#root-parameter-context). |
 | `parameter_providers` | No | Array of parameter provider definitions |
 | `flows` | No | Array of flow definitions |
 | `connectors` | No | Array of Openflow connector definitions |
@@ -115,6 +116,50 @@ Both keys accept the same object structure:
 | `properties` | No | Key-value configuration properties |
 
 When `bundle` is omitted, NiFi infers the implementation from `type`. When `bundle` is provided, all three fields are required and are passed through unchanged during creation. For an existing controller service, `bundle` is creation-time selection only; NiFi Hub does not attempt to switch an existing service to a different bundle.
+
+### Root Parameter Context
+
+Use `root_parameter_context` when root process group controller services need parameters: secrets coming from a parameter provider, shared values reused across services, or files such as a JDBC driver.
+
+```yaml
+parameter_providers:
+  - name: SnowflakeSecrets
+    type: com.snowflake.openflow.runtime.parameter.snowflake.SnowflakeParameterProvider
+    properties:
+      Snowflake Connection Service: SnowflakeConnection
+
+root_parameter_context:
+  provided_parameter_contexts: ".*POSTGRES"
+  parameters:
+    Shared Query Timeout: "30 secs"
+  assets:
+    - name: "postgresql-42.7.10.jar"
+      url: "https://jdbc.postgresql.org/download/postgresql-42.7.10.jar"
+      parameter: "Database Driver"
+
+root_pg_controller_services:
+  - name: SharedDBCPConnectionPool
+    type: org.apache.nifi.dbcp.DBCPConnectionPool
+    properties:
+      Database Driver Class Name: org.postgresql.Driver
+      Database Driver Locations: "#{Database Driver}"
+      Password: "#{POSTGRES_PWD}"
+      Validation Query Timeout: "#{Shared Query Timeout}"
+```
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `provided_parameter_contexts` | No | Regex matched (full match) against parameter provider context names, including the auto-provisioned Snowflake provider. Matching contexts are added as inherited contexts of the root context. Inheritance is additive: existing inherited contexts are never removed. |
+| `parameters` | No | Non-sensitive parameters created or updated directly in the root context. Values support `${{ vars.NAME }}`; `${{ secrets.NAME }}` is rejected because these parameters are stored in NiFi as non-sensitive values. Use provided parameter contexts for secrets. `null` clears the value; omitted parameters are left untouched. Existing sensitive or asset-bound parameters with the same name are rejected. |
+| `assets` | No | Files downloaded and uploaded as assets, each bound to a non-sensitive parameter. Same shape as flow `assets`. A parameter may not be declared in both `parameters` and `assets`. |
+
+If the root process group already has a parameter context, NiFi Hub uses it. Otherwise, it reuses an exact-name `Root Parameter Context` or creates and attaches one. Reconciliation order on every apply is: attach/reuse context, add inherited provider contexts, upsert direct parameters, then reconcile assets; root-PG controller services are reconciled afterwards so `#{...}` references resolve when they are enabled. Direct root parameters are always non-sensitive by design: `${{ secrets.* }}` is rejected here, secrets should come from provided contexts (`#{POSTGRES_PWD}`), and live-state output shows direct root-parameter values as stored.
+
+Assets: sensitive parameters, non-empty literal parameters, duplicate asset names, and multiple assets targeting one parameter are rejected. Asset filenames are treated as immutable content identities because NiFi does not retain the source URL; to deploy changed bytes, use a new filename.
+
+Removing `root_parameter_context` entries is intentionally non-destructive: NiFi Hub leaves inherited contexts, parameters, references, assets, and the context intact. This differs from `root_pg_controller_services`, which are deleted when removed from YAML.
+
+If NiFi Hub cannot safely inspect a declared root parameter context, its inherited contexts, parameters, or assets, the live diff reports a blocker and refuses to apply that runtime. Asset downloads permit only HTTP/HTTPS (including redirects), verify TLS with the bundled CA roots, use a 60-second timeout, and reject files larger than 256 MiB.
 
 ### Parameter Provider
 
@@ -249,6 +294,12 @@ deployments:
               Personal Access Token: ${{ secrets.NIFIHUB_REGISTRY_PAT }}
               Default Branch: main
               Repository Path: flows
+        root_parameter_context:
+          provided_parameter_contexts: ".*POSTGRES"
+          assets:
+            - name: "postgresql-42.7.10.jar"
+              url: "https://jdbc.postgresql.org/download/postgresql-42.7.10.jar"
+              parameter: "Database Driver"
         root_pg_controller_services:
           - name: SharedDBCPConnectionPool
             type: org.apache.nifi.dbcp.DBCPConnectionPool
@@ -259,7 +310,7 @@ deployments:
             properties:
               Database Connection URL: "jdbc:postgresql://postgres.example.com:5432/mydb"
               Database Driver Class Name: org.postgresql.Driver
-              Database Driver Locations: /opt/nifi/nifi-current/lib/postgresql.jar
+              Database Driver Locations: "#{Database Driver}"
               Database User: my_user
               Password: "#{POSTGRES_PWD}"
         flows:

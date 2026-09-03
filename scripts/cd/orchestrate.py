@@ -38,6 +38,7 @@ from manage_controller_services import (
     reconcile_controller_services, delete_controller_services,
     reconcile_root_pg_controller_services, delete_root_pg_controller_services,
 )
+from manage_root_parameter_context import reconcile_root_parameter_context
 from manage_parameter_providers import reconcile_parameter_providers, delete_parameter_providers, fetch_auto_provisioned_provider
 from manage_service_bindings import reconcile_service_bindings
 from safe_exceptions import format_safe_exception
@@ -171,6 +172,35 @@ def _reconcile_root_pg_controller_services(rt, runtime_url):
         return
     nifi_pat = _get_nifi_pat()
     reconcile_root_pg_controller_services(services, runtime_url, nifi_pat, nifi_auth=_get_nifi_auth(rt))
+
+
+def _format_blocked_entries(entries):
+    parts = []
+    for entry in entries:
+        labels = []
+        if entry.get("parameter"):
+            labels.append(str(entry["parameter"]))
+        if entry.get("name"):
+            labels.append(str(entry["name"]))
+        if not labels:
+            labels.append("<unknown>")
+        messages = [str(message) for message in entry.get("messages", [])] or ["blocked"]
+        parts.append(f"{' -> '.join(labels)}: {'; '.join(messages)}")
+    return "; ".join(parts)
+
+
+def _reconcile_root_parameter_context(rt, runtime_url, provider_context_names):
+    spec = rt.get("root_parameter_context")
+    if not spec:
+        return
+    nifi_pat = _get_nifi_pat()
+    reconcile_root_parameter_context(
+        spec,
+        runtime_url,
+        nifi_pat,
+        nifi_auth=_get_nifi_auth(rt),
+        provider_context_names=provider_context_names,
+    )
 
 
 def _delete_root_pg_controller_services(services, runtime_url, nifi_auth=None):
@@ -484,8 +514,9 @@ def apply_runtime_create(deployment_name, rt, conn):
 
     _setup_flow_registries(rt, runtime_url)
     _reconcile_controller_services(rt, runtime_url)
-    _reconcile_root_pg_controller_services(rt, runtime_url)
     pp_context_names = _reconcile_parameter_providers(rt, runtime_url)
+    _reconcile_root_parameter_context(rt, runtime_url, pp_context_names)
+    _reconcile_root_pg_controller_services(rt, runtime_url)
     _reconcile_flows(rt, runtime_url, provider_context_names=pp_context_names)
     _reconcile_connectors(rt, conn)
 
@@ -623,10 +654,18 @@ def apply_runtime_modification(mod, conn):
         )
         raise RuntimeError(f"Service binding live-state read failed; refusing to apply runtime '{rt['name']}': {details}")
 
+    blocked_root_parameter_context = mod.get("root_parameter_context_changes", {}).get("blocked", [])
+    if blocked_root_parameter_context:
+        raise RuntimeError(
+            "Root parameter context live-state read failed; refusing to apply runtime "
+            f"'{rt['name']}': {_format_blocked_entries(blocked_root_parameter_context)}"
+        )
+
     _setup_flow_registries(rt, runtime_url)
     _reconcile_controller_services(rt, runtime_url)
-    _reconcile_root_pg_controller_services(rt, runtime_url)
     pp_context_names = _reconcile_parameter_providers(rt, runtime_url)
+    _reconcile_root_parameter_context(rt, runtime_url, pp_context_names)
+    _reconcile_root_pg_controller_services(rt, runtime_url)
     _reconcile_flows(rt, runtime_url, provider_context_names=pp_context_names)
     _reconcile_connectors(rt, conn)
 

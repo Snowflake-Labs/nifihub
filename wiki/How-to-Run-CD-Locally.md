@@ -178,9 +178,30 @@ python scripts/run-cd.py environments/local/config.yaml
 1. **Describe** — no Snowflake SQL for the URL-managed runtime; NiFi state is read via REST API
 2. **Diff** — compares live NiFi state (flow registries, flows) against desired config
 3. **Translate** — URL-managed runtimes are always included in the apply list
-4. **Apply** — creates the `nifihub` registry client in NiFi, deploys the flow, reconciles any declared `service_bindings`, and then applies the final start/stop state
+4. **Apply** — creates the `nifihub` registry client in NiFi, reconciles parameter providers, the root parameter context, and root controller services, deploys the flow, reconciles any declared `service_bindings`, and then applies the final start/stop state
 
 If your local config uses `service_bindings`, declare the referenced controller services under `root_pg_controller_services` and set `start` explicitly on the flow. A binding change will stop the flow, update the target processor or controller service, validate it, and then let the final flow start logic restore the declared state. If NiFi Hub cannot read the live binding state safely, it fails closed and refuses to plan or apply binding changes for that runtime.
+
+If a root controller service needs parameters (a provided secret, a shared value, or a file), declare them under `root_parameter_context` and reference them normally:
+
+```yaml
+root_parameter_context:
+  provided_parameter_contexts: ".*SECRETS"
+  parameters:
+    Shared Query Timeout: "30 secs"
+  assets:
+    - name: "mssql-jdbc-13.4.0.jre11.jar"
+      url: "https://example.invalid/mssql-jdbc-13.4.0.jre11.jar"
+      parameter: "Database Driver"
+root_pg_controller_services:
+  - name: SQL Server Pool
+    type: org.apache.nifi.dbcp.DBCPConnectionPool
+    properties:
+      Database Driver Locations: "#{Database Driver}"
+      Validation Query Timeout: "#{Shared Query Timeout}"
+```
+
+NiFi Hub uses the root process group's existing parameter context, or creates and attaches `Root Parameter Context` when none exists. Provider contexts matching the regex are inherited additively, direct parameters are created or updated as non-sensitive values, and assets are uploaded and bound. To update asset content, change the asset filename; removing a declaration leaves the inherited contexts, parameters, assets, and bindings intact.
 
 After the run, open `https://localhost:8443/nifi` and you should see the Hello World flow running on the canvas.
 

@@ -66,6 +66,71 @@ def test_existing_flow_shape_remains_valid():
     assert _validate(_base_config()) == []
 
 
+def test_root_parameter_context_shape_is_valid():
+    config = _base_config()
+    config["deployments"][0]["runtimes"][0]["root_parameter_context"] = {
+        "provided_parameter_contexts": ".*POSTGRES",
+        "parameters": {"Shared Query Timeout": "30 sec"},
+        "assets": [{
+            "name": "driver.jar",
+            "url": "https://example.invalid/driver.jar",
+            "parameter": "Database Driver",
+        }],
+    }
+    assert _validate(config) == []
+
+
+@pytest.mark.parametrize("field", ["name", "parameter"])
+def test_root_parameter_context_rejects_empty_asset_identity_fields(field):
+    config = _base_config()
+    asset = {
+        "name": "driver.jar",
+        "url": "https://example.invalid/driver.jar",
+        "parameter": "Database Driver",
+    }
+    asset[field] = ""
+    config["deployments"][0]["runtimes"][0]["root_parameter_context"] = {"assets": [asset]}
+    assert _validate(config)
+
+
+def test_root_parameter_context_rejects_unknown_keys():
+    config = _base_config()
+    config["deployments"][0]["runtimes"][0]["root_parameter_context"] = {"unexpected": True}
+    assert any("Additional properties are not allowed" in message for message in _validate(config))
+
+
+def test_validate_root_parameter_context_rejects_duplicate_names_parameters_and_overlap(import_cd_module):
+    config = _base_config()
+    config["deployments"][0]["runtimes"][0]["root_parameter_context"] = {
+        "parameters": {"Driver A": "literal"},
+        "assets": [
+            {"name": "driver.jar", "url": "https://example.invalid/a", "parameter": "Driver A"},
+            {"name": "driver.jar", "url": "https://example.invalid/b", "parameter": "Driver A"},
+        ],
+    }
+    module = import_cd_module("validate_pr")
+    errors = module.validate_root_parameter_context(config)
+    assert any("duplicate root_parameter_context asset names" in error for error in errors)
+    assert any("same parameter" in error for error in errors)
+    assert any("also asset targets" in error for error in errors)
+
+
+def test_validate_root_parameter_context_rejects_secret_refs_in_direct_parameters(import_cd_module):
+    config = _base_config()
+    config["deployments"][0]["runtimes"][0]["root_parameter_context"] = {
+        "parameters": {"Shared Query Timeout": "${{ secrets.QUERY_TIMEOUT }}"},
+    }
+    module = import_cd_module("validate_pr")
+
+    errors = module.validate_root_parameter_context(config)
+
+    assert any(
+        "root_parameter_context.parameters are stored as non-sensitive NiFi parameters; use a provided parameter context for secrets"
+        in error
+        for error in errors
+    )
+
+
 def test_service_bindings_require_explicit_start():
     config = _base_config()
     config["deployments"][0]["runtimes"][0]["flows"][0]["service_bindings"] = [{
@@ -324,6 +389,25 @@ def test_reconcile_root_pg_controller_services_create_then_enable_uses_current_r
 
     assert calls == ["create_controller_service1", "update_run_status2:ENABLED"]
     assert runtime_state["service"].component.state == "ENABLED"
+
+
+def test_reconcile_root_pg_controller_services_fails_when_service_does_not_enable(fake_nipyapi, import_cd_module, monkeypatch):
+    service = _controller_service("Shared Reader", state="DISABLED", entity_id="root-cs-id")
+    fake_nipyapi.api_methods["FlowApi"]["get_controller_services_from_group"] = lambda **kwargs: types.SimpleNamespace(
+        controller_services=[service]
+    )
+    fake_nipyapi.api_methods["ControllerServicesApi"]["update_run_status2"] = lambda **kwargs: service
+    manage_flows = types.SimpleNamespace(configure_nifi=lambda *args, **kwargs: None)
+    module = import_cd_module("manage_controller_services", {"manage_flows": manage_flows})
+    now = iter([0, 61])
+    monkeypatch.setattr(module.time, "time", lambda: next(now))
+
+    with pytest.raises(RuntimeError, match="did not reach ENABLED"):
+        module.reconcile_root_pg_controller_services(
+            [{"name": "Shared Reader", "type": "org.apache.nifi.json.JsonTreeReader", "properties": {}}],
+            runtime_url="https://example.invalid/nifi-api",
+            nifi_pat="token",
+        )
 
 
 def test_reconcile_controller_services_existing_service_disable_update_enable_uses_legacy_run_status_method(fake_nipyapi, import_cd_module):

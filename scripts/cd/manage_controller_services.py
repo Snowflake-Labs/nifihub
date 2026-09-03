@@ -82,6 +82,14 @@ def _set_state(cs, state, refresh_fn=None, timeout=60, interval=2):
         time.sleep(interval)
 
 
+def _require_state(cs, state):
+    if cs.component.state != state:
+        raise RuntimeError(
+            f"Controller service '{cs.component.name}' did not reach {state}; current state is {cs.component.state}"
+        )
+    return cs
+
+
 def _create(svc_spec):
     api = nipyapi.nifi.ControllerApi()
     bundle_spec = svc_spec.get("bundle")
@@ -254,7 +262,7 @@ def reconcile_root_pg_controller_services(services, runtime_url, nifi_pat, nifi_
                 print(f"[root-pg-cs] '{name}' properties up-to-date")
 
         if cs.component.state != "ENABLED":
-            _set_state(cs, "ENABLED", refresh_fn=_refresh_root_pg)
+            _require_state(_set_state(cs, "ENABLED", refresh_fn=_refresh_root_pg), "ENABLED")
         else:
             print(f"[root-pg-cs] '{name}' already ENABLED")
 

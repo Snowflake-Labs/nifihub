@@ -260,6 +260,7 @@ def build_live_state(config_path, conn=None):
                             pat=nifi_pat,
                             nifi_auth=nifi_auth,
                             desired_flows=rt_cfg.get("flows", []),
+                            desired_root_parameter_context=rt_cfg.get("root_parameter_context"),
                         )
                         rt_entry["nifi"] = nifi_state
                     except Exception as e:
@@ -359,6 +360,7 @@ def build_live_state(config_path, conn=None):
                             pat=nifi_pat,
                             nifi_auth=nifi_auth,
                             desired_flows=rt_cfg_match.get("flows", []) if rt_cfg_match else [],
+                            desired_root_parameter_context=rt_cfg_match.get("root_parameter_context") if rt_cfg_match else None,
                         )
                         rt_entry["nifi"] = nifi_state
                     except Exception as e:

@@ -23,6 +23,7 @@ from manage_flows import configure_nifi, list_process_groups
 from manage_controller_services import list_controller_services, list_root_pg_controller_services
 from manage_service_bindings import build_root_pg_service_uuid_to_name_map, describe_flow_service_bindings
 from setup_registry_client import list_registry_clients
+from safe_exceptions import format_safe_exception
 import manage_parameter_providers  # noqa: F401 — triggers monkey patch
 
 
@@ -45,6 +46,260 @@ def _clean_properties(props):
     if not props:
         return {}
     return {k: v for k, v in props.items() if not _is_sensitive_value(v) and v is not None}
+
+
+def _select_api_method(api, candidate_names):
+    for candidate_name in candidate_names:
+        method = getattr(api, candidate_name, None)
+        if callable(method):
+            return method
+    return None
+
+
+def _empty_root_parameter_context_state(root_pg_id, provider_context_names=None):
+    return {
+        "root_process_group_id": root_pg_id,
+        "context": {"present": False, "id": None, "name": None},
+        "inherited": [],
+        "parameters": {},
+        "provider_context_names": list(provider_context_names or []),
+        "entries": [],
+        "blocked": False,
+        "messages": [],
+    }
+
+
+def _blocked_root_parameter_context_state(desired_spec, root_pg_id, context, message, provider_context_names=None, inherited=None, parameters=None):
+    entries = []
+    for asset_spec in (desired_spec or {}).get("assets", []) or []:
+        entries.append({
+            "name": asset_spec.get("name"),
+            "parameter": asset_spec.get("parameter"),
+            "status": "blocked",
+            "asset_id": None,
+            "missing_content": None,
+            "messages": [message],
+        })
+    return {
+        "root_process_group_id": root_pg_id,
+        "context": context,
+        "inherited": list(inherited or []),
+        "parameters": dict(parameters or {}),
+        "provider_context_names": list(provider_context_names or []),
+        "entries": entries,
+        "blocked": True,
+        "messages": [message],
+    }
+
+
+def _list_provider_context_names():
+    flow_api = nipyapi.nifi.FlowApi()
+    pc_api = nipyapi.nifi.ParameterContextsApi()
+    contexts = flow_api.get_parameter_contexts()
+    provider_names = []
+
+    for ctx_ref in (contexts.parameter_contexts or []):
+        ctx_id = getattr(ctx_ref, "id", None)
+        component = getattr(ctx_ref, "component", None)
+        ctx_name = getattr(component, "name", None) or getattr(ctx_ref, "name", None)
+        provider_cfg = getattr(component, "parameter_provider_configuration", None)
+        if provider_cfg is None and ctx_id:
+            try:
+                full_context = pc_api.get_parameter_context(id=ctx_id)
+            except Exception:
+                full_context = None
+            if full_context is not None:
+                component = getattr(full_context, "component", None)
+                ctx_name = getattr(component, "name", ctx_name)
+                provider_cfg = getattr(component, "parameter_provider_configuration", None)
+        if provider_cfg and ctx_name:
+            provider_names.append(ctx_name)
+
+    return provider_names
+
+
+def _describe_root_parameter_context(desired_spec):
+    root_pg_id = nipyapi.canvas.get_root_pg_id()
+    if not desired_spec:
+        return {}
+
+    try:
+        provider_context_names = _list_provider_context_names()
+    except Exception:
+        provider_context_names = []
+
+    empty_state = _empty_root_parameter_context_state(root_pg_id, provider_context_names)
+    empty_context = empty_state["context"]
+
+    try:
+        root_pg = nipyapi.nifi.ProcessGroupsApi().get_process_group(id=root_pg_id)
+    except Exception as exc:
+        return _blocked_root_parameter_context_state(
+            desired_spec,
+            root_pg_id,
+            empty_context,
+            f"Failed to inspect root process group: {format_safe_exception(exc)}",
+            provider_context_names=provider_context_names,
+        )
+
+    direct_context = getattr(root_pg.component, "parameter_context", None)
+    context = {
+        "present": bool(direct_context),
+        "id": getattr(direct_context, "id", None),
+        "name": getattr(getattr(direct_context, "component", None), "name", None),
+    }
+    if not direct_context:
+        return {
+            "root_process_group_id": root_pg_id,
+            "context": context,
+            "inherited": [],
+            "parameters": {},
+            "provider_context_names": provider_context_names,
+            "entries": [{
+                "name": asset_spec.get("name"),
+                "parameter": asset_spec.get("parameter"),
+                "status": "missing_context",
+                "asset_id": None,
+                "missing_content": None,
+                "messages": ["Root process group has no direct parameter context"],
+            } for asset_spec in ((desired_spec or {}).get("assets", []) or [])],
+            "blocked": False,
+            "messages": [],
+        }
+
+    pc_api = nipyapi.nifi.ParameterContextsApi()
+    try:
+        parameter_context = pc_api.get_parameter_context(id=direct_context.id)
+    except Exception as exc:
+        return _blocked_root_parameter_context_state(
+            desired_spec,
+            root_pg_id,
+            context,
+            f"Failed to inspect direct root parameter context: {format_safe_exception(exc)}",
+            provider_context_names=provider_context_names,
+        )
+
+    inherited_contexts = [
+        getattr(getattr(inherited, "component", None), "name", None) or getattr(inherited, "name", None)
+        for inherited in (parameter_context.component.inherited_parameter_contexts or [])
+    ]
+    inherited_contexts = [name for name in inherited_contexts if name]
+
+    direct_parameters = {
+        entity.parameter.name: entity.parameter
+        for entity in (parameter_context.component.parameters or [])
+    }
+    parameters = {}
+    for parameter_name, parameter in direct_parameters.items():
+        if getattr(parameter, "sensitive", False):
+            parameters[parameter_name] = "<sensitive>"
+        else:
+            parameters[parameter_name] = getattr(parameter, "value", None)
+
+    get_assets = _select_api_method(pc_api, ["get_assets1", "get_assets"])
+    if get_assets is None:
+        return _blocked_root_parameter_context_state(
+            desired_spec,
+            root_pg_id,
+            context,
+            "Failed to inspect root parameter-context assets: unsupported NiFi API method",
+            provider_context_names=provider_context_names,
+            inherited=inherited_contexts,
+            parameters=parameters,
+        )
+    try:
+        assets_result = get_assets(context_id=direct_context.id)
+    except Exception as exc:
+        return _blocked_root_parameter_context_state(
+            desired_spec,
+            root_pg_id,
+            context,
+            f"Failed to inspect root parameter-context assets: {format_safe_exception(exc)}",
+            provider_context_names=provider_context_names,
+            inherited=inherited_contexts,
+            parameters=parameters,
+        )
+
+    assets_by_name = {
+        asset_entity.asset.name: asset_entity.asset
+        for asset_entity in (assets_result.assets or [])
+    }
+    entries = []
+    for asset_spec in ((desired_spec or {}).get("assets", []) or []):
+        asset_name = asset_spec.get("name")
+        parameter_name = asset_spec.get("parameter")
+        entry = {
+            "name": asset_name,
+            "parameter": parameter_name,
+            "status": "matched",
+            "asset_id": None,
+            "missing_content": None,
+            "messages": [],
+        }
+        parameter = direct_parameters.get(parameter_name)
+        asset = assets_by_name.get(asset_name)
+        if asset is not None:
+            entry["asset_id"] = getattr(asset, "id", None)
+            entry["missing_content"] = bool(getattr(asset, "missing_content", False))
+        if parameter is None:
+            entry["status"] = "missing_parameter"
+            entry["messages"].append("Direct parameter not found in root parameter context")
+            entries.append(entry)
+            continue
+
+        if getattr(parameter, "sensitive", False):
+            entry["status"] = "sensitive_parameter"
+            entry["messages"].append("Direct parameter is sensitive and cannot reference a root asset")
+            entries.append(entry)
+            continue
+
+        references = list(getattr(parameter, "referenced_assets", None) or [])
+        if len(references) > 1:
+            entry["status"] = "multiple_references"
+            entry["messages"].append("Direct parameter references multiple assets")
+            entries.append(entry)
+            continue
+
+        parameter_value = getattr(parameter, "value", None)
+        if not references and parameter_value not in (None, ""):
+            entry["status"] = "literal_parameter"
+            entry["messages"].append("Direct parameter has a literal value and cannot be converted safely")
+            entries.append(entry)
+            continue
+
+        if asset is None:
+            entry["status"] = "missing_asset"
+            entry["messages"].append("Declared asset is missing from the direct root parameter context")
+            entries.append(entry)
+            continue
+
+        if entry["missing_content"]:
+            entry["status"] = "missing_content"
+            entry["messages"].append("Declared asset exists but its content is missing")
+
+        if not references:
+            entry["status"] = "missing_reference"
+            entry["messages"].append("Direct parameter does not reference the declared asset")
+            entries.append(entry)
+            continue
+
+        reference = references[0]
+        if getattr(reference, "id", None) != getattr(asset, "id", None) or getattr(reference, "name", None) != asset_name:
+            entry["status"] = "wrong_reference"
+            entry["messages"].append("Direct parameter references a different asset")
+
+        entries.append(entry)
+
+    return {
+        "root_process_group_id": root_pg_id,
+        "context": context,
+        "inherited": inherited_contexts,
+        "parameters": parameters,
+        "provider_context_names": provider_context_names,
+        "entries": entries,
+        "blocked": False,
+        "messages": [],
+    }
 
 
 def get_flow_parameters(pg_id):
@@ -77,7 +332,7 @@ def get_flow_parameters(pg_id):
     return params
 
 
-def describe_nifi_state(runtime_url, pat=None, nifi_auth=None, desired_flows=None):
+def describe_nifi_state(runtime_url, pat=None, nifi_auth=None, desired_flows=None, desired_root_parameter_context=None):
     configure_nifi(runtime_url, pat=pat, nifi_auth=nifi_auth)
 
     registries = list_registry_clients()
@@ -179,6 +434,7 @@ def describe_nifi_state(runtime_url, pat=None, nifi_auth=None, desired_flows=Non
         "flow_registries": flow_registries,
         "flows": flows,
         "parameters": parameters,
+        "root_parameter_context": _describe_root_parameter_context(desired_root_parameter_context),
     }
 
 

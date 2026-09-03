@@ -24,6 +24,7 @@ import yaml
 from jsonschema import validate, ValidationError
 
 from config_runtime_mode import all_configured_runtimes_are_url_managed
+from manage_parameters import _SECRET_RE
 
 
 def _parse_account(account_url):
@@ -69,7 +70,44 @@ def validate_schema(config_path, schema_path):
         validate(instance=data, schema=schema)
     except ValidationError as e:
         errors.append(e.message)
+    errors.extend(validate_root_parameter_context(data))
     return data, errors
+
+
+def validate_root_parameter_context(config_data):
+    errors = []
+    for deployment in (config_data or {}).get("deployments", []):
+        for runtime in deployment.get("runtimes", []):
+            spec = runtime.get("root_parameter_context") or {}
+            assets = spec.get("assets", []) or []
+            runtime_name = runtime.get("name", "<unnamed>")
+            names = [asset.get("name") for asset in assets]
+            parameters = [asset.get("parameter") for asset in assets]
+            duplicate_names = sorted({name for name in names if name and names.count(name) > 1})
+            duplicate_parameters = sorted({name for name in parameters if name and parameters.count(name) > 1})
+            if duplicate_names:
+                errors.append(
+                    f"Runtime '{runtime_name}' has duplicate root_parameter_context asset names: "
+                    + ", ".join(duplicate_names)
+                )
+            if duplicate_parameters:
+                errors.append(
+                    f"Runtime '{runtime_name}' maps multiple root_parameter_context assets to the same parameter: "
+                    + ", ".join(duplicate_parameters)
+                )
+            overlap = sorted(set(parameters) & set((spec.get("parameters") or {}).keys()))
+            if overlap:
+                errors.append(
+                    f"Runtime '{runtime_name}' declares root_parameter_context parameters that are also asset targets: "
+                    + ", ".join(overlap)
+                )
+            for parameter_name, parameter_value in (spec.get("parameters") or {}).items():
+                if parameter_value is not None and _SECRET_RE.fullmatch(str(parameter_value)):
+                    errors.append(
+                        f"Runtime '{runtime_name}' root_parameter_context parameter '{parameter_name}' uses a GitHub secret reference, "
+                        "but root_parameter_context.parameters are stored as non-sensitive NiFi parameters; use a provided parameter context for secrets"
+                    )
+    return errors
 
 
 def check_connectivity(conn):

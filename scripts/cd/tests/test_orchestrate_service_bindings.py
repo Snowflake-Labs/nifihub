@@ -67,6 +67,9 @@ def _orchestrate_stubs(call_order, flow_pg_lookup=None):
     manage_assets = types.SimpleNamespace(
         reconcile_flow_assets=lambda *args, **kwargs: call_order.append("assets"),
     )
+    manage_root_parameter_context = types.SimpleNamespace(
+        reconcile_root_parameter_context=lambda *args, **kwargs: call_order.append("root-context"),
+    )
     manage_controller_services = types.SimpleNamespace(
         reconcile_controller_services=lambda *args, **kwargs: None,
         delete_controller_services=lambda *args, **kwargs: None,
@@ -103,6 +106,7 @@ def _orchestrate_stubs(call_order, flow_pg_lookup=None):
         "setup_registry_client": setup_registry_client,
         "manage_flows": manage_flows,
         "manage_assets": manage_assets,
+        "manage_root_parameter_context": manage_root_parameter_context,
         "manage_controller_services": manage_controller_services,
         "manage_parameter_providers": manage_parameter_providers,
         "manage_connectors": manage_connectors,
@@ -150,6 +154,53 @@ def test_reconcile_flows_applies_bindings_after_assets_and_before_start(fake_nip
         "bindings:Example Flow",
         "start:Example Flow:pg-Example Flow",
     ]
+
+
+def test_runtime_modification_reconciles_root_parameter_context_before_root_services(fake_nipyapi, import_cd_module, monkeypatch):
+    call_order = []
+    stubs = _orchestrate_stubs(call_order)
+    stubs["manage_controller_services"] = types.SimpleNamespace(
+        reconcile_controller_services=lambda *args, **kwargs: call_order.append("controller-services"),
+        delete_controller_services=lambda *args, **kwargs: None,
+        reconcile_root_pg_controller_services=lambda *args, **kwargs: call_order.append("root-services"),
+        delete_root_pg_controller_services=lambda *args, **kwargs: None,
+    )
+    stubs["manage_service_bindings"] = types.SimpleNamespace(reconcile_service_bindings=lambda *args, **kwargs: None)
+    module = import_cd_module("orchestrate", stubs)
+    monkeypatch.setattr(module, "_runtime_url", lambda *args, **kwargs: "https://example.invalid/nifi-api")
+    monkeypatch.setattr(module, "_setup_flow_registries", lambda *args, **kwargs: None)
+    monkeypatch.setattr(module, "_reconcile_parameter_providers", lambda *args, **kwargs: call_order.append("providers") or [])
+    monkeypatch.setattr(module, "_reconcile_flows", lambda *args, **kwargs: None)
+    monkeypatch.setattr(module, "_reconcile_connectors", lambda *args, **kwargs: None)
+
+    module.apply_runtime_modification({
+        "new": {
+            "name": "MY_RUNTIME", "database": "DB", "schema": "SCHEMA", "url": "https://example.invalid",
+            "controller_services": [{"name": "Controller Service"}],
+            "root_parameter_context": {"assets": [{"name": "driver.jar", "url": "https://example.invalid/driver.jar", "parameter": "Driver"}]},
+            "root_pg_controller_services": [{"name": "Pool"}],
+        },
+        "old": {},
+        "root_parameter_context_changes": {"blocked": []},
+    }, {})
+
+    assert call_order == ["controller-services", "providers", "root-context", "root-services"]
+
+
+def test_runtime_modification_blocks_when_root_parameter_context_state_is_unreadable(fake_nipyapi, import_cd_module, monkeypatch):
+    stubs = _orchestrate_stubs([])
+    stubs["manage_service_bindings"] = types.SimpleNamespace(reconcile_service_bindings=lambda *args, **kwargs: None)
+    module = import_cd_module("orchestrate", stubs)
+    monkeypatch.setattr(module, "_runtime_url", lambda *args, **kwargs: "https://example.invalid/nifi-api")
+
+    with pytest.raises(RuntimeError, match="Root parameter context live-state read failed"):
+        module.apply_runtime_modification({
+            "new": {"name": "MY_RUNTIME", "database": "DB", "schema": "SCHEMA", "url": "https://example.invalid"},
+            "old": {},
+            "root_parameter_context_changes": {
+                "blocked": [{"parameter": "Driver", "name": "driver.jar", "messages": ["HTTP 403 Forbidden"]}],
+            },
+        }, {})
 
 
 def test_reconcile_flows_rebinds_after_version_update_using_current_ids_before_start(fake_nipyapi, import_cd_module):

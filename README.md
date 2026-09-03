@@ -200,7 +200,7 @@ The pipeline compares the **actual deployed state** against the desired configur
 - **Flow Registry Clients** — Git-based, configured via NiFi REST API
 - **Imported Flows** — pulled from the Git registry at a specific version
 - **Openflow Connectors** — created, configured, and started via the SOM SQL API (lifecycle: STOP → TERMINATE → DROP)
-- **NiFi Resources** — controller services, parameter providers, parameters (compared via NiFi REST API)
+- **NiFi Resources** — controller services, parameter providers, parameters, and the root parameter context (inherited provider contexts, shared parameters, assets), compared via NiFi REST API
 - **Auto-Provisioned Snowflake Parameter Provider** — every runtime has a built-in "Openflow - Snowflake Parameter Provider" that exposes Snowflake secrets as parameters. The CD pipeline automatically fetches this provider and adds its parameter contexts as inherited to all flows (no YAML declaration needed). By default all parameters are marked sensitive; to customize, declare the provider explicitly in the YAML with a `sensitive_param_pattern`.
 
 ### Runtime Options
@@ -225,7 +225,7 @@ The CD pipeline supports two modes depending on whether your Snowflake account h
 
 **SOM-enabled accounts** (default): The pipeline manages the full lifecycle of deployments and runtimes via Snowflake SQL (`CREATE/ALTER/DROP OPENFLOW DEPLOYMENT`, `CREATE/ALTER/SUSPEND/RESUME OPENFLOW RUNTIME`). It also manages network rules, EAIs, and connectors via SQL. This is the standard mode — you declare runtimes with `node_type`, `min_nodes`, `max_nodes`, etc. and the pipeline provisions them.
 
-**Non-SOM accounts** (URL-managed): If your account does not support SOM, runtimes must be pre-provisioned outside of this pipeline. To use the CD pipeline for NiFi-level resource management only (flow registries, flows, parameters, controller services, and service bindings), add a `url` field to the runtime configuration pointing to the existing NiFi API endpoint:
+**Non-SOM accounts** (URL-managed): If your account does not support SOM, runtimes must be pre-provisioned outside of this pipeline. To use the CD pipeline for NiFi-level resource management only (flow registries, flows, parameters, the root parameter context, controller services, and service bindings), add a `url` field to the runtime configuration pointing to the existing NiFi API endpoint:
 
 ```yaml
 runtimes:

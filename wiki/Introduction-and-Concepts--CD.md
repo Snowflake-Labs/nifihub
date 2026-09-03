@@ -70,6 +70,7 @@ NiFi Hub uses a **GitOps** model for managing Openflow infrastructure. The `envi
 | Flow Registry Clients | Git-based clients configured via NiFi REST API |
 | Controller-level Controller Services | Created/updated/deleted via NiFi REST API; used by parameter providers and reporting tasks (`controller_services`) |
 | Root PG Controller Services | Created/updated/deleted via NiFi REST API; accessible to all flow processors in the runtime (`root_pg_controller_services`) |
+| Root Parameter Context | Root process group parameter context: inherited provider contexts, shared non-sensitive parameters, and assets (`root_parameter_context`) |
 | Parameter Providers | Created/updated/deleted via NiFi REST API |
 | Imported Flows | Pulled from the Git registry at a specified version |
 | Flow Service Bindings | Reconciled after import and parameter/asset application, binding root-PG controller services onto processor or flow-local controller service properties (`flows[].service_bindings`) |
@@ -99,6 +100,8 @@ When `service_bindings` are declared on a flow, the apply sequence is:
 4. start or stop the flow according to the explicit `start` field
 
 Binding reconciliation runs on every apply, including unchanged YAML, so out-of-band drift is repaired. Any binding mutation quiesces the whole flow first, then validates the target and rolls back on failure. Root process group controller-service `bundle` coordinates are creation-time selectors only; existing services are not rebound to a different bundle.
+
+When `root_parameter_context` is declared, the runtime apply order is: flow registries, controller-level services, parameter providers, root parameter context, root-PG controller services, flows, connectors. NiFi Hub first ensures the root process group has a direct parameter context, creating and attaching `Root Parameter Context` only when no context is already attached. It then adds provider contexts matching `provided_parameter_contexts` as inherited contexts (additively), creates or updates the declared non-sensitive `parameters`, uploads and binds the declared `assets`, and only afterward enables root-PG controller services that may reference those parameters (for example `#{POSTGRES_PWD}` from a provider). Removing a root parameter context declaration does not delete inherited contexts, parameters, assets, references, or the context.
 
 ### Triggering CD Manually
 

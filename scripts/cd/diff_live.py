@@ -366,6 +366,105 @@ def diff_nifi_parameters(live_params, desired_params):
     return {"changes": changes, "unchanged": unchanged}
 
 
+def diff_nifi_root_parameter_context(live_root_parameter_context, desired_root_parameter_context):
+    created = []
+    modified = []
+    deleted = []
+    unchanged = []
+    health = []
+    blocked = []
+
+    desired_root_parameter_context = desired_root_parameter_context or {}
+    live_root_parameter_context = live_root_parameter_context or {}
+
+    live_context = live_root_parameter_context.get("context", {})
+    live_inherited = list(live_root_parameter_context.get("inherited", []) or [])
+    live_parameters = dict(live_root_parameter_context.get("parameters", {}) or {})
+    provider_context_names = list(live_root_parameter_context.get("provider_context_names", []) or [])
+    desired_assets = list(desired_root_parameter_context.get("assets", []) or [])
+
+    inheritance_pattern = desired_root_parameter_context.get("provided_parameter_contexts")
+    matched_inheritance = []
+    if inheritance_pattern:
+        matched_inheritance = [
+            name for name in provider_context_names
+            if re.fullmatch(inheritance_pattern, name)
+        ]
+    inherited_set = set(live_inherited)
+    inheritance_missing = [name for name in matched_inheritance if name not in inherited_set]
+    inheritance_unchanged = [name for name in matched_inheritance if name in inherited_set]
+
+    parameter_diff = diff_nifi_parameters(
+        live_parameters,
+        desired_root_parameter_context.get("parameters", {}),
+    )
+
+    if live_root_parameter_context.get("blocked"):
+        for entry in live_root_parameter_context.get("entries", []):
+            blocked.append({
+                "name": entry.get("name"),
+                "parameter": entry.get("parameter"),
+                "status": entry.get("status", "blocked"),
+                "messages": list(entry.get("messages", [])),
+            })
+        if not blocked:
+            blocked.append({
+                "status": "blocked",
+                "messages": list(live_root_parameter_context.get("messages", [])) or ["Live root parameter context state could not be read safely"],
+            })
+
+    desired_by_name = {
+        asset["name"]: asset
+        for asset in desired_assets
+        if asset.get("name")
+    }
+    live_entries = {
+        entry.get("name", ""): entry
+        for entry in live_root_parameter_context.get("entries", [])
+        if entry.get("name")
+    }
+
+    for asset_name, desired_asset in desired_by_name.items():
+        live_entry = live_entries.get(asset_name, {})
+        base_entry = {
+            "name": desired_asset.get("name"),
+            "parameter": desired_asset.get("parameter"),
+            "asset_id": live_entry.get("asset_id"),
+            "missing_content": live_entry.get("missing_content"),
+            "messages": list(live_entry.get("messages", [])),
+        }
+        status = live_entry.get("status")
+        if status == "matched":
+            unchanged.append(base_entry)
+        elif status in ("missing_context", "missing_parameter", "missing_asset", "missing_reference"):
+            created.append({**base_entry, "action": "create", "status": status})
+        elif status in ("wrong_reference", "missing_content"):
+            modified.append({**base_entry, "action": "repair", "status": status})
+        elif status in ("sensitive_parameter", "literal_parameter", "multiple_references"):
+            health.append({**base_entry, "status": status})
+        elif status == "blocked":
+            blocked.append({**base_entry, "status": status})
+        else:
+            created.append({**base_entry, "action": "create", "status": status or "missing_state"})
+
+    return {
+        "created": created,
+        "modified": modified,
+        "deleted": deleted,
+        "unchanged": unchanged,
+        "health": health,
+        "blocked": blocked,
+        "root_process_group_id": live_root_parameter_context.get("root_process_group_id"),
+        "context": live_context,
+        "inheritance": {
+            "missing": inheritance_missing,
+            "unchanged": inheritance_unchanged,
+            "unmatched_pattern": bool(inheritance_pattern) and not matched_inheritance,
+        },
+        "parameters": parameter_diff,
+    }
+
+
 def diff_nifi_state(live_nifi, desired_rt):
     if not live_nifi or live_nifi.get("error"):
         return {"error": live_nifi.get("error") if live_nifi else "No NiFi state available"}
@@ -394,6 +493,10 @@ def diff_nifi_state(live_nifi, desired_rt):
         live_nifi.get("flows", []),
         desired_rt.get("flows", [])
     )
+    root_parameter_context_diff = diff_nifi_root_parameter_context(
+        live_nifi.get("root_parameter_context", {}),
+        desired_rt.get("root_parameter_context", {}),
+    )
 
     param_diffs = {}
     live_params = live_nifi.get("parameters", {})
@@ -412,6 +515,7 @@ def diff_nifi_state(live_nifi, desired_rt):
         "flows": flow_diff,
         "parameters": param_diffs,
         "service_bindings": service_binding_diff,
+        "root_parameter_context": root_parameter_context_diff,
     }
 
 
@@ -505,6 +609,32 @@ def diff_runtime(live_rt, desired_rt):
     }
 
 
+def _nifi_diff_has_changes(nifi_diff):
+    if not nifi_diff or nifi_diff.get("error") or nifi_diff.get("skipped"):
+        return False
+    for section in (
+        "controller_services",
+        "root_pg_controller_services",
+        "parameter_providers",
+        "flow_registries",
+        "flows",
+        "service_bindings",
+        "root_parameter_context",
+    ):
+        section_diff = nifi_diff.get(section, {})
+        if section_diff.get("created") or section_diff.get("modified") or section_diff.get("deleted") or section_diff.get("health") or section_diff.get("blocked"):
+            return True
+    root_parameter_context_diff = nifi_diff.get("root_parameter_context", {})
+    if root_parameter_context_diff.get("inheritance", {}).get("missing"):
+        return True
+    if root_parameter_context_diff.get("parameters", {}).get("changes"):
+        return True
+    for pdiff in nifi_diff.get("parameters", {}).values():
+        if pdiff.get("changes"):
+            return True
+    return False
+
+
 def diff_live(live_state, config_path):
     with open(config_path) as f:
         config = yaml.safe_load(f) or {}
@@ -574,18 +704,7 @@ def diff_live(live_state, config_path):
                 # URL-managed runtimes since the pipeline doesn't manage them.
                 rt_diff = diff_runtime(live_rt, rt_cfg)
                 nifi_diff = rt_diff.get("nifi", {})
-                nifi_has_changes = False
-                if nifi_diff and not nifi_diff.get("error"):
-                    for section in ("controller_services", "root_pg_controller_services", "parameter_providers", "flow_registries", "flows", "service_bindings"):
-                        sd = nifi_diff.get(section, {})
-                        if sd.get("created") or sd.get("modified") or sd.get("deleted") or sd.get("health") or sd.get("blocked"):
-                            nifi_has_changes = True
-                            break
-                    if not nifi_has_changes:
-                        for flow_name, pdiff in nifi_diff.get("parameters", {}).items():
-                            if pdiff.get("changes"):
-                                nifi_has_changes = True
-                                break
+                nifi_has_changes = _nifi_diff_has_changes(nifi_diff)
                 if nifi_has_changes:
                     rt_results["to_modify"].append({
                         "name": rt_cfg["name"],
@@ -609,18 +728,7 @@ def diff_live(live_state, config_path):
 
             rt_diff = diff_runtime(live_rt, rt_cfg)
             nifi_diff = rt_diff.get("nifi", {})
-            nifi_has_changes = False
-            if nifi_diff and not nifi_diff.get("error"):
-                for section in ("controller_services", "root_pg_controller_services", "parameter_providers", "flow_registries", "flows", "service_bindings"):
-                    sd = nifi_diff.get(section, {})
-                    if sd.get("created") or sd.get("modified") or sd.get("deleted") or sd.get("health") or sd.get("blocked"):
-                        nifi_has_changes = True
-                        break
-                if not nifi_has_changes:
-                    for flow_name, pdiff in nifi_diff.get("parameters", {}).items():
-                        if pdiff.get("changes"):
-                            nifi_has_changes = True
-                            break
+            nifi_has_changes = _nifi_diff_has_changes(nifi_diff)
 
             has_changes = (
                 rt_diff["changed_fields"]

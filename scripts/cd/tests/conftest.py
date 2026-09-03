@@ -65,6 +65,7 @@ def _build_fake_nipyapi_module():
         "FlowApi": {
             "get_controller_services_from_group",
             "get_controller_services_from_controller",
+            "get_parameter_contexts",
             "get_parameter_providers",
             "get_versions",
             "schedule_components",
@@ -107,6 +108,14 @@ def _build_fake_nipyapi_module():
         },
         "ParameterContextsApi": {
             "get_parameter_context",
+            "get_assets",
+            "get_assets1",
+            "create_asset",
+            "create_asset1",
+            "create_parameter_context",
+            "submit_parameter_context_update",
+            "get_parameter_context_update",
+            "delete_update_request",
         },
     }
     api_methods = {
@@ -176,6 +185,13 @@ def _build_fake_nipyapi_module():
         "ProcessGroupDTO",
         "PositionDTO",
         "VersionControlInformationDTO",
+        "ParameterContextEntity",
+        "ParameterContextDTO",
+        "ParameterEntity",
+        "ParameterDTO",
+        "AssetReferenceDTO",
+        "ParameterContextReferenceEntity",
+        "ParameterContextReferenceDTO",
     ]:
         setattr(nifi, model_name, type(model_name, (_Model,), {}))
     module.nifi = nifi

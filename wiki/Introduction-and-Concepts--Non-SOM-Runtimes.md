@@ -47,6 +47,7 @@ runtimes:
 - Parameter contexts and parameter values
 - Controller-level controller services (`controller_services` — used by parameter providers)
 - Root process group controller services (`root_pg_controller_services` — shared across all flows)
+- Root parameter context inheritance, shared parameters, and assets (`root_parameter_context`)
 - Service bindings from root-PG controller services to processors or flow-local controller services (`flows[].service_bindings`)
 - Parameter providers (including the auto-provisioned Snowflake Parameter Provider, if available)
 - Flow start/stop state
@@ -71,6 +72,14 @@ runtimes:
       verify_ssl: false   # set false for local self-signed certificates
 
     flow_registries: [...]
+    root_parameter_context:
+      provided_parameter_contexts: ".*SECRETS"
+      parameters:
+        Shared Query Timeout: "30 secs"
+      assets:
+        - name: "driver.jar"
+          url: "https://example.invalid/driver.jar"
+          parameter: "Database Driver"
     root_pg_controller_services: [...]
     flows:
       - name: MY_FLOW
@@ -82,6 +91,8 @@ runtimes:
 ```
 
 Bound flows use the same `service_bindings` contract as SOM-managed runtimes. Declare referenced services under `root_pg_controller_services`, set `start` explicitly, and see the [complete environment schema reference](../environments/README.md#service-bindings) for validation and lifecycle behavior.
+
+The `root_parameter_context` contract is also identical for SOM and URL-managed runtimes. NiFi Hub can inherit matching parameter-provider contexts, upsert shared non-sensitive parameters, and upload assets before it enables root-PG controller services. See [Root Parameter Context](../environments/README.md#root-parameter-context).
 
 ### nifi_auth Fields
 
