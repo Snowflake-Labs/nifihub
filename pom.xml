@@ -56,7 +56,7 @@
         <!-- NiFi versions -->
         <nifi.version>2.11.0</nifi.version>
         <nifi-api.version>2.10.0</nifi-api.version>
-        <nifi.nar.maven.plugin.version>2.3.0</nifi.nar.maven.plugin.version>
+        <nifi.nar.maven.plugin.version>2.4.0</nifi.nar.maven.plugin.version>
 
         <!-- Logging -->
         <org.slf4j.version>2.0.18</org.slf4j.version>
