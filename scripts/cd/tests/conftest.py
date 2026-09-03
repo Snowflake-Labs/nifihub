@@ -87,6 +87,7 @@ def _build_fake_nipyapi_module():
             "get_process_groups",
             "get_processors",
             "create_controller_service",
+            "create_controller_service1",
             "create_process_group",
             "update_process_group",
             "create_empty_all_connections_request",
@@ -98,6 +99,7 @@ def _build_fake_nipyapi_module():
             "get_processor",
             "update_processor",
             "update_run_status4",
+            "update_run_status5",
         },
         "ParameterProvidersApi": {
             "update_parameter_provider",
@@ -169,6 +171,7 @@ def _build_fake_nipyapi_module():
         "ProcessorConfigDTO",
         "ProcessorRunStatusEntity",
         "ActivateControllerServicesEntity",
+        "ScheduleComponentsEntity",
         "ProcessGroupEntity",
         "ProcessGroupDTO",
         "PositionDTO",
@@ -227,14 +230,19 @@ def real_nipyapi_method_names():
     try:
         method_names = {}
         for api_name in (
+            "FlowApi",
+            "ProcessGroupsApi",
             "ProcessorsApi",
             "ControllerServicesApi",
+            "ControllerApi",
         ):
             api_cls = getattr(real_nipyapi.nifi, api_name, None)
             if api_cls is None:
                 continue
             method_names[api_name] = {
-                name for name, value in inspect.getmembers(api_cls) if callable(value) and not name.startswith("_")
+                name: inspect.signature(value)
+                for name, value in inspect.getmembers(api_cls)
+                if callable(value) and not name.startswith("_")
             }
         return method_names
     finally:

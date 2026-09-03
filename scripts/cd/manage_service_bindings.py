@@ -23,6 +23,7 @@ import nipyapi
 
 from manage_controller_services import list_root_pg_controller_services
 from manage_flows import configure_nifi, list_process_groups, start_flow
+from safe_exceptions import format_safe_exception
 
 
 _UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.IGNORECASE)
@@ -421,7 +422,7 @@ def _stop_processor_if_needed(candidate, entity):
     if not _is_processor_running(entity):
         return entity
     body = _build_run_status_entity(entity, "STOPPED", ["ProcessorRunStatusEntity"])
-    method, _ = _select_api_method(nipyapi.nifi.ProcessorsApi(), ["update_run_status4"], "ProcessorsApi")
+    method, _ = _select_api_method(nipyapi.nifi.ProcessorsApi(), ["update_run_status5", "update_run_status4"], "ProcessorsApi")
     method(id=candidate["id"], body=body)
     deadline = time.time() + 30
     while True:
@@ -443,7 +444,7 @@ def _disable_controller_service_if_needed(candidate, entity):
     )
     method, _ = _select_api_method(
         nipyapi.nifi.ControllerServicesApi(),
-        ["update_run_status1", "update_run_status2"],
+        ["update_run_status2", "update_run_status1"],
         "ControllerServicesApi",
     )
     method(id=candidate["id"], body=body)
@@ -532,7 +533,7 @@ def _set_target_operational_state(candidate, state):
         if _target_operational_state(candidate, current) == state:
             return current
         body = _build_run_status_entity(current, state, ["ProcessorRunStatusEntity"])
-        method, _ = _select_api_method(nipyapi.nifi.ProcessorsApi(), ["update_run_status4"], "ProcessorsApi")
+        method, _ = _select_api_method(nipyapi.nifi.ProcessorsApi(), ["update_run_status5", "update_run_status4"], "ProcessorsApi")
         method(id=candidate["id"], body=body)
         deadline = time.time() + 30
         while True:
@@ -553,7 +554,7 @@ def _set_target_operational_state(candidate, state):
     )
     method, _ = _select_api_method(
         nipyapi.nifi.ControllerServicesApi(),
-        ["update_run_status1", "update_run_status2"],
+        ["update_run_status2", "update_run_status1"],
         "ControllerServicesApi",
     )
     method(id=candidate["id"], body=body)
@@ -597,18 +598,6 @@ def apply_service_binding_entry(plan, restore_context):
         raise RuntimeError(f"{_controller_service_target_summary(candidate)} did not validate after binding update: {errors}")
     _verify_applied_properties(candidate, entity, binding_spec, plan["resolved_properties"])
     return entity
-
-
-def _sanitize_exception(exc):
-    status = _get(exc, "status")
-    reason = _get(exc, "reason")
-    if status is not None or reason:
-        if status is not None and reason:
-            return f"HTTP {status} {reason}"
-        if status is not None:
-            return f"HTTP {status}"
-        return str(reason)
-    return str(exc)
 
 
 def _restore_binding_context(restore_context):
@@ -662,7 +651,7 @@ def describe_flow_service_bindings(flow_pg_id, flow_name, binding_specs, root_pg
                 entry["properties"][property_name] = property_state
         except Exception as exc:
             entry["state"] = "unknown"
-            entry["issues"].append(_sanitize_exception(exc))
+            entry["issues"].append(format_safe_exception(exc))
         described.append(entry)
     return described
 
@@ -710,26 +699,26 @@ def reconcile_service_bindings(flow_spec, root_pg_controller_service_specs, runt
             try:
                 _restore_binding_context(current_context)
             except Exception as exc:
-                restoration_failures.append(f"current entry restore failed: {_sanitize_exception(exc)}")
+                restoration_failures.append(f"current entry restore failed: {format_safe_exception(exc)}")
         for restore_context in reversed(applied_contexts):
             try:
                 _restore_binding_context(restore_context)
             except Exception as exc:
                 restoration_failures.append(
-                    f"restore failed for {_controller_service_target_summary(restore_context['candidate'])}: {_sanitize_exception(exc)}"
+                    f"restore failed for {_controller_service_target_summary(restore_context['candidate'])}: {format_safe_exception(exc)}"
                 )
         if flow_was_running:
             try:
                 start_flow(pg.id, flow_spec["name"])
             except Exception as exc:
-                restoration_failures.append(f"flow restoration failed: {_sanitize_exception(exc)}")
+                restoration_failures.append(f"flow restoration failed: {format_safe_exception(exc)}")
         if restoration_failures:
             raise RuntimeError(
-                f"Service binding sequence failed for flow '{flow_spec['name']}': {_sanitize_exception(original_error)}. "
+                f"Service binding sequence failed for flow '{flow_spec['name']}': {format_safe_exception(original_error)}. "
                 f"Restoration failures: {'; '.join(restoration_failures)}"
             ) from original_error
         raise RuntimeError(
-            f"Service binding sequence failed for flow '{flow_spec['name']}': {_sanitize_exception(original_error)}. "
+            f"Service binding sequence failed for flow '{flow_spec['name']}': {format_safe_exception(original_error)}. "
             f"The original values and run state were restored."
         ) from original_error
     return True

@@ -140,18 +140,37 @@ class _ApiException(Exception):
         self.body = body
 
 
-def test_fake_api_rejects_unexpected_method_names(fake_nipyapi):
-    with pytest.raises(AssertionError, match="Unexpected fake ProcessorsApi method: update_run_status5"):
-        getattr(fake_nipyapi.nifi.ProcessorsApi(), "update_run_status5")
+@pytest.mark.parametrize(
+    ("api_name", "method_name"),
+    [
+        ("ProcessorsApi", "totally_unknown_method"),
+        ("ControllerServicesApi", "totally_unknown_method"),
+        ("ProcessGroupsApi", "totally_unknown_method"),
+    ],
+)
+def test_fake_api_rejects_unexpected_method_names(fake_nipyapi, api_name, method_name):
+    api = getattr(fake_nipyapi.nifi, api_name)()
+    with pytest.raises(AssertionError, match=fr"Unexpected fake {api_name} method: {method_name}"):
+        getattr(api, method_name)
 
 
 def test_real_method_names_cover_supported_run_status_calls(real_nipyapi_method_names):
-    processor_methods = real_nipyapi_method_names.get("ProcessorsApi", set())
-    controller_service_methods = real_nipyapi_method_names.get("ControllerServicesApi", set())
+    processor_methods = real_nipyapi_method_names.get("ProcessorsApi", {})
+    controller_service_methods = real_nipyapi_method_names.get("ControllerServicesApi", {})
     if processor_methods:
-        assert any(name.startswith("update_run_status") for name in processor_methods)
+        assert "update_run_status5" in processor_methods
+        assert "body" in processor_methods["update_run_status5"].parameters
+        assert "id" in processor_methods["update_run_status5"].parameters
+        if "update_run_status4" in processor_methods:
+            assert "body" in processor_methods["update_run_status4"].parameters
+            assert "id" in processor_methods["update_run_status4"].parameters
     if controller_service_methods:
-        assert {"update_run_status1", "update_run_status2"} & controller_service_methods
+        assert "update_run_status2" in controller_service_methods
+        assert "body" in controller_service_methods["update_run_status2"].parameters
+        assert "id" in controller_service_methods["update_run_status2"].parameters
+        if "update_run_status1" in controller_service_methods:
+            assert "body" in controller_service_methods["update_run_status1"].parameters
+            assert "id" in controller_service_methods["update_run_status1"].parameters
 
 
 def test_reconcile_processor_binding_quiesces_once_and_updates_uuid(fake_nipyapi, import_cd_module):
@@ -211,7 +230,75 @@ def test_reconcile_processor_binding_quiesces_once_and_updates_uuid(fake_nipyapi
     assert update_calls == [{"Record Reader": "root-cs-1"}]
 
 
-def test_running_processor_uses_update_run_status4(fake_nipyapi, import_cd_module):
+def test_running_processor_uses_update_run_status5_when_available(fake_nipyapi, import_cd_module):
+    calls = []
+    runtime_state = {
+        "processor": _processor_entity(
+            name="Parse Records",
+            entity_id="proc-1",
+            parent_group_id="flow-pg",
+            properties={},
+            descriptors={"Record Reader": _descriptor()},
+            run_status="RUNNING",
+        )
+    }
+
+    def get_processor(**kwargs):
+        return runtime_state["processor"]
+
+    def update_run_status5(**kwargs):
+        calls.append("update_run_status5")
+        runtime_state["processor"] = _processor_entity(
+            name="Parse Records",
+            entity_id="proc-1",
+            parent_group_id="flow-pg",
+            properties={},
+            descriptors={"Record Reader": _descriptor()},
+            run_status="STOPPED",
+            revision_version=1,
+        )
+        return runtime_state["processor"]
+
+    def update_processor(**kwargs):
+        runtime_state["processor"] = _processor_entity(
+            name="Parse Records",
+            entity_id="proc-1",
+            parent_group_id="flow-pg",
+            properties={"Record Reader": "root-cs-1"},
+            descriptors={"Record Reader": _descriptor()},
+            run_status="STOPPED",
+            revision_version=2,
+        )
+        return runtime_state["processor"]
+
+    fake_nipyapi.api_methods["ProcessGroupsApi"]["get_processors"] = lambda **kwargs: types.SimpleNamespace(processors=[runtime_state["processor"]])
+    fake_nipyapi.api_methods["FlowApi"]["get_controller_services_from_group"] = lambda **kwargs: types.SimpleNamespace(controller_services=[])
+    fake_nipyapi.api_methods["ProcessGroupsApi"]["get_process_group"] = lambda **kwargs: _flow_pg()
+    fake_nipyapi.api_methods["ProcessorsApi"]["get_processor"] = get_processor
+    fake_nipyapi.api_methods["ProcessorsApi"]["update_run_status5"] = update_run_status5
+    fake_nipyapi.api_methods["ProcessorsApi"]["update_processor"] = update_processor
+
+    module = _import_manage_service_bindings(
+        import_cd_module,
+        _manage_flows_module(),
+        types.SimpleNamespace(list_root_pg_controller_services=lambda: [_controller_service_entity("CSV Reader", "root-cs-1", "root")]),
+    )
+
+    module.reconcile_service_bindings(
+        {
+            "name": "Example Flow",
+            "start": True,
+            "service_bindings": [{"target": "Parse Records", "properties": {"Record Reader": "CSV Reader"}}],
+        },
+        [{"name": "CSV Reader", "type": "org.apache.nifi.json.JsonTreeReader"}],
+        runtime_url="https://example.invalid/nifi-api",
+        nifi_pat="token",
+    )
+
+    assert calls == ["update_run_status5"]
+
+
+def test_running_processor_falls_back_to_update_run_status4(fake_nipyapi, import_cd_module):
     calls = []
     runtime_state = {
         "processor": _processor_entity(
@@ -347,6 +434,76 @@ def test_controller_service_target_success_uses_supported_run_status_method(fake
 
     assert changed is True
     assert calls == ["update_run_status2", "update_controller_service"]
+
+
+def test_controller_service_target_falls_back_to_update_run_status1(fake_nipyapi, import_cd_module):
+    calls = []
+    runtime_state = {
+        "service": _controller_service_entity(
+            name="Lookup",
+            entity_id="cs-1",
+            parent_group_id="flow-pg",
+            properties={"Record Reader": "root-cs-old"},
+            descriptors={"Record Reader": _descriptor()},
+            state="ENABLED",
+        )
+    }
+
+    def get_controller_service(**kwargs):
+        return runtime_state["service"]
+
+    def update_run_status1(**kwargs):
+        calls.append("update_run_status1")
+        runtime_state["service"] = _controller_service_entity(
+            name="Lookup",
+            entity_id="cs-1",
+            parent_group_id="flow-pg",
+            properties={"Record Reader": "root-cs-old"},
+            descriptors={"Record Reader": _descriptor()},
+            state="DISABLED",
+            revision_version=1,
+        )
+        return runtime_state["service"]
+
+    def update_controller_service(**kwargs):
+        calls.append("update_controller_service")
+        runtime_state["service"] = _controller_service_entity(
+            name="Lookup",
+            entity_id="cs-1",
+            parent_group_id="flow-pg",
+            properties={"Record Reader": "root-cs-1"},
+            descriptors={"Record Reader": _descriptor()},
+            state="DISABLED",
+            revision_version=2,
+        )
+        return runtime_state["service"]
+
+    fake_nipyapi.api_methods["ProcessGroupsApi"]["get_processors"] = lambda **kwargs: types.SimpleNamespace(processors=[])
+    fake_nipyapi.api_methods["FlowApi"]["get_controller_services_from_group"] = lambda **kwargs: types.SimpleNamespace(controller_services=[runtime_state["service"]])
+    fake_nipyapi.api_methods["ProcessGroupsApi"]["get_process_group"] = lambda **kwargs: _flow_pg()
+    fake_nipyapi.api_methods["ControllerServicesApi"]["get_controller_service"] = get_controller_service
+    fake_nipyapi.api_methods["ControllerServicesApi"]["update_run_status1"] = update_run_status1
+    fake_nipyapi.api_methods["ControllerServicesApi"]["update_controller_service"] = update_controller_service
+
+    module = _import_manage_service_bindings(
+        import_cd_module,
+        _manage_flows_module(),
+        types.SimpleNamespace(list_root_pg_controller_services=lambda: [_controller_service_entity("CSV Reader", "root-cs-1", "root")]),
+    )
+
+    changed = module.reconcile_service_bindings(
+        {
+            "name": "Example Flow",
+            "start": False,
+            "service_bindings": [{"target": "Lookup", "properties": {"Record Reader": "CSV Reader"}}],
+        },
+        [{"name": "CSV Reader", "type": "org.apache.nifi.json.JsonTreeReader"}],
+        runtime_url="https://example.invalid/nifi-api",
+        nifi_pat="token",
+    )
+
+    assert changed is True
+    assert calls == ["update_run_status1", "update_controller_service"]
 
 
 def test_dynamic_probe_success_updates_binding(fake_nipyapi, import_cd_module):

@@ -61,7 +61,13 @@ def _set_state(cs, state, refresh_fn=None, timeout=60, interval=2):
         revision=cs.revision,
         state=state,
     )
-    api.update_run_status1(id=cs.id, body=body)
+    update_run_status = _select_api_method(
+        api,
+        ["update_run_status2", "update_run_status1"],
+        "ControllerServicesApi",
+        "controller service run-status update",
+    )
+    update_run_status(id=cs.id, body=body)
     print(f"[cs] '{cs.component.name}' -> {state}")
     fn = refresh_fn or _refresh
     name = cs.component.name
@@ -188,6 +194,15 @@ def _refresh_root_pg(name):
     return cs
 
 
+def _select_api_method(api, candidate_names, api_name, operation_name):
+    for candidate_name in candidate_names:
+        method = getattr(api, candidate_name, None)
+        if callable(method):
+            return method
+    names = ", ".join(candidate_names)
+    raise AttributeError(f"{api_name} does not provide a supported {operation_name} method ({names})")
+
+
 def _create_root_pg(svc_spec):
     api = nipyapi.nifi.ProcessGroupsApi()
     bundle_spec = svc_spec.get("bundle")
@@ -207,7 +222,13 @@ def _create_root_pg(svc_spec):
             properties=svc_spec.get("properties", {}),
         ),
     )
-    result = api.create_controller_service(id='root', body=body)
+    create_controller_service = _select_api_method(
+        api,
+        ["create_controller_service1", "create_controller_service"],
+        "ProcessGroupsApi",
+        "root PG controller service creation",
+    )
+    result = create_controller_service(id='root', body=body)
     print(f"[root-pg-cs] Created '{svc_spec['name']}' (id={result.id})")
     return result
 

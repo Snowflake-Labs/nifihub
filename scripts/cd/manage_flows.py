@@ -21,6 +21,349 @@ import time
 
 import nipyapi
 
+from safe_exceptions import format_safe_exception
+
+
+DELETE_POLL_INTERVAL_SECONDS = 1
+DELETE_STATE_TIMEOUT_SECONDS = 60
+DROP_REQUEST_TIMEOUT_SECONDS = 60
+
+
+def _get(obj, *names, default=None):
+    for name in names:
+        if obj is None:
+            return default
+        if isinstance(obj, dict) and name in obj:
+            return obj[name]
+        if hasattr(obj, name):
+            return getattr(obj, name)
+    return default
+
+
+def _component(entity):
+    return _get(entity, "component")
+
+
+def _entity_id(entity):
+    component = _component(entity)
+    return _get(entity, "id") or _get(component, "id")
+
+
+def _component_name(entity):
+    return _get(_component(entity), "name", default="")
+
+
+def _component_parent_group_id(entity):
+    return _get(_component(entity), "parent_group_id", "parentGroupId")
+
+
+def _revision_version(entity):
+    revision = _get(entity, "revision")
+    return _get(revision, "version")
+
+
+def _processor_state(entity):
+    status = _get(entity, "status")
+    return str(
+        _get(status, "run_status", "runStatus")
+        or _get(_component(entity), "state")
+        or ""
+    ).upper()
+
+
+def _processor_active_thread_count(entity):
+    status = _get(entity, "status")
+    snapshot = _get(status, "aggregate_snapshot", "aggregateSnapshot")
+    return _get(snapshot, "active_thread_count", "activeThreadCount")
+
+
+def _controller_service_state(entity):
+    return str(_get(_component(entity), "state") or "").upper()
+
+
+def _processor_is_deletable(entity):
+    return (
+        _processor_state(entity) in {"STOPPED", "DISABLED", "INVALID"}
+        and _processor_active_thread_count(entity) == 0
+    )
+
+
+def _processor_delete_state(entity):
+    state = _processor_state(entity) or "UNKNOWN"
+    active_threads = _processor_active_thread_count(entity)
+    thread_summary = "UNKNOWN" if active_threads is None else str(active_threads)
+    return f"{state}, active threads={thread_summary}"
+
+
+def _build_process_group_path_resolver(flow_pg_id, flow_name):
+    api = nipyapi.nifi.ProcessGroupsApi()
+    cache = {flow_pg_id: flow_name}
+
+    def resolve(group_id):
+        if not group_id:
+            return flow_name
+        if group_id in cache:
+            return cache[group_id]
+        pg = api.get_process_group(id=group_id)
+        parent_group_id = _get(_component(pg), "parent_group_id", "parentGroupId")
+        name = _get(_component(pg), "name", default=group_id)
+        if parent_group_id == flow_pg_id:
+            path = f"{flow_name}/{name}"
+        else:
+            path = f"{resolve(parent_group_id)}/{name}"
+        cache[group_id] = path
+        return path
+
+    return resolve
+
+
+def _format_component_state(entity, state, resolve_path):
+    path = resolve_path(_component_parent_group_id(entity))
+    component_id = _entity_id(entity)
+    component_name = _component_name(entity) or component_id or "<unnamed>"
+    return f"{path}/{component_name} [{component_id}]={state or 'UNKNOWN'}"
+
+
+def _summarize_components(entities, state_getter, resolve_path):
+    return ", ".join(
+        _format_component_state(entity, state_getter(entity), resolve_path)
+        for entity in entities
+    )
+
+
+def _select_api_method(api, candidate_names, api_name):
+    for candidate_name in candidate_names:
+        method = getattr(api, candidate_name, None)
+        if callable(method):
+            return method, candidate_name
+    names = ", ".join(candidate_names)
+    raise AttributeError(f"{api_name} does not provide a supported method ({names})")
+
+
+def _is_unsupported_kwarg_type_error(exc, kwarg_names):
+    message = str(exc)
+    if "unexpected keyword argument" not in message:
+        return False
+    return any(f"'{kwarg_name}'" in message for kwarg_name in kwarg_names)
+
+
+def _call_api_with_legacy_kwarg_fallback(api_method, base_kwargs, optional_kwargs):
+    kwargs = {**base_kwargs, **optional_kwargs}
+    try:
+        return api_method(**kwargs)
+    except TypeError as exc:
+        if not optional_kwargs or not _is_unsupported_kwarg_type_error(exc, optional_kwargs):
+            raise
+    return api_method(**base_kwargs)
+
+
+def _list_descendant_processors(pg_id):
+    result = _call_api_with_legacy_kwarg_fallback(
+        nipyapi.nifi.ProcessGroupsApi().get_processors,
+        {"id": pg_id},
+        {"include_descendant_groups": True},
+    )
+    return list(_get(result, "processors", default=[]) or [])
+
+
+def _list_descendant_controller_services(pg_id):
+    result = _call_api_with_legacy_kwarg_fallback(
+        nipyapi.nifi.FlowApi().get_controller_services_from_group,
+        {"id": pg_id},
+        {
+            "include_ancestor_groups": False,
+            "include_descendant_groups": True,
+        },
+    )
+    return list(_get(result, "controller_services", default=[]) or [])
+
+
+def _await_deletable_flow_state(
+    pg_id,
+    flow_name,
+    timeout=DELETE_STATE_TIMEOUT_SECONDS,
+    interval=DELETE_POLL_INTERVAL_SECONDS,
+):
+    resolve_path = _build_process_group_path_resolver(pg_id, flow_name)
+    deadline = time.time() + timeout
+    while True:
+        try:
+            processors = _list_descendant_processors(pg_id)
+            controller_services = _list_descendant_controller_services(pg_id)
+        except Exception as exc:
+            raise RuntimeError(
+                f"Failed to inspect deletable state for flow '{flow_name}': {format_safe_exception(exc)}"
+            ) from None
+
+        active_processors = [processor for processor in processors if not _processor_is_deletable(processor)]
+        active_controller_services = [
+            controller_service
+            for controller_service in controller_services
+            if _controller_service_state(controller_service) != "DISABLED"
+        ]
+
+        if not active_processors and not active_controller_services:
+            return
+
+        if time.time() >= deadline:
+            details = []
+            if active_processors:
+                details.append(
+                    "processors not in a deletable state: "
+                    + _summarize_components(active_processors, _processor_delete_state, resolve_path)
+                )
+            if active_controller_services:
+                details.append(
+                    "controller services not DISABLED: "
+                    + _summarize_components(active_controller_services, _controller_service_state, resolve_path)
+                )
+            raise RuntimeError(
+                f"Flow '{flow_name}' did not reach a deletable state within {timeout}s: {'; '.join(details)}"
+            )
+
+        time.sleep(interval)
+
+
+def _prepare_flow_for_delete(pg_id, flow_name):
+    flow_api = nipyapi.nifi.FlowApi()
+    try:
+        flow_api.schedule_components(
+            id=pg_id,
+            body=nipyapi.nifi.ScheduleComponentsEntity(id=pg_id, state="STOPPED"),
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            f"Failed to stop processors for flow '{flow_name}': {format_safe_exception(exc)}"
+        ) from None
+
+    try:
+        flow_api.activate_controller_services(
+            id=pg_id,
+            body=nipyapi.nifi.ActivateControllerServicesEntity(id=pg_id, state="DISABLED"),
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            f"Failed to disable controller services for flow '{flow_name}': {format_safe_exception(exc)}"
+        ) from None
+
+    _await_deletable_flow_state(pg_id, flow_name)
+
+
+def _drop_all_flowfiles(
+    pg_id,
+    flow_name,
+    timeout=DROP_REQUEST_TIMEOUT_SECONDS,
+    interval=DELETE_POLL_INTERVAL_SECONDS,
+):
+    pg_api = nipyapi.nifi.ProcessGroupsApi()
+    try:
+        drop_response = pg_api.create_empty_all_connections_request(id=pg_id)
+    except Exception as exc:
+        raise RuntimeError(
+            f"Failed to drop queued flowfiles for flow '{flow_name}': {format_safe_exception(exc)}"
+        ) from None
+
+    drop_request = _get(drop_response, "drop_request", "dropRequest")
+    drop_request_id = _get(drop_request, "id")
+    if not drop_request_id:
+        raise RuntimeError(f"Failed to drop queued flowfiles for flow '{flow_name}': missing drop request id")
+
+    operation_error = None
+    try:
+        deadline = time.time() + timeout
+        while True:
+            status_response = pg_api.get_drop_all_flowfiles_request(id=pg_id, drop_request_id=drop_request_id)
+            status = _get(status_response, "drop_request", "dropRequest")
+            failure_reason = _get(status, "failure_reason", "failureReason")
+            state = str(_get(status, "state") or "").upper()
+            finished = bool(_get(status, "finished", default=False))
+            if failure_reason or state == "FAILURE":
+                raise RuntimeError(
+                    f"Queue drop request for flow '{flow_name}' failed: {failure_reason or 'drop request reported FAILURE'}"
+                )
+            if finished:
+                break
+            if time.time() >= deadline:
+                raise RuntimeError(
+                    f"Queue drop request for flow '{flow_name}' did not finish within {timeout}s"
+                )
+            time.sleep(interval)
+    except Exception as exc:
+        operation_error = exc
+
+    cleanup_error = None
+    try:
+        remove_drop_request, _ = _select_api_method(
+            pg_api,
+            ["remove_drop_request1", "remove_drop_request"],
+            "ProcessGroupsApi",
+        )
+        remove_drop_request(id=pg_id, drop_request_id=drop_request_id)
+    except Exception as exc:
+        cleanup_error = exc
+
+    if operation_error is not None:
+        message = str(operation_error)
+        if cleanup_error is not None:
+            message = (
+                f"{message}. Failed to remove queue drop request for flow '{flow_name}': "
+                f"{format_safe_exception(cleanup_error)}"
+            )
+        raise RuntimeError(message) from None
+
+    if cleanup_error is not None:
+        raise RuntimeError(
+            f"Failed to remove queue drop request for flow '{flow_name}': {format_safe_exception(cleanup_error)}"
+        ) from None
+
+
+def _get_process_group_for_delete(pg_id, flow_name):
+    try:
+        return nipyapi.nifi.ProcessGroupsApi().get_process_group(id=pg_id)
+    except Exception as exc:
+        raise RuntimeError(
+            f"Failed to refresh process group '{flow_name}' before delete: {format_safe_exception(exc)}"
+        ) from None
+
+
+def _is_revision_conflict(exc):
+    if getattr(exc, "status", None) != 409:
+        return False
+    reason = str(getattr(exc, "reason", "") or "").lower()
+    body = str(getattr(exc, "body", "") or "").lower()
+    message = str(exc).lower()
+
+    def has_revision_conflict_marker(text):
+        return (
+            ("revision" in text and "conflict" in text)
+            or "current revision" in text
+            or "not the most up-to-date revision" in text
+        )
+
+    return (
+        has_revision_conflict_marker(body)
+        or has_revision_conflict_marker(message)
+        or ("revision" in reason and "conflict" in reason)
+    )
+
+
+def _remove_process_group(pg_id, flow_name):
+    pg_api = nipyapi.nifi.ProcessGroupsApi()
+    for attempt in range(2):
+        if attempt:
+            _await_deletable_flow_state(pg_id, flow_name)
+        pg_entity = _get_process_group_for_delete(pg_id, flow_name)
+        try:
+            pg_api.remove_process_group(id=pg_id, version=str(_revision_version(pg_entity)))
+            return
+        except Exception as exc:
+            if attempt == 0 and _is_revision_conflict(exc):
+                continue
+            action = "retry delete" if attempt else "delete"
+            raise RuntimeError(
+                f"Failed to {action} process group '{flow_name}': {format_safe_exception(exc)}"
+            ) from None
+
 
 def configure_nifi(runtime_url, pat=None, nifi_auth=None):
     """Configure nipyapi to connect to a NiFi instance.
@@ -181,43 +524,9 @@ def delete_flow(pg_entity):
     name = pg_entity.component.name
     print(f"[flow] Deleting process group '{name}' ({pg_id})...")
 
-    # Step 1: Stop all processors in the process group (recursively)
-    try:
-        nipyapi.nifi.FlowApi().schedule_components(
-            body=nipyapi.nifi.ScheduleComponentsEntity(id=pg_id, state="STOPPED"),
-            id=pg_id,
-        )
-        time.sleep(2)
-    except Exception as e:
-        print(f"[flow] Warning: could not stop processors in '{name}': {e}")
-
-    # Step 2: Disable all controller services in the process group (recursively)
-    try:
-        nipyapi.nifi.FlowApi().activate_controller_services(
-            body=nipyapi.nifi.ActivateControllerServicesEntity(id=pg_id, state="DISABLED"),
-            id=pg_id,
-        )
-        time.sleep(2)
-    except Exception as e:
-        print(f"[flow] Warning: could not disable controller services in '{name}': {e}")
-
-    # Step 3: Drop all queued flowfiles in the process group
-    try:
-        pg_api = nipyapi.nifi.ProcessGroupsApi()
-        drop_req = pg_api.create_empty_all_connections_request(pg_id)
-        drop_id = drop_req.drop_request.id
-        for _ in range(20):
-            status = pg_api.get_drop_all_flowfiles_request(pg_id, drop_id)
-            if status.drop_request.finished:
-                break
-            time.sleep(1)
-        pg_api.remove_drop_request1(pg_id, drop_id)
-    except Exception as e:
-        print(f"[flow] Warning: could not empty queues in '{name}': {e}")
-
-    # Step 4: Delete the process group (re-fetch for latest revision)
-    pg_entity = nipyapi.nifi.ProcessGroupsApi().get_process_group(id=pg_id)
-    nipyapi.nifi.ProcessGroupsApi().remove_process_group(pg_id, version=str(pg_entity.revision.version))
+    _prepare_flow_for_delete(pg_id, name)
+    _drop_all_flowfiles(pg_id, name)
+    _remove_process_group(pg_id, name)
     print(f"[flow] Deleted process group '{name}'")
 
 
@@ -283,11 +592,21 @@ def stop_flow(pg_id, pg_name=""):
 
 def delete_flows(flows, registry_client_name, runtime_url, nifi_pat, nifi_auth=None):
     """Delete process groups for flows that were removed from config."""
-    configure_nifi(runtime_url, pat=nifi_pat, nifi_auth=nifi_auth)
+    try:
+        configure_nifi(runtime_url, pat=nifi_pat, nifi_auth=nifi_auth)
+    except Exception as exc:
+        raise RuntimeError(
+            f"Failed to configure NiFi client for flow delete: {format_safe_exception(exc)}"
+        ) from None
 
     for flow_spec in flows:
         pg_name = flow_spec["name"]
-        pg = find_flow_pg_by_name(pg_name)
+        try:
+            pg = find_flow_pg_by_name(pg_name)
+        except Exception as exc:
+            raise RuntimeError(
+                f"Failed to locate process group '{pg_name}' for delete: {format_safe_exception(exc)}"
+            ) from None
         if pg:
             delete_flow(pg)
         else:

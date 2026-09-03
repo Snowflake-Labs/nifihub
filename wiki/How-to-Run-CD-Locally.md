@@ -14,7 +14,7 @@ The NiFi Hub CD pipeline is implemented as a set of standalone Python scripts. Y
 
 - Python 3.12+
 - Dependencies installed: `pip install -r scripts/cd/requirements-cd.txt`
-- Snowflake CLI installed (`snow`) — required by `describe_live_state.py` even for non-SOM runtimes
+- Snowflake CLI installed (`snow`) — required for SOM or mixed configs; URL-managed-only configs can run without it
 - A running NiFi instance (Snowflake Openflow or local Apache NiFi)
 
 ---
@@ -59,7 +59,7 @@ With `--dry-run`, the pipeline stops after step 3 and prints the change plan JSO
 | `GH_SECRETS_JSON` | No | JSON object of secrets for `${{ secrets.NAME }}` resolution (default `{}`) |
 | `GH_VARS_JSON` | No | JSON object of variables for `${{ vars.NAME }}` resolution (default `{}`) |
 
-> **Note:** `SNOWFLAKE_*` variables are read by `describe_live_state.py` even for non-SOM runtimes (to list connectors). If your runtime uses `url:` and has no Snowflake connectors, you can set them to placeholder values.
+> **Note:** `SNOWFLAKE_*` variables are required only when at least one configured runtime is managed through Snowflake (SOM or mixed configs). URL-managed-only configs skip Snowflake discovery entirely.
 
 ---
 
@@ -165,13 +165,6 @@ deployments:
 # Credentials for the local NiFi (resolved via GH_SECRETS_JSON / GH_VARS_JSON)
 export GH_SECRETS_JSON='{"NIFI_PASSWORD":"adminpassword","NIFIHUB_REGISTRY_PAT":"ghp_..."}'
 export GH_VARS_JSON='{"NIFI_USERNAME":"admin"}'
-
-# Snowflake vars (required by describe_live_state.py even though no SQL runs)
-# Set to placeholder values if you have no Snowflake account
-export SNOWFLAKE_ACCOUNT_URL="https://placeholder.snowflakecomputing.com"
-export SNOWFLAKE_USER="placeholder"
-export SNOWFLAKE_PAT="placeholder"
-export SNOWFLAKE_ROLE="SYSADMIN"
 
 # Run (dry run first to preview)
 python scripts/run-cd.py environments/local/config.yaml --dry-run
@@ -280,7 +273,7 @@ Verify NiFi is running: `docker logs local-nifi | tail -20`. Check that the port
 Check that `NIFI_USERNAME`/`NIFI_PASSWORD` match the credentials in `SINGLE_USER_CREDENTIALS_USERNAME`/`SINGLE_USER_CREDENTIALS_PASSWORD` used when starting the container.
 
 **`SNOWFLAKE_ACCOUNT_URL not set` or Snowflake connection errors**
-Even for non-SOM runtimes, `describe_live_state.py` tries to connect to Snowflake to list connectors and runtimes. Set the `SNOWFLAKE_*` variables to real or placeholder values. If you have no Snowflake account, set them to placeholders — the script will log errors but continue.
+This only applies when the config includes at least one SOM-managed runtime. URL-managed-only configs do not require any `SNOWFLAKE_*` variables.
 
 **`NIFI_RUNTIME_PAT` not set warning**
 This is expected when using `nifi_auth` in `config.yaml`. The `NIFI_RUNTIME_PAT` env var is not required when username/password auth is configured.

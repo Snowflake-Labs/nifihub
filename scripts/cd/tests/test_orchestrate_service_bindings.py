@@ -311,3 +311,72 @@ def test_apply_runtime_modification_rejects_blocked_live_binding_state(fake_nipy
 
     with pytest.raises(RuntimeError, match="Service binding live-state read failed; refusing to apply runtime 'MY_RUNTIME': Example Flow / Lookup: HTTP 403 Forbidden"):
         module.apply_runtime_modification(mod, {"account": "example"})
+
+
+class _LeakyDeleteError(Exception):
+    def __str__(self):
+        return "HTTP response headers: Set-Cookie: secret\nHTTP response body: sensitive"
+
+
+def test_apply_deployment_modifications_sanitizes_delete_failures(fake_nipyapi, import_cd_module, capsys):
+    stubs = _orchestrate_stubs([])
+    stubs["manage_service_bindings"] = types.SimpleNamespace(reconcile_service_bindings=lambda *args, **kwargs: None)
+    module = import_cd_module("orchestrate", stubs)
+    module.runtime_exists = lambda *args, **kwargs: True
+    module._delete_connectors = lambda *args, **kwargs: (_ for _ in ()).throw(_LeakyDeleteError())
+
+    errors = []
+    module.apply_deployment_modifications(
+        [{
+            "name": "DEPLOYMENT",
+            "runtime_changes": {
+                "created": [],
+                "modified": [],
+                "deleted": [{"name": "RUNTIME", "database": "DB", "schema": "SCHEMA", "url": "https://example.invalid", "flows": []}],
+            },
+        }],
+        {"account": "example"},
+        errors,
+    )
+
+    out = capsys.readouterr().out
+    assert errors == ["Runtime RUNTIME delete failed: _LeakyDeleteError"]
+    assert "Set-Cookie" not in out
+    assert "sensitive" not in out
+    assert "traceback" not in out.lower()
+
+
+def test_apply_deployment_deletes_sanitizes_delete_failures_and_aggregates_errors(fake_nipyapi, import_cd_module, capsys):
+    stubs = _orchestrate_stubs([])
+    stubs["manage_service_bindings"] = types.SimpleNamespace(reconcile_service_bindings=lambda *args, **kwargs: None)
+    module = import_cd_module("orchestrate", stubs)
+
+    def failing_delete_flows(flows, rt, runtime_url):
+        raise _LeakyDeleteError()
+
+    module._delete_flows = failing_delete_flows
+    module._delete_connectors = lambda *args, **kwargs: None
+    module.delete_runtime = lambda *args, **kwargs: None
+    module.delete_runtime_eai = lambda *args, **kwargs: None
+
+    errors = []
+    module.apply_deployment_deletes(
+        [{
+            "name": "DEPLOYMENT",
+            "runtimes_to_delete": [
+                {"name": "RUNTIME_ONE", "database": "DB", "schema": "SCHEMA", "url": "https://example.invalid", "flows": [{"name": "Flow One"}]},
+                {"name": "RUNTIME_TWO", "database": "DB", "schema": "SCHEMA", "url": "https://example.invalid", "flows": [{"name": "Flow Two"}]},
+            ],
+        }],
+        {"account": "example"},
+        errors,
+    )
+
+    out = capsys.readouterr().out
+    assert errors == [
+        "Runtime RUNTIME_ONE delete failed: _LeakyDeleteError",
+        "Runtime RUNTIME_TWO delete failed: _LeakyDeleteError",
+    ]
+    assert "Set-Cookie" not in out
+    assert "sensitive" not in out
+    assert "traceback" not in out.lower()

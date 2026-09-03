@@ -18,7 +18,6 @@ import argparse
 import json
 import os
 import sys
-import traceback
 from collections import defaultdict
 
 from manage_deployment import (
@@ -41,6 +40,7 @@ from manage_controller_services import (
 )
 from manage_parameter_providers import reconcile_parameter_providers, delete_parameter_providers, fetch_auto_provisioned_provider
 from manage_service_bindings import reconcile_service_bindings
+from safe_exceptions import format_safe_exception
 from manage_connectors import (
     create_connector, connector_exists, describe_connector,
     apply_connector_config, get_connector_config, put_connector_config,
@@ -441,9 +441,8 @@ def apply_deployment_creates(created_deps, conn, errors):
             try:
                 apply_runtime_create(dep["name"], rt, conn)
             except Exception as e:
-                msg = f"Runtime {rt['name']} create failed: {e}"
+                msg = f"Runtime {rt['name']} create failed: {format_safe_exception(e)}"
                 print(f"[orchestrate] ERROR: {msg}")
-                traceback.print_exc()
                 errors.append(msg)
 
 
@@ -513,9 +512,8 @@ def apply_deployment_modifications(modified_deps, conn, errors):
             try:
                 apply_runtime_create(dep["name"], rt, conn)
             except Exception as e:
-                msg = f"Runtime {rt['name']} create failed: {e}"
+                msg = f"Runtime {rt['name']} create failed: {format_safe_exception(e)}"
                 print(f"[orchestrate] ERROR: {msg}")
-                traceback.print_exc()
                 errors.append(msg)
 
         for mod in rtc.get("modified", []):
@@ -533,9 +531,8 @@ def apply_deployment_modifications(modified_deps, conn, errors):
                         continue
                 apply_runtime_modification(mod, conn)
             except Exception as e:
-                msg = f"Runtime {rt_new['name']} modify failed: {e}"
+                msg = f"Runtime {rt_new['name']} modify failed: {format_safe_exception(e)}"
                 print(f"[orchestrate] ERROR: {msg}")
-                traceback.print_exc()
                 errors.append(msg)
 
         for rt in rtc.get("deleted", []):
@@ -560,9 +557,8 @@ def apply_deployment_modifications(modified_deps, conn, errors):
                         database=rt["database"], schema=rt["schema"], **conn
                     )
             except Exception as e:
-                msg = f"Runtime {rt['name']} delete failed: {e}"
+                msg = f"Runtime {rt['name']} delete failed: {format_safe_exception(e)}"
                 print(f"[orchestrate] ERROR: {msg}")
-                traceback.print_exc()
                 errors.append(msg)
 
 
@@ -681,9 +677,8 @@ def apply_deployment_deletes(deleted_deps, conn, errors):
                         database=rt["database"], schema=rt["schema"], **conn
                     )
             except Exception as e:
-                msg = f"Runtime {rt['name']} delete failed: {e}"
+                msg = f"Runtime {rt['name']} delete failed: {format_safe_exception(e)}"
                 print(f"[orchestrate] ERROR: {msg}")
-                traceback.print_exc()
                 errors.append(msg)
 
         som_rts = [rt for rt in dep.get("runtimes_to_delete", []) if _has_som_api(rt)]
