@@ -391,6 +391,85 @@ def test_reconcile_root_pg_controller_services_create_then_enable_uses_current_r
     assert runtime_state["service"].component.state == "ENABLED"
 
 
+def test_root_pg_controller_service_resolves_secret_before_create(fake_nipyapi, import_cd_module, monkeypatch):
+    captured = {}
+    runtime_state = {"service": None}
+
+    def list_services(**kwargs):
+        return types.SimpleNamespace(controller_services=[] if runtime_state["service"] is None else [runtime_state["service"]])
+
+    def create_service(**kwargs):
+        captured["properties"] = kwargs["body"].component.properties
+        runtime_state["service"] = _controller_service("SQL Pool", state="DISABLED", entity_id="root-cs-id")
+        return runtime_state["service"]
+
+    def set_state(**kwargs):
+        runtime_state["service"] = _controller_service("SQL Pool", state=kwargs["body"].state, entity_id="root-cs-id")
+        return runtime_state["service"]
+
+    fake_nipyapi.api_methods["FlowApi"]["get_controller_services_from_group"] = list_services
+    fake_nipyapi.api_methods["ProcessGroupsApi"]["create_controller_service1"] = create_service
+    fake_nipyapi.api_methods["ControllerServicesApi"]["update_run_status2"] = set_state
+    monkeypatch.setenv("GH_SECRETS_JSON", '{"DATABASE_PASSWORD":"resolved-password"}')
+    module = import_cd_module("manage_controller_services", {
+        "manage_flows": types.SimpleNamespace(configure_nifi=lambda *args, **kwargs: None),
+    })
+
+    module.reconcile_root_pg_controller_services(
+        [{"name": "SQL Pool", "type": "org.apache.nifi.dbcp.DBCPConnectionPool", "properties": {"Password": "${{ secrets.DATABASE_PASSWORD }}"}}],
+        runtime_url="https://example.invalid/nifi-api",
+        nifi_pat="token",
+    )
+
+    assert captured["properties"] == {"Password": "resolved-password"}
+
+
+def test_controller_service_resolves_variable_before_update(fake_nipyapi, import_cd_module, monkeypatch):
+    captured = {}
+    runtime_state = {"service": _controller_service("Lookup", state="DISABLED", properties={"Endpoint": "old"})}
+    fake_nipyapi.api_methods["FlowApi"]["get_controller_services_from_controller"] = lambda **kwargs: types.SimpleNamespace(
+        controller_services=[runtime_state["service"]]
+    )
+
+    def update_service(**kwargs):
+        captured["properties"] = kwargs["body"].component.properties
+        runtime_state["service"] = _controller_service("Lookup", state="DISABLED", properties=captured["properties"], revision_version=1)
+        return runtime_state["service"]
+
+    def set_state(**kwargs):
+        runtime_state["service"] = _controller_service("Lookup", state=kwargs["body"].state, properties=captured["properties"], revision_version=2)
+        return runtime_state["service"]
+
+    fake_nipyapi.api_methods["ControllerServicesApi"]["update_controller_service"] = update_service
+    fake_nipyapi.api_methods["ControllerServicesApi"]["update_run_status2"] = set_state
+    monkeypatch.setenv("GH_VARS_JSON", '{"SERVICE_ENDPOINT":"https://service.example.invalid"}')
+    module = import_cd_module("manage_controller_services", {
+        "manage_flows": types.SimpleNamespace(configure_nifi=lambda *args, **kwargs: None),
+    })
+
+    module.reconcile_controller_services(
+        [{"name": "Lookup", "type": "org.example.Lookup", "properties": {"Endpoint": "${{ vars.SERVICE_ENDPOINT }}"}}],
+        runtime_url="https://example.invalid/nifi-api",
+        nifi_pat="token",
+    )
+
+    assert captured["properties"] == {"Endpoint": "https://service.example.invalid"}
+
+
+def test_controller_service_missing_secret_fails_before_nifi_calls(fake_nipyapi, import_cd_module, monkeypatch):
+    monkeypatch.setenv("GH_SECRETS_JSON", "{}")
+    module = import_cd_module("manage_controller_services", {
+        "manage_flows": types.SimpleNamespace(configure_nifi=lambda *args, **kwargs: pytest.fail("NiFi must not be configured")),
+    })
+
+    with pytest.raises(RuntimeError, match="Secret 'MISSING' not found"):
+        module.reconcile_root_pg_controller_services(
+            [{"name": "SQL Pool", "type": "org.apache.nifi.dbcp.DBCPConnectionPool", "properties": {"Password": "${{ secrets.MISSING }}"}}],
+            runtime_url="https://example.invalid/nifi-api",
+            nifi_pat="token",
+        )
+
+
 def test_reconcile_root_pg_controller_services_fails_when_service_does_not_enable(fake_nipyapi, import_cd_module, monkeypatch):
     service = _controller_service("Shared Reader", state="DISABLED", entity_id="root-cs-id")
     fake_nipyapi.api_methods["FlowApi"]["get_controller_services_from_group"] = lambda **kwargs: types.SimpleNamespace(

@@ -21,6 +21,7 @@ import time
 import nipyapi
 
 from manage_flows import configure_nifi
+from manage_parameters import resolve_value
 
 _orig_ref_type_setter = nipyapi.nifi.ControllerServiceReferencingComponentDTO.reference_type.fset
 def _patched_ref_type_setter(self, value):
@@ -134,8 +135,22 @@ def _properties_match(cs, desired_props):
     return all(current.get(k) == v for k, v in desired_props.items())
 
 
+def _resolve_service_specs(services):
+    resolved = []
+    for service in services:
+        resolved.append({
+            **service,
+            "properties": {
+                name: resolve_value(value)
+                for name, value in (service.get("properties") or {}).items()
+            },
+        })
+    return resolved
+
+
 def reconcile_controller_services(services, runtime_url, nifi_pat, nifi_auth=None):
     """Idempotent reconcile: create missing services, update mismatched properties, ensure all are ENABLED."""
+    services = _resolve_service_specs(services)
     configure_nifi(runtime_url, pat=nifi_pat, nifi_auth=nifi_auth)
     for svc_spec in services:
         name = svc_spec["name"]
@@ -147,8 +162,8 @@ def reconcile_controller_services(services, runtime_url, nifi_pat, nifi_auth=Non
             cs = _refresh(name)
         else:
             if not _properties_match(cs, desired_props):
-                if cs.component.state == "ENABLED":
-                    cs = _set_state(cs, "DISABLED")
+                if cs.component.state != "DISABLED":
+                    cs = _require_state(_set_state(cs, "DISABLED"), "DISABLED")
                 cs = _update_properties(cs, desired_props)
                 cs = _refresh(name)
             else:
@@ -243,6 +258,7 @@ def _create_root_pg(svc_spec):
 
 def reconcile_root_pg_controller_services(services, runtime_url, nifi_pat, nifi_auth=None):
     """Idempotent reconcile for root process group-scoped controller services."""
+    services = _resolve_service_specs(services)
     configure_nifi(runtime_url, pat=nifi_pat, nifi_auth=nifi_auth)
     for svc_spec in services:
         name = svc_spec["name"]
@@ -254,8 +270,11 @@ def reconcile_root_pg_controller_services(services, runtime_url, nifi_pat, nifi_
             cs = _refresh_root_pg(name)
         else:
             if not _properties_match(cs, desired_props):
-                if cs.component.state == "ENABLED":
-                    cs = _set_state(cs, "DISABLED", refresh_fn=_refresh_root_pg)
+                if cs.component.state != "DISABLED":
+                    cs = _require_state(
+                        _set_state(cs, "DISABLED", refresh_fn=_refresh_root_pg),
+                        "DISABLED",
+                    )
                 cs = _update_properties(cs, desired_props)
                 cs = _refresh_root_pg(name)
             else:
