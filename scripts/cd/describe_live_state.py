@@ -17,6 +17,7 @@
 import json
 import os
 import sys
+from contextlib import redirect_stdout
 
 import yaml
 
@@ -387,9 +388,12 @@ def main():
     config_path = sys.argv[1]
     config = load_config(config_path)
     conn = None if all_configured_runtimes_are_url_managed(config) else _conn()
-    state = build_live_state(config_path, conn)
+    # stdout is the machine-readable JSON contract consumed by diff_live.py.
+    # Route diagnostics from nested reconciliation helpers to stderr.
+    with redirect_stdout(sys.stderr):
+        state = build_live_state(config_path, conn)
     json.dump(state, sys.stdout, indent=2)
-    print()
+    print(file=sys.stdout)
 
 
 if __name__ == "__main__":

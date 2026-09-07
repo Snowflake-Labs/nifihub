@@ -105,6 +105,31 @@ def test_describe_live_state_main_skips_conn_for_url_only(tmp_path, monkeypatch,
     assert runtime["nifi"] == {"flows": [], "flow_registries": []}
 
 
+def test_describe_live_state_main_keeps_diagnostics_out_of_json_stdout(tmp_path, monkeypatch, import_cd_module, capsys):
+    config_path = _write_config(tmp_path, _som_config())
+    stubs = {
+        "describe_nifi_state": types.SimpleNamespace(describe_nifi_state=lambda *args, **kwargs: {}),
+        "manage_connectors": types.SimpleNamespace(get_connector_config=lambda *args, **kwargs: {}),
+        "manage_flows": types.SimpleNamespace(configure_nifi=lambda *args, **kwargs: None),
+    }
+    module = import_cd_module("describe_live_state", stubs)
+    monkeypatch.setattr(module, "_conn", lambda: {"account_url": "https://acct", "pat": "pat", "user": "user", "role": "ROLE"})
+
+    def noisy_build_live_state(_path, _conn):
+        print("[helper] diagnostic output")
+        return {"deployments": []}
+
+    monkeypatch.setattr(module, "build_live_state", noisy_build_live_state)
+    monkeypatch.setattr(sys, "argv", ["describe_live_state.py", str(config_path)])
+
+    module.main()
+
+    captured = capsys.readouterr()
+    assert json.loads(captured.out) == {"deployments": []}
+    assert "diagnostic output" not in captured.out
+    assert "diagnostic output" in captured.err
+
+
 @pytest.mark.parametrize("config_factory", [_som_config, _mixed_config])
 def test_describe_live_state_main_uses_conn_when_not_all_url_managed(tmp_path, monkeypatch, import_cd_module, config_factory):
     config_path = _write_config(tmp_path, config_factory())
