@@ -60,7 +60,7 @@ If you want to manage Openflow deployments and runtimes using the GitOps pipelin
    - `SNOWFLAKE_ROLE` (variable)
    - `SNOWFLAKE_PAT` (secret) — Snowflake Personal Access Token
    - `NIFI_RUNTIME_PAT` (secret) — PAT for the NiFi runtime REST API
-   - `NIFI_REGISTRY_PAT` (secret) — PAT for the NiFi registry
+   - `NIFIHUB_REGISTRY_PAT` (secret) — GitHub PAT for the NiFi Flow Registry Client
 4. **Open a PR** — the Environment CD Validate workflow will post a change plan
 5. **Merge to `main`** — your infrastructure is provisioned automatically
 

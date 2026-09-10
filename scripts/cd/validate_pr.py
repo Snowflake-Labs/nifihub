@@ -23,6 +23,9 @@ import tempfile
 import yaml
 from jsonschema import validate, ValidationError
 
+from config_runtime_mode import all_configured_runtimes_are_url_managed
+from manage_parameters import _SECRET_RE
+
 
 def _parse_account(account_url):
     host = account_url.replace("https://", "").replace("http://", "").rstrip("/")
@@ -67,7 +70,44 @@ def validate_schema(config_path, schema_path):
         validate(instance=data, schema=schema)
     except ValidationError as e:
         errors.append(e.message)
+    errors.extend(validate_root_parameter_context(data))
     return data, errors
+
+
+def validate_root_parameter_context(config_data):
+    errors = []
+    for deployment in (config_data or {}).get("deployments", []):
+        for runtime in deployment.get("runtimes", []):
+            spec = runtime.get("root_parameter_context") or {}
+            assets = spec.get("assets", []) or []
+            runtime_name = runtime.get("name", "<unnamed>")
+            names = [asset.get("name") for asset in assets]
+            parameters = [asset.get("parameter") for asset in assets]
+            duplicate_names = sorted({name for name in names if name and names.count(name) > 1})
+            duplicate_parameters = sorted({name for name in parameters if name and parameters.count(name) > 1})
+            if duplicate_names:
+                errors.append(
+                    f"Runtime '{runtime_name}' has duplicate root_parameter_context asset names: "
+                    + ", ".join(duplicate_names)
+                )
+            if duplicate_parameters:
+                errors.append(
+                    f"Runtime '{runtime_name}' maps multiple root_parameter_context assets to the same parameter: "
+                    + ", ".join(duplicate_parameters)
+                )
+            overlap = sorted(set(parameters) & set((spec.get("parameters") or {}).keys()))
+            if overlap:
+                errors.append(
+                    f"Runtime '{runtime_name}' declares root_parameter_context parameters that are also asset targets: "
+                    + ", ".join(overlap)
+                )
+            for parameter_name, parameter_value in (spec.get("parameters") or {}).items():
+                if parameter_value is not None and _SECRET_RE.fullmatch(str(parameter_value)):
+                    errors.append(
+                        f"Runtime '{runtime_name}' root_parameter_context parameter '{parameter_name}' uses a GitHub secret reference, "
+                        "but root_parameter_context.parameters are stored as non-sensitive NiFi parameters; use a provided parameter context for secrets"
+                    )
+    return errors
 
 
 def check_connectivity(conn):
@@ -175,13 +215,6 @@ def main():
         except Exception:
             old_config_data = {}
 
-    conn = {
-        "account_url": os.environ["SNOWFLAKE_ACCOUNT_URL"],
-        "pat": os.environ["SNOWFLAKE_PAT"],
-        "user": os.environ["SNOWFLAKE_USER"],
-        "role": os.environ.get("SNOWFLAKE_ROLE", "OPENFLOW_ADMIN"),
-    }
-
     sections = []
     has_errors = False
 
@@ -192,13 +225,28 @@ def main():
     else:
         sections.append("### :white_check_mark: Schema Validation\n\nConfiguration is valid.")
 
-    connected, conn_err = check_connectivity(conn)
-    if not connected:
-        has_errors = True
-        err_msg = conn_err.strip().replace("\n", " ") if conn_err else "Unknown error"
-        sections.append(f"### :x: Snowflake Connectivity\n\nFailed to connect:\n```\n{err_msg}\n```")
+    url_only_config = all_configured_runtimes_are_url_managed(config_data or {})
+    conn = None
+    connected = False
+    if url_only_config:
+        sections.append(
+            "### :information_source: Snowflake Connectivity\n\n"
+            "Skipped Snowflake validation because every configured runtime is URL-managed (`url:` set on each runtime)."
+        )
     else:
-        sections.append("### :white_check_mark: Snowflake Connectivity\n\nSuccessfully connected to Snowflake.")
+        conn = {
+            "account_url": os.environ["SNOWFLAKE_ACCOUNT_URL"],
+            "pat": os.environ["SNOWFLAKE_PAT"],
+            "user": os.environ["SNOWFLAKE_USER"],
+            "role": os.environ.get("SNOWFLAKE_ROLE", "OPENFLOW_ADMIN"),
+        }
+        connected, conn_err = check_connectivity(conn)
+        if not connected:
+            has_errors = True
+            err_msg = conn_err.strip().replace("\n", " ") if conn_err else "Unknown error"
+            sections.append(f"### :x: Snowflake Connectivity\n\nFailed to connect:\n```\n{err_msg}\n```")
+        else:
+            sections.append("### :white_check_mark: Snowflake Connectivity\n\nSuccessfully connected to Snowflake.")
 
     if connected and config_data:
         for dep in config_data.get("deployments", []):
@@ -217,6 +265,11 @@ def main():
             sections.append(f"### :warning: Existing Runtimes\n\nCould not list runtimes:\n```\n{rt_err}\n```")
         else:
             sections.append(f"### :information_source: Existing Runtimes\n\n{format_runtimes_table(runtimes)}")
+    elif url_only_config:
+        sections.append(
+            "### :information_source: Snowflake Inventory\n\n"
+            "Skipped deployment and runtime inventory because URL-managed runtimes are reconciled directly through the NiFi API."
+        )
 
     comment_body = "## Environment CD — PR Validation\n\n" + "\n\n".join(sections)
     comment_body += "\n\n---\n> *Auto-generated by Environment CD validation workflow.*"
