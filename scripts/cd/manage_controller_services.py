@@ -21,6 +21,7 @@ import time
 import nipyapi
 
 from manage_flows import configure_nifi
+from manage_parameters import resolve_value
 
 _orig_ref_type_setter = nipyapi.nifi.ControllerServiceReferencingComponentDTO.reference_type.fset
 def _patched_ref_type_setter(self, value):
@@ -61,7 +62,13 @@ def _set_state(cs, state, refresh_fn=None, timeout=60, interval=2):
         revision=cs.revision,
         state=state,
     )
-    api.update_run_status1(id=cs.id, body=body)
+    update_run_status = _select_api_method(
+        api,
+        ["update_run_status2", "update_run_status1"],
+        "ControllerServicesApi",
+        "controller service run-status update",
+    )
+    update_run_status(id=cs.id, body=body)
     print(f"[cs] '{cs.component.name}' -> {state}")
     fn = refresh_fn or _refresh
     name = cs.component.name
@@ -76,13 +83,30 @@ def _set_state(cs, state, refresh_fn=None, timeout=60, interval=2):
         time.sleep(interval)
 
 
+def _require_state(cs, state):
+    if cs.component.state != state:
+        raise RuntimeError(
+            f"Controller service '{cs.component.name}' did not reach {state}; current state is {cs.component.state}"
+        )
+    return cs
+
+
 def _create(svc_spec):
     api = nipyapi.nifi.ControllerApi()
+    bundle_spec = svc_spec.get("bundle")
+    bundle = None
+    if bundle_spec:
+        bundle = nipyapi.nifi.BundleDTO(
+            group=bundle_spec["group"],
+            artifact=bundle_spec["artifact"],
+            version=bundle_spec["version"],
+        )
     body = nipyapi.nifi.ControllerServiceEntity(
         revision=nipyapi.nifi.RevisionDTO(version=0),
         component=nipyapi.nifi.ControllerServiceDTO(
             name=svc_spec["name"],
             type=svc_spec["type"],
+            bundle=bundle,
             properties=svc_spec.get("properties", {}),
         ),
     )
@@ -111,8 +135,22 @@ def _properties_match(cs, desired_props):
     return all(current.get(k) == v for k, v in desired_props.items())
 
 
+def _resolve_service_specs(services):
+    resolved = []
+    for service in services:
+        resolved.append({
+            **service,
+            "properties": {
+                name: resolve_value(value)
+                for name, value in (service.get("properties") or {}).items()
+            },
+        })
+    return resolved
+
+
 def reconcile_controller_services(services, runtime_url, nifi_pat, nifi_auth=None):
     """Idempotent reconcile: create missing services, update mismatched properties, ensure all are ENABLED."""
+    services = _resolve_service_specs(services)
     configure_nifi(runtime_url, pat=nifi_pat, nifi_auth=nifi_auth)
     for svc_spec in services:
         name = svc_spec["name"]
@@ -124,8 +162,8 @@ def reconcile_controller_services(services, runtime_url, nifi_pat, nifi_auth=Non
             cs = _refresh(name)
         else:
             if not _properties_match(cs, desired_props):
-                if cs.component.state == "ENABLED":
-                    cs = _set_state(cs, "DISABLED")
+                if cs.component.state != "DISABLED":
+                    cs = _require_state(_set_state(cs, "DISABLED"), "DISABLED")
                 cs = _update_properties(cs, desired_props)
                 cs = _refresh(name)
             else:
@@ -179,23 +217,48 @@ def _refresh_root_pg(name):
     return cs
 
 
+def _select_api_method(api, candidate_names, api_name, operation_name):
+    for candidate_name in candidate_names:
+        method = getattr(api, candidate_name, None)
+        if callable(method):
+            return method
+    names = ", ".join(candidate_names)
+    raise AttributeError(f"{api_name} does not provide a supported {operation_name} method ({names})")
+
+
 def _create_root_pg(svc_spec):
     api = nipyapi.nifi.ProcessGroupsApi()
+    bundle_spec = svc_spec.get("bundle")
+    bundle = None
+    if bundle_spec:
+        bundle = nipyapi.nifi.BundleDTO(
+            group=bundle_spec["group"],
+            artifact=bundle_spec["artifact"],
+            version=bundle_spec["version"],
+        )
     body = nipyapi.nifi.ControllerServiceEntity(
         revision=nipyapi.nifi.RevisionDTO(version=0),
         component=nipyapi.nifi.ControllerServiceDTO(
             name=svc_spec["name"],
             type=svc_spec["type"],
+            bundle=bundle,
             properties=svc_spec.get("properties", {}),
         ),
     )
-    result = api.create_controller_service(id='root', body=body)
+    create_controller_service = _select_api_method(
+        api,
+        ["create_controller_service1", "create_controller_service"],
+        "ProcessGroupsApi",
+        "root PG controller service creation",
+    )
+    result = create_controller_service(id='root', body=body)
     print(f"[root-pg-cs] Created '{svc_spec['name']}' (id={result.id})")
     return result
 
 
 def reconcile_root_pg_controller_services(services, runtime_url, nifi_pat, nifi_auth=None):
     """Idempotent reconcile for root process group-scoped controller services."""
+    services = _resolve_service_specs(services)
     configure_nifi(runtime_url, pat=nifi_pat, nifi_auth=nifi_auth)
     for svc_spec in services:
         name = svc_spec["name"]
@@ -207,15 +270,18 @@ def reconcile_root_pg_controller_services(services, runtime_url, nifi_pat, nifi_
             cs = _refresh_root_pg(name)
         else:
             if not _properties_match(cs, desired_props):
-                if cs.component.state == "ENABLED":
-                    cs = _set_state(cs, "DISABLED", refresh_fn=_refresh_root_pg)
+                if cs.component.state != "DISABLED":
+                    cs = _require_state(
+                        _set_state(cs, "DISABLED", refresh_fn=_refresh_root_pg),
+                        "DISABLED",
+                    )
                 cs = _update_properties(cs, desired_props)
                 cs = _refresh_root_pg(name)
             else:
                 print(f"[root-pg-cs] '{name}' properties up-to-date")
 
         if cs.component.state != "ENABLED":
-            _set_state(cs, "ENABLED", refresh_fn=_refresh_root_pg)
+            _require_state(_set_state(cs, "ENABLED", refresh_fn=_refresh_root_pg), "ENABLED")
         else:
             print(f"[root-pg-cs] '{name}' already ENABLED")
 

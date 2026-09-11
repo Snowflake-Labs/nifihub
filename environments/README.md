@@ -19,24 +19,6 @@ Each `config.yaml` defines one Snowflake account's Openflow resources. Changes m
 
 ### Account
 
-```yaml
-# Controller-level: required for parameter providers and reporting tasks
-controller_services:
-  - name: SnowflakeConnection
-    type: com.snowflake.openflow.runtime.services.snowflake.SnowflakeConnectionService
-    properties:
-      Authentication Strategy: SNOWFLAKE_MANAGED
-
-# Root process group: shared across all flows in this runtime
-root_pg_controller_services:
-  - name: SharedSSLContext
-    type: org.apache.nifi.ssl.StandardRestrictedSSLContextService
-    properties:
-      TrustStore Filename: /etc/ssl/certs/ca-certificates.crt
-      TrustStore Type: JKS
-      Keystore Password: ${{ secrets.KEYSTORE_PASSWORD }}
-```
-
 | Field | Required | Description |
 |-------|----------|-------------|
 | `name` | Yes | Human-readable account name (used in logs and comments) |
@@ -75,6 +57,7 @@ Only one deployment per account is allowed.
 | `flow_registries` | No | Array of Flow Registry Client definitions |
 | `controller_services` | No | Array of controller-level services — visible to parameter providers and reporting tasks; shared across the entire NiFi instance. See [Controller Services](#controller-services). |
 | `root_pg_controller_services` | No | Array of root process group-scoped services — accessible to all flow processors deployed to this runtime. See [Controller Services](#controller-services). |
+| `root_parameter_context` | No | Parameter context managed on the root process group: inherited provider contexts, shared non-sensitive parameters, and assets for root-PG controller services. See [Root Parameter Context](#root-parameter-context). |
 | `parameter_providers` | No | Array of parameter provider definitions |
 | `flows` | No | Array of flow definitions |
 | `connectors` | No | Array of Openflow connector definitions |
@@ -100,6 +83,23 @@ Only one deployment per account is allowed.
 
 NiFi has two scopes for controller services. Use the right key depending on what needs to reference the service:
 
+```yaml
+# These fields belong inside a runtime definition.
+controller_services:
+  - name: SnowflakeConnection
+    type: com.snowflake.openflow.runtime.services.snowflake.SnowflakeConnectionService
+    properties:
+      Authentication Strategy: SNOWFLAKE_MANAGED
+
+root_pg_controller_services:
+  - name: SharedSSLContext
+    type: org.apache.nifi.ssl.StandardRestrictedSSLContextService
+    properties:
+      TrustStore Filename: /etc/ssl/certs/ca-certificates.crt
+      TrustStore Type: JKS
+      Keystore Password: ${{ secrets.KEYSTORE_PASSWORD }}
+```
+
 > **`controller_services`** — Created at the NiFi controller level (`POST /controller/controller-services`). Visible to parameter providers and reporting tasks across the entire instance. Use this when a service must be referenced by a **parameter provider** (e.g. `SnowflakeConnectionService` consumed by `SnowflakeParameterProvider`). Controller service names in parameter provider `properties` are automatically resolved to their NiFi UUIDs at apply time.
 >
 > **`root_pg_controller_services`** — Created inside the root process group (`POST /process-groups/root/controller-services`). Accessible to processors in all flows deployed to this runtime, but not visible outside the process group hierarchy. Use this for services shared across multiple flows that do not need to be at the NiFi controller level (e.g. `StandardRestrictedSSLContextService`, `StandardHttpContextMap`).
@@ -110,7 +110,56 @@ Both keys accept the same object structure:
 |-------|----------|-------------|
 | `name` | Yes | Controller service name in NiFi (unique identity for reconciliation) |
 | `type` | Yes | Fully-qualified Java type |
+| `bundle.group` | No | Exact NiFi bundle group coordinate to use when type lookup is ambiguous |
+| `bundle.artifact` | No | Exact NiFi bundle artifact coordinate |
+| `bundle.version` | No | Exact NiFi bundle version coordinate |
 | `properties` | No | Key-value configuration properties |
+
+When `bundle` is omitted, NiFi infers the implementation from `type`. When `bundle` is provided, all three fields are required and are passed through unchanged during creation. For an existing controller service, `bundle` is creation-time selection only; NiFi Hub does not attempt to switch an existing service to a different bundle.
+
+### Root Parameter Context
+
+Use `root_parameter_context` when root process group controller services need parameters: secrets coming from a parameter provider, shared values reused across services, or files such as a JDBC driver.
+
+```yaml
+parameter_providers:
+  - name: SnowflakeSecrets
+    type: com.snowflake.openflow.runtime.parameter.snowflake.SnowflakeParameterProvider
+    properties:
+      Snowflake Connection Service: SnowflakeConnection
+
+root_parameter_context:
+  provided_parameter_contexts: ".*POSTGRES"
+  parameters:
+    Shared Query Timeout: "30 secs"
+  assets:
+    - name: "postgresql-42.7.10.jar"
+      url: "https://jdbc.postgresql.org/download/postgresql-42.7.10.jar"
+      parameter: "Database Driver"
+
+root_pg_controller_services:
+  - name: SharedDBCPConnectionPool
+    type: org.apache.nifi.dbcp.DBCPConnectionPool
+    properties:
+      Database Driver Class Name: org.postgresql.Driver
+      Database Driver Locations: "#{Database Driver}"
+      Password: "#{POSTGRES_PWD}"
+      Validation Query Timeout: "#{Shared Query Timeout}"
+```
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `provided_parameter_contexts` | No | Regex matched (full match) against parameter provider context names, including the auto-provisioned Snowflake provider. Matching contexts are added as inherited contexts of the root context. Inheritance is additive: existing inherited contexts are never removed. |
+| `parameters` | No | Non-sensitive parameters created or updated directly in the root context. Values support `${{ vars.NAME }}`; `${{ secrets.NAME }}` is rejected because these parameters are stored in NiFi as non-sensitive values. Use provided parameter contexts for secrets. `null` clears the value; omitted parameters are left untouched. Existing sensitive or asset-bound parameters with the same name are rejected. |
+| `assets` | No | Files downloaded and uploaded as assets, each bound to a non-sensitive parameter. Same shape as flow `assets`. A parameter may not be declared in both `parameters` and `assets`. |
+
+If the root process group already has a parameter context, NiFi Hub uses it. Otherwise, it reuses an exact-name `Root Parameter Context` or creates and attaches one. Reconciliation order on every apply is: attach/reuse context, add inherited provider contexts, upsert direct parameters, then reconcile assets; root-PG controller services are reconciled afterwards so `#{...}` references resolve when they are enabled. Direct root parameters are always non-sensitive by design: `${{ secrets.* }}` is rejected here, secrets should come from provided contexts (`#{POSTGRES_PWD}`), and live-state output shows direct root-parameter values as stored.
+
+Assets: sensitive parameters, non-empty literal parameters, duplicate asset names, and multiple assets targeting one parameter are rejected. Asset filenames are treated as immutable content identities because NiFi does not retain the source URL; to deploy changed bytes, use a new filename.
+
+Removing `root_parameter_context` entries is intentionally non-destructive: NiFi Hub leaves inherited contexts, parameters, references, assets, and the context intact. This differs from `root_pg_controller_services`, which are deleted when removed from YAML.
+
+If NiFi Hub cannot safely inspect a declared root parameter context, its inherited contexts, parameters, or assets, the live diff reports a blocker and refuses to apply that runtime. Asset downloads permit only HTTP/HTTPS (including redirects), verify TLS with the bundled CA roots, use a 60-second timeout, and reject files larger than 256 MiB.
 
 ### Parameter Provider
 
@@ -130,12 +179,56 @@ Both keys accept the same object structure:
 | `bucket` | Yes | Flow bucket name in the registry |
 | `flow` | Yes | Flow name in the registry bucket |
 | `version` | Yes | Version to check out. Use `latest` for the newest version, or a specific version string (commit SHA for GitHub-backed registries, semver for connector registries). |
-| `start` | No | If `true`, enable controller services and start processors after parameters are applied. Defaults to `false`. |
+| `start` | No | If `true`, enable controller services and start processors after parameters are applied. Defaults to `false`. Required when `service_bindings` is declared. |
 | `provided_parameter_contexts` | No | Regex pattern to filter which parameter contexts from providers are added as inherited. Only contexts with names matching this pattern are added. If not specified, no provider contexts are inherited by this flow. |
 | `dedicated_parameter_context` | No | If `true`, create a dedicated parameter context for this flow instance instead of reusing existing ones. Required when deploying multiple instances of the same flow with different parameters. Defaults to `false`. |
 | `parameters` | No | Key-value parameter values. Keys are parameter names (context membership is resolved automatically). Use `null` to clear a parameter. |
 | `parameter_overrides` | No | Parameter values set as overrides in the flow's direct parameter context, shadowing inherited values. Use with `dedicated_parameter_context: true` for multi-instance deployments. |
 | `assets` | No | Array of files to download and upload as NiFi Parameter Context Assets. |
+| `service_bindings` | No | Array of bindings that map root-PG controller services onto processor or flow-local controller service properties inside the imported flow. |
+
+#### Service Bindings
+
+Use `service_bindings` when a registry-sourced flow must reference controller services that are declared at the runtime root process group level.
+
+```yaml
+root_pg_controller_services:
+  - name: SharedJsonReader
+    type: org.apache.nifi.json.JsonTreeReader
+    bundle:
+      group: org.apache.nifi
+      artifact: nifi-record-serialization-services-nar
+      version: 2.9.0
+
+flows:
+  - name: "My Versioned Flow"
+    bucket: examples
+    flow: my-flow
+    version: latest
+    start: true
+    service_bindings:
+      - target: Parse Records
+        properties:
+          Record Reader: SharedJsonReader
+      - target: Reader Lookup
+        properties:
+          json: SharedJsonReader
+          obsolete: null
+```
+
+Rules and behavior:
+
+- `target` must match exactly one processor or flow-local controller service in the imported flow. Duplicate names across kinds or nested process groups fail.
+- Binding values must match exactly one declared `root_pg_controller_services` entry. Empty strings and unresolved names are rejected before any write.
+- The referenced root-PG service must implement the controller service API required by the target property. NiFi Hub validates compatibility after applying the binding and rolls back an incompatible binding.
+- Only declared binding properties are managed. Omitted properties are left untouched. Explicit `null` removes an optional or dynamic property.
+- Required controller service properties cannot be removed with `null`; NiFi Hub rejects the removal rather than reporting success.
+- Before changing any bound target, NiFi Hub quiesces the whole imported flow. The final `start` value then re-establishes the declared running state.
+- Existing descriptors must identify a controller service and must not be sensitive. Sensitive service-binding properties are not supported in the first version.
+- When the property does not exist yet, NiFi Hub probes it as a dynamic property, re-fetches the descriptor, and rolls back if the property did not materialize as a non-sensitive controller-service reference.
+- Every apply re-checks bindings after flow import/version update, parameter inheritance, parameter updates, overrides, and asset reconciliation. Matching binding values are a no-op; validation health is reported separately.
+- Live diff and change plans render service names, never raw controller service UUIDs. Unknown live UUIDs are reported as unmanaged binding warnings.
+- Because the flow is locally mutated after registry import, the process group is expected to show `LOCALLY_MODIFIED` inside NiFi.
 
 #### Flow Asset
 
@@ -201,12 +294,35 @@ deployments:
               Personal Access Token: ${{ secrets.NIFIHUB_REGISTRY_PAT }}
               Default Branch: main
               Repository Path: flows
+        root_parameter_context:
+          provided_parameter_contexts: ".*POSTGRES"
+          assets:
+            - name: "postgresql-42.7.10.jar"
+              url: "https://jdbc.postgresql.org/download/postgresql-42.7.10.jar"
+              parameter: "Database Driver"
+        root_pg_controller_services:
+          - name: SharedDBCPConnectionPool
+            type: org.apache.nifi.dbcp.DBCPConnectionPool
+            bundle:
+              group: org.apache.nifi
+              artifact: nifi-dbcp-service-nar
+              version: 2.9.0
+            properties:
+              Database Connection URL: "jdbc:postgresql://postgres.example.com:5432/mydb"
+              Database Driver Class Name: org.postgresql.Driver
+              Database Driver Locations: "#{Database Driver}"
+              Database User: my_user
+              Password: "#{POSTGRES_PWD}"
         flows:
-          - name: "My Flow"
-            bucket: examples
-            flow: hello-world
+          - name: "CDC Postgres Demo - Data Generator"
+            bucket: data-generator
+            flow: postgres-cdc-demo
             version: latest
             start: true
+            service_bindings:
+              - target: ExecuteSQLStatement
+                properties:
+                  Connection Pooling Service: SharedDBCPConnectionPool
             provided_parameter_contexts: ".*"
             parameters:
               My Parameter: "some value"

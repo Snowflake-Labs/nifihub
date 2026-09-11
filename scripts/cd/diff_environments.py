@@ -47,6 +47,31 @@ def diff_lists(old_items, new_items):
     return created, modified, deleted
 
 
+def diff_named_runtime_collection(old_items, new_items):
+    old_idx = {item["name"]: item for item in (old_items or [])}
+    new_idx = {item["name"]: item for item in (new_items or [])}
+    created = [v for k, v in new_idx.items() if k not in old_idx]
+    deleted = [v for k, v in old_idx.items() if k not in new_idx]
+    modified = []
+    unchanged = []
+    for name, new_item in new_idx.items():
+        old_item = old_idx.get(name)
+        if old_item is None:
+            continue
+        if old_item != new_item:
+            modified.append({"old": old_item, "new": new_item})
+        else:
+            unchanged.append(new_item)
+    return {
+        "created": created,
+        "modified": modified,
+        "deleted": deleted,
+        "unchanged": unchanged,
+        "health": [],
+        "blocked": [],
+    }
+
+
 def diff_runtimes(old_runtimes, new_runtimes):
     created, modified, deleted = diff_lists(old_runtimes, new_runtimes)
     results = {"created": created, "modified": [], "deleted": deleted}
@@ -55,7 +80,7 @@ def diff_runtimes(old_runtimes, new_runtimes):
         new_rt = mod["new"]
         changed_fields = {}
         for key in set(list(old_rt.keys()) + list(new_rt.keys())):
-            if key in ("flows", "network_rules", "flow_registries", "controller_services", "root_pg_controller_services", "parameter_providers", "connectors"):
+            if key in ("flows", "network_rules", "flow_registries", "controller_services", "root_pg_controller_services", "root_parameter_context", "parameter_providers", "connectors"):
                 continue
             if old_rt.get(key) != new_rt.get(key):
                 changed_fields[key] = {"old": old_rt.get(key), "new": new_rt.get(key)}
@@ -84,6 +109,14 @@ def diff_runtimes(old_runtimes, new_runtimes):
         new_pp = new_rt.get("parameter_providers", [])
         parameter_provider_changes = diff_controller_services(old_pp, new_pp)
 
+        old_root_parameter_context = old_rt.get("root_parameter_context")
+        new_root_parameter_context = new_rt.get("root_parameter_context")
+        root_parameter_context_changes = {
+            "changed": old_root_parameter_context != new_root_parameter_context,
+            "old": old_root_parameter_context,
+            "new": new_root_parameter_context,
+        }
+
         old_conn = old_rt.get("connectors", [])
         new_conn = new_rt.get("connectors", [])
         connector_changes = diff_controller_services(old_conn, new_conn)
@@ -97,6 +130,7 @@ def diff_runtimes(old_runtimes, new_runtimes):
             "controller_service_changes": controller_service_changes,
             "root_pg_controller_service_changes": root_pg_controller_service_changes,
             "parameter_provider_changes": parameter_provider_changes,
+            "root_parameter_context_changes": root_parameter_context_changes,
             "connector_changes": connector_changes,
             "network_rule_changes": {
                 "created": nr_created,

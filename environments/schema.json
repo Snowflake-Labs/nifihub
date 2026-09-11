@@ -82,7 +82,7 @@
         "url": {
           "type": "string",
           "format": "uri",
-          "description": "NiFi runtime URL (without /nifi-api suffix). When set, SOM SQL-based runtime lifecycle management (CREATE/ALTER/DELETE, EAI, network rules, suspend/resume) is skipped entirely. Only NiFi API operations (registries, flows, parameters, controller services) are performed."
+          "description": "NiFi runtime URL (without /nifi-api suffix). When set, SOM SQL-based runtime lifecycle management (CREATE/ALTER/DROP, EAI, network rules, SUSPEND/RESUME) is skipped entirely. Only NiFi API operations (registries, flows, parameters, controller services, and service bindings) are performed."
         },
         "nifi_auth": {
           "type": "object",
@@ -177,6 +177,31 @@
             "$ref": "#/definitions/controller_service"
           }
         },
+        "root_parameter_context": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "Parameter context managed on the root process group. If the root process group already has a parameter context it is reused; otherwise 'Root Parameter Context' is created and attached. Parameters and assets declared here are visible to root process group controller services.",
+          "properties": {
+            "provided_parameter_contexts": {
+              "type": "string",
+              "description": "Regex pattern selecting parameter provider contexts to add as inherited contexts of the root parameter context. Inheritance is additive; existing inherited contexts are never removed."
+            },
+            "parameters": {
+              "type": "object",
+              "description": "Non-sensitive parameters created or updated directly in the root parameter context. Use null to clear a value. Omitted parameters are left untouched.",
+              "additionalProperties": {
+                "type": ["string", "null"]
+              }
+            },
+            "assets": {
+              "type": "array",
+              "description": "Files to upload as assets in the root parameter context. Each asset is bound to a non-sensitive parameter.",
+              "items": {
+                "$ref": "#/definitions/nifi_asset"
+              }
+            }
+          }
+        },
         "flows": {
           "type": "array",
           "items": {
@@ -212,11 +237,87 @@
           "type": "string",
           "description": "Fully-qualified Java type of the controller service."
         },
+        "bundle": {
+          "$ref": "#/definitions/nifi_bundle"
+        },
         "properties": {
           "type": "object",
           "description": "Key-value properties to configure on the controller service.",
           "additionalProperties": {
             "type": "string"
+          }
+        }
+      }
+    },
+    "nifi_bundle": {
+      "type": "object",
+      "required": ["group", "artifact", "version"],
+      "additionalProperties": false,
+      "properties": {
+        "group": {
+          "type": "string",
+          "minLength": 1,
+          "description": "NiFi bundle group coordinate."
+        },
+        "artifact": {
+          "type": "string",
+          "minLength": 1,
+          "description": "NiFi bundle artifact coordinate."
+        },
+        "version": {
+          "type": "string",
+          "minLength": 1,
+          "description": "NiFi bundle version coordinate."
+        }
+      }
+    },
+    "nifi_asset": {
+      "type": "object",
+      "required": ["name", "url", "parameter"],
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Filename for the asset in the NiFi Parameter Context. Use a new filename when the asset content changes."
+        },
+        "url": {
+          "type": "string",
+          "minLength": 1,
+          "format": "uri",
+          "description": "URL to download the asset file from."
+        },
+        "parameter": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Non-sensitive Parameter name to bind this asset to."
+        }
+      }
+    },
+    "service_binding": {
+      "type": "object",
+      "required": ["target", "properties"],
+      "additionalProperties": false,
+      "properties": {
+        "target": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Exact name of a processor or flow-local controller service inside the imported flow."
+        },
+        "properties": {
+          "type": "object",
+          "minProperties": 1,
+          "description": "Map of target property name to root process group controller service name, or null to remove an optional binding.",
+          "additionalProperties": {
+            "oneOf": [
+              {
+                "type": "string",
+                "minLength": 1
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         }
       }
@@ -409,27 +510,32 @@
           "type": "array",
           "description": "Files to download and upload as NiFi Parameter Context Assets. Each asset is bound to the specified parameter.",
           "items": {
-            "type": "object",
-            "required": ["name", "url", "parameter"],
-            "additionalProperties": false,
+            "$ref": "#/definitions/nifi_asset"
+          }
+        },
+        "service_bindings": {
+          "type": "array",
+          "description": "Bindings that map root process group controller services onto processor or controller service properties inside the imported flow.",
+          "items": {
+            "$ref": "#/definitions/service_binding"
+          }
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "required": ["service_bindings"]
+          },
+          "then": {
+            "required": ["start"],
             "properties": {
-              "name": {
-                "type": "string",
-                "description": "Filename for the asset in the NiFi Parameter Context."
-              },
-              "url": {
-                "type": "string",
-                "format": "uri",
-                "description": "URL to download the asset file from."
-              },
-              "parameter": {
-                "type": "string",
-                "description": "Parameter name to bind this asset to."
+              "start": {
+                "type": "boolean"
               }
             }
           }
         }
-      }
+      ]
     }
   }
 }
