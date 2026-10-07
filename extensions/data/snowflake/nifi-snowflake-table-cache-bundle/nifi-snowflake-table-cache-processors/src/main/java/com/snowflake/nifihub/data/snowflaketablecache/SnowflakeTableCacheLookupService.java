@@ -42,6 +42,7 @@ import java.sql.SQLException;
 import java.sql.Statement;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Base64;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.LinkedHashSet;
@@ -124,8 +125,7 @@ public class SnowflakeTableCacheLookupService extends AbstractControllerService
             .description("Refresh by reading only what changed since the last refresh, using "
                     + "Snowflake's CHANGES clause. Requires change tracking on the source: "
                     + "ALTER TABLE <table> SET CHANGE_TRACKING = TRUE. Inserts, updates and deletes "
-                    + "are all applied. Every node keeps its own watermark, so this is safe on a "
-                    + "cluster of any size. If a watermark falls outside the table's time travel "
+                    + "are all applied. Every node keeps its own watermark. If a watermark falls outside the table's time travel "
                     + "retention - for example after a node has been down a long time - the next "
                     + "refresh automatically falls back to a full reload.")
             .allowableValues("true", "false")
@@ -159,9 +159,6 @@ public class SnowflakeTableCacheLookupService extends AbstractControllerService
             .required(true)
             .build();
 
-    /** Composite key separator: not legal in a Snowflake identifier or a ITEM_ID. */
-    private static final String KEY_SEPARATOR = "\u0000";
-
     /** Alias for the computed delete marker on an incremental read. */
     private static final String DELETE_FLAG = "__TABLE_CACHE_IS_DELETE";
 
@@ -184,6 +181,7 @@ public class SnowflakeTableCacheLookupService extends AbstractControllerService
     private volatile boolean incremental;
     private volatile TableCacheStore store;
     private volatile ScheduledExecutorService refreshExecutor;
+    private volatile boolean stopping;
 
     @Override
     protected List<PropertyDescriptor> getSupportedPropertyDescriptors() {
@@ -191,7 +189,8 @@ public class SnowflakeTableCacheLookupService extends AbstractControllerService
     }
 
     @OnEnabled
-    public void onEnabled(final ConfigurationContext context) throws TableCacheException {
+    public synchronized void onEnabled(final ConfigurationContext context) throws TableCacheException {
+        stopping = false;
         dbcpService = context.getProperty(SNOWFLAKE_CONNECTION_SERVICE).asControllerService(DBCPService.class);
         sourceTable = context.getProperty(SOURCE_TABLE).evaluateAttributeExpressions().getValue().trim();
         keyColumns = splitColumns(context.getProperty(KEY_COLUMNS).getValue());
@@ -262,15 +261,20 @@ public class SnowflakeTableCacheLookupService extends AbstractControllerService
         final String directory = context.getProperty(STORAGE_DIRECTORY)
                 .evaluateAttributeExpressions().getValue().trim();
         try {
-            return new RocksDbTableCacheStore(Paths.get(directory));
+            final List<String> identity = new ArrayList<>(List.of("table-cache-v1", dbcpService.getIdentifier(), sourceTable));
+            identity.add(Base64.getEncoder().encodeToString(RowCodec.encode(keyColumns)));
+            identity.add(selectAll ? "*" : Base64.getEncoder().encodeToString(RowCodec.encode(valueColumns)));
+            identity.add(Boolean.toString(incremental));
+            return new RocksDbTableCacheStore(Paths.get(directory), RowCodec.encode(identity));
         } catch (final IOException e) {
-            throw new TableCacheException("Failed to open embedded store at " + directory
-                    + ". The directory must be writable by the NiFi process.", e);
+            throw new TableCacheException("Cannot open embedded store: check permissions, exclusive use and configuration identity. "
+                    + "Preserve existing files; use a fresh directory when changing the source.", e);
         }
     }
 
     @OnDisabled
     public void onDisabled() {
+        stopping = true;
         final ScheduledExecutorService executor = refreshExecutor;
         refreshExecutor = null;
         if (executor != null) {
@@ -282,13 +286,16 @@ public class SnowflakeTableCacheLookupService extends AbstractControllerService
             }
         }
 
-        final TableCacheStore current = store;
-        store = null;
-        if (current != null) {
-            try {
-                current.close();
-            } catch (final Exception e) {
-                getLogger().warn("Failed to close cache store", e);
+        // A JDBC driver can ignore interruption. Never close JNI handles while refresh still uses them.
+        synchronized (this) {
+            final TableCacheStore current = store;
+            store = null;
+            if (current != null) {
+                try {
+                    current.close();
+                } catch (final Exception e) {
+                    getLogger().warn("Failed to close cache store", e);
+                }
             }
         }
     }
@@ -304,7 +311,7 @@ public class SnowflakeTableCacheLookupService extends AbstractControllerService
      */
     synchronized RefreshResult refresh() throws TableCacheException {
         final TableCacheStore target = store;
-        if (target == null) {
+        if (target == null || stopping) {
             throw new TableCacheException("Service is not enabled");
         }
 
@@ -349,7 +356,7 @@ public class SnowflakeTableCacheLookupService extends AbstractControllerService
                     load.commit(watermark);
                 }
             }
-        } catch (final SQLException e) {
+        } catch (final SQLException | RuntimeException e) {
             throw new TableCacheException("Failed to load cache from " + sourceTable
                     + " using query [" + sql + "]", e);
         }
@@ -372,40 +379,41 @@ public class SnowflakeTableCacheLookupService extends AbstractControllerService
 
         // Project exactly the fields already stored, so the delta's schema matches the load's. On-disk
         // encoding is positional, so a differing column set would silently shift values.
-        // The DELETE-half of an update pair is filtered out: it carries the OLD row state, and the
-        // matching INSERT already carries the new one.
+        // Keep update DELETE halves: a lookup key can itself change. INSERT wins for same-key pairs.
         final String sql = "SELECT " + String.join(", ", fieldNames)
                 + ", METADATA$ACTION = 'DELETE' AS " + DELETE_FLAG
                 + " FROM " + sourceTable
-                + " CHANGES(INFORMATION => DEFAULT) AT(TIMESTAMP => '" + watermark + "'::TIMESTAMP_TZ)"
-                + " WHERE NOT (METADATA$ACTION = 'DELETE' AND METADATA$ISUPDATE = TRUE)";
-
-        final Map<String, Record> upserts = new HashMap<>();
-        final Set<String> deletes = new LinkedHashSet<>();
+                + " CHANGES(INFORMATION => DEFAULT) AT(TIMESTAMP => '" + watermark + "'::TIMESTAMP_TZ)";
 
         try (Connection connection = dbcpService.getConnection()) {
             final String nextWatermark = serverTimestamp(connection);
-
-            try (Statement statement = connection.createStatement();
-                 ResultSet resultSet = statement.executeQuery(sql)) {
-                while (resultSet.next()) {
-                    final String key = compositeKey(resultSet);
-                    if (key == null) {
-                        continue;
-                    }
-                    if (resultSet.getBoolean(DELETE_FLAG)) {
-                        upserts.remove(key);
-                        deletes.add(key);
-                    } else {
-                        deletes.remove(key);
-                        upserts.put(key, readRecord(resultSet, schema, fieldNames));
-                    }
-                }
+            if (!WATERMARK_PATTERN.matcher(nextWatermark).matches()) {
+                throw new TableCacheException("Server returned an unrecognisable timestamp");
             }
 
-            target.applyChanges(schema, upserts, deletes, nextWatermark);
+            try (Statement statement = connection.createStatement();
+                 ResultSet resultSet = statement.executeQuery(sql
+                         + " END(TIMESTAMP => '" + nextWatermark + "'::TIMESTAMP_TZ)")) {
+                return applyChangeRows(target, resultSet, nextWatermark, started);
+            }
         }
+    }
 
+    RefreshResult applyChangeRows(final TableCacheStore target, final ResultSet resultSet,
+                                  final String nextWatermark, final long started) throws SQLException {
+        final RecordSchema schema = target.schema();
+        final Map<String, Record> upserts = new HashMap<>();
+        final Set<String> deletes = new LinkedHashSet<>();
+        while (resultSet.next()) {
+            final String key = compositeKey(resultSet);
+            if (resultSet.getBoolean(DELETE_FLAG)) {
+                deletes.add(key);
+            } else if (upserts.putIfAbsent(key, readRecord(resultSet, schema, schema.getFieldNames())) != null) {
+                throw new SQLException("Change rows contain duplicate lookup keys");
+            }
+        }
+        deletes.removeAll(upserts.keySet());
+        target.applyChanges(schema, upserts, deletes, nextWatermark);
         return new RefreshResult(upserts.size(), deletes.size(),
                 System.currentTimeMillis() - started, true, target.describe());
     }
@@ -465,19 +473,19 @@ public class SnowflakeTableCacheLookupService extends AbstractControllerService
             throw new LookupFailureException("Cache for " + sourceTable + " is not loaded yet");
         }
 
-        final StringBuilder key = new StringBuilder();
-        for (int i = 0; i < keyColumns.size(); i++) {
-            final String column = keyColumns.get(i);
+        final List<String> parts = new ArrayList<>(keyColumns.size());
+        for (final String column : keyColumns) {
             final Object value = coordinates.get(column);
             if (value == null) {
                 throw new LookupFailureException("Lookup coordinate '" + column + "' is required but was not supplied");
             }
-            if (i > 0) {
-                key.append(KEY_SEPARATOR);
-            }
-            key.append(value);
+            parts.add(value.toString());
         }
-        return current.get(key.toString());
+        try {
+            return current.get(encodeKey(parts));
+        } catch (final RuntimeException e) {
+            throw new LookupFailureException("Cache storage lookup failed", e);
+        }
     }
 
     @Override
@@ -498,14 +506,19 @@ public class SnowflakeTableCacheLookupService extends AbstractControllerService
     }
 
     private String compositeKey(final ResultSet resultSet) throws SQLException {
-        if (keyColumns.size() == 1) {
-            return resultSet.getString(keyColumns.get(0));
-        }
         final List<String> parts = new ArrayList<>(keyColumns.size());
         for (final String column : keyColumns) {
-            parts.add(resultSet.getString(column));
+            final String value = resultSet.getString(column);
+            if (value == null) {
+                throw new SQLException("Source keys must be non-null");
+            }
+            parts.add(value);
         }
-        return String.join(KEY_SEPARATOR, parts);
+        return encodeKey(parts);
+    }
+
+    private static String encodeKey(final List<String> parts) {
+        return parts.size() == 1 ? parts.getFirst() : Base64.getEncoder().encodeToString(RowCodec.encode(parts));
     }
 
     /**

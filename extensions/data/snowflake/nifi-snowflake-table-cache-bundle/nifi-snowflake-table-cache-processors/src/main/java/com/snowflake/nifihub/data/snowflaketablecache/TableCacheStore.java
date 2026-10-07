@@ -26,7 +26,7 @@ import java.util.Set;
  *
  * <p>Two write paths, and both must be <em>atomic</em>: readers concurrent with a write continue to
  * see the previous contents until it completes. That is what lets a refresh run while lookups are
- * being served, and what prevents a reader from obseritemIdg a half-applied change — which for an
+ * being served, and what prevents a reader from observing a half-applied change — which for an
  * entitlement dataset would be a correctness bug, not a performance one.
  *
  * <ul>
@@ -35,8 +35,7 @@ import java.util.Set;
  * </ul>
  *
  * <p>Both write paths also carry the <b>watermark</b>, so it is stored atomically with the data it
- * describes. A restart can therefore never come up with contents and a watermark that disagree,
- * which would either re-apply changes (harmless) or skip them (not harmless).
+ * describes. Crash and filesystem durability still depend on the backend and runtime.
  */
 public interface TableCacheStore extends Closeable {
 
@@ -53,7 +52,7 @@ public interface TableCacheStore extends Closeable {
      *
      * @param schema    schema of the upserted records
      * @param upserts   keys to insert or replace
-     * @param deletes   keys to remove
+     * @param deletes   keys to remove; an upsert for the same key takes precedence
      * @param watermark new watermark, stored with the change
      */
     void applyChanges(RecordSchema schema, Map<String, Record> upserts, Set<String> deletes,

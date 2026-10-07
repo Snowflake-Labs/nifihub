@@ -23,19 +23,31 @@ import org.apache.nifi.serialization.record.RecordFieldType;
 import org.apache.nifi.serialization.record.RecordSchema;
 import org.apache.nifi.util.TestRunner;
 import org.apache.nifi.util.TestRunners;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
+import java.nio.file.Files;
 import java.nio.file.Path;
+import java.sql.Connection;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
+import java.sql.Statement;
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -73,6 +85,206 @@ class TestSnowflakeTableCacheLookupService {
 
         runner = TestRunners.newTestRunner(NoOpProcessor.class);
         service = new SnowflakeTableCacheLookupService();
+    }
+
+    @AfterEach
+    void stopServices() {
+        service.onDisabled();
+    }
+
+    @Test
+    void embeddedRejectsChangedSourceInsteadOfServingPreviousData() throws Exception {
+        enableService("EMBEDDED_KV", "ITEM_ID", "*");
+        runner.disableControllerService(service);
+        connectionService.execute("CREATE TABLE OTHER_DATA AS SELECT * FROM REFERENCE_DATA");
+        runner.setProperty(service, SnowflakeTableCacheLookupService.SOURCE_TABLE, "OTHER_DATA");
+        assertThrows(AssertionError.class, () -> runner.enableControllerService(service));
+        assertThrows(LookupFailureException.class, () -> service.lookup(Map.of("ITEM_ID", "ITEM_ID001")));
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"HEAP", "EMBEDDED_KV"})
+    void compositeKeysWithSeparatorBytesRemainDistinct(final String mode) throws Exception {
+        connectionService.execute("CREATE TABLE KEYS_TEST (K1 VARCHAR, K2 VARCHAR, LABEL VARCHAR)");
+        try (final Connection connection = connectionService.getConnection();
+                final PreparedStatement statement = connection.prepareStatement("INSERT INTO KEYS_TEST VALUES (?, ?, ?)")) {
+            statement.setString(1, "a\u0000b");
+            statement.setString(2, "c");
+            statement.setString(3, "first");
+            statement.executeUpdate();
+            statement.setString(1, "a");
+            statement.setString(2, "b\u0000c");
+            statement.setString(3, "second");
+            statement.executeUpdate();
+        }
+        enableService(mode, "K1,K2", "LABEL", "0 sec", "KEYS_TEST");
+        assertEquals("first", service.lookup(Map.of("K1", "a\u0000b", "K2", "c")).orElseThrow().getAsString("LABEL"));
+        assertEquals("second", service.lookup(Map.of("K1", "a", "K2", "b\u0000c")).orElseThrow().getAsString("LABEL"));
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"HEAP", "EMBEDDED_KV"})
+    void duplicateKeysFailLoadRatherThanChooseAnArbitraryRow(final String mode) throws Exception {
+        connectionService.execute("CREATE TABLE DUPLICATE_KEYS (K VARCHAR, V VARCHAR)",
+                "INSERT INTO DUPLICATE_KEYS VALUES ('a','first'),('a','second')");
+        enableService(mode, "K", "V", "0 sec", "DUPLICATE_KEYS");
+        assertFalse(service.isHydrated());
+        assertThrows(LookupFailureException.class, () -> service.lookup(Map.of("K", "a")));
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"HEAP", "EMBEDDED_KV"})
+    void nullCompositeKeyFailsLoad(final String mode) throws Exception {
+        connectionService.execute("CREATE TABLE NULL_KEYS (K1 VARCHAR, K2 VARCHAR, V VARCHAR)",
+                "INSERT INTO NULL_KEYS VALUES ('a',NULL,'not-addressable')");
+        enableService(mode, "K1,K2", "V", "0 sec", "NULL_KEYS");
+        assertFalse(service.isHydrated());
+    }
+
+    @Test
+    void secondStoreCannotDeleteAnOpenStoresData() throws Exception {
+        final RecordSchema recordSchema = schema("K", "V");
+        try (RocksDbTableCacheStore first = new RocksDbTableCacheStore(storageDirectory)) {
+            try (TableCacheStore.BulkLoad load = first.beginBulkLoad(recordSchema)) {
+                load.put("first", record(recordSchema, "first", "value"));
+                load.commit("watermark");
+            }
+            assertThrows(java.io.IOException.class, () -> {
+                try (RocksDbTableCacheStore ignored = new RocksDbTableCacheStore(storageDirectory)) {
+                    assertFalse(ignored.isHydrated());
+                }
+            });
+        }
+        try (RocksDbTableCacheStore reopened = new RocksDbTableCacheStore(storageDirectory)) {
+            assertEquals("value", reopened.get("first").orElseThrow().getAsString("V"));
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"HEAP", "EMBEDDED_KV"})
+    void changeRowsHandleKeyChangesAndEitherUpdateOrder(final String mode) throws Exception {
+        enableService(mode, "ITEM_ID", "*");
+        connectionService.execute("CREATE TABLE DELTA (ITEM_ID VARCHAR, LABEL VARCHAR, REGION VARCHAR, __TABLE_CACHE_IS_DELETE BOOLEAN)",
+                "INSERT INTO DELTA VALUES ('ITEM_ID900','new','EU',FALSE),('ITEM_ID001','old','NA',TRUE),"
+                        + "('ITEM_ID002','updated','EU',FALSE),('ITEM_ID002','old','NA',TRUE),"
+                        + "('ITEM_ID003','old','NA',TRUE),('ITEM_ID003','updated','EU',FALSE)");
+        try (final Connection connection = connectionService.getConnection();
+             final Statement statement = connection.createStatement();
+             final ResultSet rows = statement.executeQuery("SELECT * FROM DELTA")) {
+            service.applyChangeRows(service.storeForTest(), rows, "new-watermark", System.currentTimeMillis());
+        }
+        assertEquals(3L, service.size());
+        assertTrue(service.lookup(Map.of("ITEM_ID", "ITEM_ID001")).isEmpty());
+        assertEquals("new", service.lookup(Map.of("ITEM_ID", "ITEM_ID900")).orElseThrow().getAsString("LABEL"));
+        assertEquals("updated", service.lookup(Map.of("ITEM_ID", "ITEM_ID002")).orElseThrow().getAsString("LABEL"));
+        assertEquals("updated", service.lookup(Map.of("ITEM_ID", "ITEM_ID003")).orElseThrow().getAsString("LABEL"));
+    }
+
+    @Test
+    void metadataLikeUserKeysDoNotOverwriteStoreMetadata() throws Exception {
+        final RecordSchema recordSchema = schema("K", "V");
+        try (RocksDbTableCacheStore cache = new RocksDbTableCacheStore(storageDirectory)) {
+            try (TableCacheStore.BulkLoad load = cache.beginBulkLoad(recordSchema)) {
+                load.put("\u0000__schema__", record(recordSchema, "\u0000__schema__", "value"));
+                load.commit("watermark");
+            }
+        }
+        try (RocksDbTableCacheStore cache = new RocksDbTableCacheStore(storageDirectory)) {
+            assertEquals(1L, cache.size());
+            assertEquals("value", cache.get("\u0000__schema__").orElseThrow().getAsString("V"));
+        }
+    }
+
+    @Test
+    void mismatchedIdentityDoesNotLeakDirectoryLock() throws Exception {
+        try (RocksDbTableCacheStore cache = new RocksDbTableCacheStore(storageDirectory, new byte[]{1})) {
+            assertFalse(cache.isHydrated());
+        }
+        assertThrows(java.io.IOException.class, () -> new RocksDbTableCacheStore(storageDirectory, new byte[]{2}));
+        try (RocksDbTableCacheStore cache = new RocksDbTableCacheStore(storageDirectory, new byte[]{1})) {
+            assertFalse(cache.isHydrated());
+        }
+    }
+
+    @Test
+    void failedGenerationOpenPreservesFilesAndReleasesLock() throws Exception {
+        try (RocksDbTableCacheStore cache = new RocksDbTableCacheStore(storageDirectory)) {
+            assertFalse(cache.isHydrated());
+        }
+        final Path incomplete = Files.createDirectory(storageDirectory.resolve("gen-1"));
+        final Path evidence = Files.writeString(incomplete.resolve("evidence"), "preserve me");
+        assertThrows(java.io.IOException.class, () -> new RocksDbTableCacheStore(storageDirectory));
+        assertEquals("preserve me", Files.readString(evidence));
+        Files.move(incomplete, storageDirectory.resolve("preserved"));
+        try (RocksDbTableCacheStore cache = new RocksDbTableCacheStore(storageDirectory)) {
+            assertFalse(cache.isHydrated());
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"HEAP", "EMBEDDED_KV"})
+    void invalidRefreshRetainsPreviousDataAndWatermark(final String mode) throws Exception {
+        enableService(mode, "ITEM_ID", "*");
+        final String watermark = service.watermarkForTest();
+        connectionService.execute("ALTER TABLE REFERENCE_DATA DROP PRIMARY KEY",
+                "INSERT INTO REFERENCE_DATA VALUES ('ITEM_ID001','duplicate','NA')");
+        assertThrows(TableCacheException.class, () -> service.refresh());
+        assertEquals(3L, service.size());
+        assertEquals(watermark, service.watermarkForTest());
+        assertEquals("b2b", service.lookup(Map.of("ITEM_ID", "ITEM_ID001")).orElseThrow().getAsString("LABEL"));
+    }
+
+    @Test
+    void disableWaitsForInFlightRefreshBeforeClosingStorage() throws Exception {
+        final CountDownLatch entered = new CountDownLatch(1);
+        final CountDownLatch release = new CountDownLatch(1);
+        connectionService = new H2ConnectionService("tablecache" + DB_COUNTER.get()) {
+            private int connections;
+
+            @Override
+            public Connection getConnection() {
+                if (++connections > 1) {
+                    entered.countDown();
+                    try {
+                        if (!release.await(10, TimeUnit.SECONDS)) {
+                            throw new IllegalStateException("Test did not release JDBC connection");
+                        }
+                    } catch (final InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        throw new IllegalStateException(e);
+                    }
+                }
+                return super.getConnection();
+            }
+        };
+        enableService("EMBEDDED_KV", "ITEM_ID", "*");
+        try (final ExecutorService executor = Executors.newFixedThreadPool(2)) {
+            final Future<RefreshResult> refresh = executor.submit(() -> service.refresh());
+            assertTrue(entered.await(5, TimeUnit.SECONDS));
+            final Future<?> disable = executor.submit(() -> service.onDisabled());
+            try {
+                assertThrows(TimeoutException.class, () -> disable.get(100, TimeUnit.MILLISECONDS));
+            } finally {
+                release.countDown();
+            }
+            refresh.get(5, TimeUnit.SECONDS);
+            disable.get(5, TimeUnit.SECONDS);
+            assertFalse(service.isHydrated());
+        } finally {
+            release.countDown();
+        }
+    }
+
+    @Test
+    void namedTomlConnectionSupportsQuotedNamesWithoutLeakingInvalidInput() throws Exception {
+        final Path config = storageDirectory.resolve("connections.toml");
+        Files.writeString(config, "[connections.\"test.name\"]\nuser = 'test-user'\nport = 123\n");
+        assertEquals(Map.of("user", "test-user"), SnowflakeConfigConnectionService.readConnection(config, "test.name"));
+        assertTrue(SnowflakeConfigConnectionService.readConnection(config, "absent").isEmpty());
+        Files.writeString(config, "[connections.test]\npassword = 'synthetic-invalid-input");
+        final IllegalArgumentException error = assertThrows(IllegalArgumentException.class,
+                () -> SnowflakeConfigConnectionService.readConnection(config, "test"));
+        assertFalse(error.getMessage().contains("synthetic-invalid-input"));
     }
 
     private void enableService(final String mode, final String keyColumns,
@@ -289,8 +501,8 @@ class TestSnowflakeTableCacheLookupService {
     // ---------- incremental refresh ----------
     //
     // The CHANGES clause is Snowflake-only, so H2 cannot exercise the incremental read itself; that
-    // path was verified directly against Snowflake and needs a live integration test. What IS
-    // testable here, and matters more for safety, is the store-level apply and the fallback: an
+    // path needs a live integration test for this artifact. Local coverage includes row application,
+    // store-level apply and the fallback: an
     // incremental attempt that fails must degrade to a correct full reload rather than to a wrong
     // cache.
 
@@ -455,6 +667,10 @@ class TestSnowflakeTableCacheLookupService {
             assertTrue(reopened.isHydrated());
             assertEquals(1L, reopened.size());
             assertEquals("v1", reopened.get("k1").orElseThrow().getAsString("V"));
+            reopened.applyChanges(recordSchema, Map.of(), Set.of(), null);
+        }
+        try (RocksDbTableCacheStore reopened = new RocksDbTableCacheStore(storageDirectory)) {
+            assertEquals(null, reopened.watermark());
         }
     }
 

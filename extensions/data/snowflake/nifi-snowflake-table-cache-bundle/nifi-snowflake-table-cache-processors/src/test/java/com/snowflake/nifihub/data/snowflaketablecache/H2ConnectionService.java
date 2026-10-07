@@ -26,10 +26,8 @@ import java.sql.Statement;
  * DBCPService backed by an in-memory H2 database.
  *
  * <p>Lets the whole component be exercised against real JDBC and real SQL with no Snowflake
- * connection. The v1 refresh query is plain {@code SELECT ... FROM <table>}, which H2 executes
- * identically to Snowflake — so these are genuine tests of the refresh path, not stubs. Once
- * Snowflake-specific SQL arrives (stream consumption, {@code METADATA$ACTION}, stage snapshots)
- * those paths move to integration tests against a live account.
+ * connection. H2 exercises the full-load JDBC path, not Snowflake semantics. The CHANGES query
+ * requires separate live integration tests against a dedicated test schema.
  */
 class H2ConnectionService extends AbstractControllerService implements DBCPService {
 

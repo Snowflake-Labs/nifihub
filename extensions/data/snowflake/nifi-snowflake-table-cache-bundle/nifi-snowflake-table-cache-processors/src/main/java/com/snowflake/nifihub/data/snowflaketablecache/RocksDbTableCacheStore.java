@@ -28,12 +28,18 @@ import org.rocksdb.WriteOptions;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
+import java.nio.channels.FileChannel;
+import java.nio.channels.FileLock;
+import java.nio.channels.OverlappingFileLockException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Comparator;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -42,15 +48,15 @@ import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.stream.Stream;
 
 /**
- * Embedded on-disk store backed by RocksDB. Durable across restart and far more compact than heap.
+ * Embedded on-disk store backed by RocksDB, reusable when its directory survives restart.
  *
  * <p>Footprint depends on keys, values, compression and RocksDB's native buffers.
  *
  * <h2>Why generation directories</h2>
  * A full load must <em>replace</em> contents, not merge — otherwise a row deleted upstream lingers
  * forever, which for an entitlement table means a revoked key keeps working. Doing that atomically
- * inside one database would need either a whole-keyspace delete range in the same write batch as 40M
- * puts (a batch far too large to hold in memory) or a non-atomic delete-then-load window during
+ * inside one database would need either a whole-keyspace delete range in the same write batch as all
+ * puts (potentially too large to hold in memory) or a non-atomic delete-then-load window during
  * which readers see an empty cache.
  *
  * <p>So each full load writes a fresh {@code gen-<n>} directory and commit swaps the open handle to
@@ -78,17 +84,48 @@ public class RocksDbTableCacheStore implements TableCacheStore {
 
     private final Path baseDirectory;
     private final ReentrantReadWriteLock lock = new ReentrantReadWriteLock();
+    private final FileChannel ownershipChannel;
+    private final FileLock ownershipLock;
 
     private Generation current;
 
     public RocksDbTableCacheStore(final Path baseDirectory) throws IOException {
+        this(baseDirectory, RowCodec.encode(List.of("table-cache-v1", "standalone")));
+    }
+
+    public RocksDbTableCacheStore(final Path baseDirectory, final byte[] identity) throws IOException {
         this.baseDirectory = baseDirectory;
         Files.createDirectories(baseDirectory);
-        adoptNewestGeneration();
+        ownershipChannel = FileChannel.open(baseDirectory.resolve("cache.lock"),
+                StandardOpenOption.CREATE, StandardOpenOption.WRITE);
+        try {
+            ownershipLock = ownershipChannel.tryLock();
+            if (ownershipLock == null) {
+                throw new IOException("Cache directory is already in use");
+            }
+            final Path identityPath = baseDirectory.resolve("identity");
+            if (Files.exists(identityPath)) {
+                if (!Arrays.equals(identity, Files.readAllBytes(identityPath))) {
+                    throw new IOException("Cache configuration differs; use a fresh storage directory");
+                }
+            } else {
+                if (!generationNumbers().isEmpty()) {
+                    throw new IOException("Cache has no format identity; use a fresh storage directory");
+                }
+                Files.write(identityPath, identity, StandardOpenOption.CREATE_NEW);
+            }
+            adoptNewestGeneration();
+        } catch (final OverlappingFileLockException e) {
+            ownershipChannel.close();
+            throw new IOException("Cache directory is already in use", e);
+        } catch (final IOException | RuntimeException e) {
+            ownershipChannel.close();
+            throw e;
+        }
     }
 
     /** Adopt the newest existing generation, if any, so a restart does not re-hydrate. */
-    private void adoptNewestGeneration() {
+    private void adoptNewestGeneration() throws IOException {
         final long newest = generationNumbers().stream().max(Comparator.naturalOrder()).orElse(-1L);
         if (newest < 0) {
             return;
@@ -96,9 +133,8 @@ public class RocksDbTableCacheStore implements TableCacheStore {
         try {
             current = Generation.open(generationPath(newest), newest);
         } catch (final RocksDBException e) {
-            // A half-written generation is not fatal: discard it and load from source instead.
-            deleteRecursively(generationPath(newest));
-            current = null;
+            // Lock errors, corruption and incomplete generations must never trigger data deletion.
+            throw new IOException("Cannot adopt cache generation; preserve it and use a fresh directory", e);
         }
     }
 
@@ -209,6 +245,14 @@ public class RocksDbTableCacheStore implements TableCacheStore {
                 current.close();
                 current = null;
             }
+            try {
+                if (ownershipLock.isValid()) {
+                    ownershipLock.release();
+                }
+                ownershipChannel.close();
+            } catch (final IOException e) {
+                throw new UncheckedIOException(e);
+            }
         } finally {
             lock.writeLock().unlock();
         }
@@ -228,6 +272,7 @@ public class RocksDbTableCacheStore implements TableCacheStore {
         private RocksDB db;
         private WriteOptions writeOptions;
         private WriteBatch batch;
+        private final Set<String> pendingKeys = new HashSet<>();
         private long staged;
         private boolean committed;
 
@@ -244,9 +289,7 @@ public class RocksDbTableCacheStore implements TableCacheStore {
                         .setWriteBufferSize(64L * 1024 * 1024)
                         .setMaxWriteBufferNumber(3);
                 db = RocksDB.open(options, path.toString());
-                // The write-ahead log buys nothing during a load: a generation is either committed or
-                // discarded, and an interrupted load is re-run from source rather than recovered.
-                writeOptions = new WriteOptions().setDisableWAL(true);
+                writeOptions = new WriteOptions();
                 batch = new WriteBatch();
             } catch (final IOException | RocksDBException e) {
                 closeQuietly();
@@ -259,11 +302,15 @@ public class RocksDbTableCacheStore implements TableCacheStore {
             if (committed) {
                 throw new IllegalStateException("Bulk load already committed");
             }
-            if (key == null) {
-                return; // a null lookup key is not addressable; skip rather than fail the load
+            if (key == null || value == null) {
+                throw new IllegalArgumentException("Source keys and records must be non-null");
             }
             try {
-                batch.put(key.getBytes(StandardCharsets.UTF_8), encode(fieldNames, value));
+                final byte[] encodedKey = dataKey(key);
+                if (!pendingKeys.add(key) || db.get(encodedKey) != null) {
+                    throw new IllegalArgumentException("Source keys must be unique");
+                }
+                batch.put(encodedKey, encode(fieldNames, value));
                 staged++;
                 if (staged % BATCH_ROWS == 0) {
                     flush();
@@ -277,6 +324,7 @@ public class RocksDbTableCacheStore implements TableCacheStore {
             db.write(writeOptions, batch);
             batch.close();
             batch = new WriteBatch();
+            pendingKeys.clear();
         }
 
         @Override
@@ -394,7 +442,7 @@ public class RocksDbTableCacheStore implements TableCacheStore {
                         RowCodec.decode(schemaBytes),
                         Long.parseLong(new String(countBytes, StandardCharsets.UTF_8)),
                         watermarkBytes == null ? null : new String(watermarkBytes, StandardCharsets.UTF_8));
-            } catch (final RocksDBException e) {
+            } catch (final RocksDBException | RuntimeException e) {
                 if (db != null) {
                     db.close();
                 }
@@ -411,14 +459,17 @@ public class RocksDbTableCacheStore implements TableCacheStore {
                  WriteOptions writeOptions = new WriteOptions()) {
 
                 for (final Map.Entry<String, Record> entry : upserts.entrySet()) {
-                    final byte[] key = entry.getKey().getBytes(StandardCharsets.UTF_8);
+                    final byte[] key = dataKey(entry.getKey());
                     if (db.get(key) == null) {
                         delta++;
                     }
                     batch.put(key, encode(fieldNames, entry.getValue()));
                 }
                 for (final String deleteKey : deletes) {
-                    final byte[] key = deleteKey.getBytes(StandardCharsets.UTF_8);
+                    if (upserts.containsKey(deleteKey)) {
+                        continue;
+                    }
+                    final byte[] key = dataKey(deleteKey);
                     if (db.get(key) != null) {
                         delta--;
                     }
@@ -429,6 +480,8 @@ public class RocksDbTableCacheStore implements TableCacheStore {
                 batch.put(COUNT_KEY, Long.toString(newCount).getBytes(StandardCharsets.UTF_8));
                 if (newWatermark != null) {
                     batch.put(WATERMARK_KEY, newWatermark.getBytes(StandardCharsets.UTF_8));
+                } else {
+                    batch.delete(WATERMARK_KEY);
                 }
 
                 db.write(writeOptions, batch);
@@ -441,7 +494,7 @@ public class RocksDbTableCacheStore implements TableCacheStore {
 
         Optional<Record> get(final String key) {
             try {
-                final byte[] encoded = db.get(key.getBytes(StandardCharsets.UTF_8));
+                final byte[] encoded = db.get(dataKey(key));
                 if (encoded == null) {
                     return Optional.empty();
                 }
@@ -460,6 +513,11 @@ public class RocksDbTableCacheStore implements TableCacheStore {
             db.close();
             options.close();
         }
+    }
+
+    private static byte[] dataKey(final String key) {
+        // Separate arbitrary user keys from the metadata namespace, including embedded NUL bytes.
+        return ("\u0001" + key).getBytes(StandardCharsets.UTF_8);
     }
 
     private static byte[] encode(final List<String> fieldNames, final Record value) {
