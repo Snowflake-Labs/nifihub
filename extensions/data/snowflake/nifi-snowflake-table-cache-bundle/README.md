@@ -116,9 +116,11 @@ The class and bundle coordinates differ from predecessor private builds. Use a
 new service and a fresh dedicated directory; old flow exports do not automatically
 resolve to this bundle. No on-disk migration or compatibility alias is provided.
 
-Before redistribution, complete source-rights and native-dependency license review.
-The RocksDB JNI artifact includes multiple native libraries but no embedded license
-files; a passing RAT check of this bundle is not third-party redistribution clearance.
+The NAR includes reviewed RocksDB/native dependency notices and full license texts.
+See [THIRD_PARTY.md](THIRD_PARTY.md) for the inventory, pinned sources and remaining
+source-rights/build-provenance approvals. Account-free `verify` checks the actual
+packaged texts and JNI checksum. Passing RAT and packaging tests is not legal or
+organizational redistribution approval.
 
 Keep the version at `0.1.0-SNAPSHOT` during contribution. A public PR is source
 disclosure; a release version merged to main can trigger automatic NAR publication.
