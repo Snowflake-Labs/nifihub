@@ -28,6 +28,7 @@ import java.sql.Connection;
 import java.sql.Statement;
 import java.util.Map;
 import java.util.Optional;
+import java.util.UUID;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
@@ -62,15 +63,17 @@ class SnowflakeTableCacheLookupServiceIT {
     private SnowflakeTableCacheLookupService service;
     private SnowflakeConfigConnectionService connectionService;
     private String table;
+    private boolean tableCreated;
 
     @BeforeEach
     void setUp() throws Exception {
-        table = "TABLE_CACHE_IT_" + System.currentTimeMillis();
+        table = "TABLE_CACHE_IT_" + UUID.randomUUID().toString().replace("-", "");
         connectionService = new SnowflakeConfigConnectionService();
 
-        execute("CREATE OR REPLACE TABLE " + table
-                        + " (ITEM_ID STRING, LABEL STRING, REGION STRING) CHANGE_TRACKING = TRUE",
-                "INSERT INTO " + table + " VALUES "
+        execute("CREATE TABLE " + table
+                        + " (ITEM_ID STRING, LABEL STRING, REGION STRING) CHANGE_TRACKING = TRUE");
+        tableCreated = true;
+        execute("INSERT INTO " + table + " VALUES "
                         + "('ITEM_ID001','b2b','NA'),('ITEM_ID002','b2b,advertiser','NA'),('ITEM_ID003','advertiser','EU')");
 
         runner = TestRunners.newTestRunner(NoOpProcessor.class);
@@ -79,7 +82,10 @@ class SnowflakeTableCacheLookupServiceIT {
 
     @AfterEach
     void tearDown() throws Exception {
-        if (table != null) {
+        if (service != null) {
+            service.onDisabled();
+        }
+        if (tableCreated) {
             execute("DROP TABLE IF EXISTS " + table);
         }
     }
@@ -141,6 +147,18 @@ class SnowflakeTableCacheLookupServiceIT {
         assertTrue(result.incremental());
         assertEquals(3L, service.size());
         assertTrue(lookup("ITEM_ID001").isPresent(), "unrelated keys must survive a delta");
+    }
+
+    /** Changing a lookup key must remove the old address as well as insert the new one. */
+    @ParameterizedTest
+    @ValueSource(strings = {"HEAP", "EMBEDDED_KV"})
+    void incrementalKeyChangeRemovesTheOldKey(final String mode) throws Exception {
+        enableService(mode);
+        execute("UPDATE " + table + " SET ITEM_ID = 'ITEM_ID900' WHERE ITEM_ID = 'ITEM_ID001'");
+        final RefreshResult result = refreshUntil(() -> lookup("ITEM_ID001").isEmpty()
+                && lookup("ITEM_ID900").isPresent(), "key change to apply");
+        assertTrue(result.incremental());
+        assertEquals(3L, service.size());
     }
 
     /** A refresh with nothing to do must be a no-op, not a silent full reload. */

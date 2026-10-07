@@ -113,7 +113,9 @@ public class HeapTableCacheStore implements TableCacheStore {
             if (staged == null) {
                 throw new IllegalStateException("Bulk load already completed");
             }
-            staged.put(key, value);
+            if (key == null || value == null || staged.putIfAbsent(key, value) != null) {
+                throw new IllegalArgumentException("Source keys must be unique and non-null");
+            }
         }
 
         @Override

@@ -32,6 +32,11 @@ For example, a reference row `ITEM_ID=example-1, LABEL=blue` enriches
 `{"item_id":"example-1"}` with a reference record containing string values.
 An unknown key is unmatched, not a lookup failure.
 
+Keys must be unique and non-null in the source, including every composite-key
+part. Full loads reject duplicates or nulls without publishing a partial cache.
+Keep uniqueness enforced upstream: an incremental delta cannot detect a duplicate
+against an unchanged source row. Composite keys use length-prefixed encoding.
+
 ## Refresh and failure semantics
 
 - Lookups fail before the first successful load, rather than reporting a miss.
@@ -40,6 +45,10 @@ An unknown key is unmatched, not a lookup failure.
   This is not fail-closed authorization or guaranteed real-time revocation.
 - Full reloads replace the cache. Incremental reads advance a node-local watermark
   alongside its data. SQL failures on the incremental path attempt a full reload.
+- Incremental reads retain both update halves, remove the old key when a key
+  changes, and let inserts win over deletes for the same key regardless of row
+  order. Reads have an explicit end watermark. Local tests cover row application;
+  the changed Snowflake query still requires live verification.
 - Initial-load failures are retried only when the refresh interval is positive.
 - Every value is a string, including numeric and semi-structured values. Convert
   downstream when native types are required.
@@ -55,6 +64,20 @@ Use a dedicated persistent directory, never a directory belonging to NiFi state,
 another service, or a different reference source. Do not assume a writable path
 is persistent. Backup/recovery, permissions and capacity belong to the runtime
 operator. Keep source credentials out of paths and logs.
+
+Embedded mode locks its directory and checks a versioned identity containing the
+connection-service ID, source expression, key/value columns and incremental mode.
+Mismatches fail enablement; existing generations are not deleted on open errors.
+This does not detect a changed account, role, database, or session configuration
+inside the same DBCP service, nor source replacement under the same table name.
+Use a fresh directory for those changes. Fully qualify source names and keep the
+connection context stable. This is a configuration guard, not a source identity
+or authorization guarantee.
+
+Disable waits for an in-flight refresh before closing native storage. Configure
+connection/query timeouts in the supplied DBCP service: a driver that ignores
+interrupts can delay disablement. Incremental changes are not synchronously fsynced
+on every refresh; abrupt crash/power-loss durability is not claimed.
 
 A predecessor build was exercised on one managed Medium Openflow node using
 `/nifi/configuration_resources`, including incremental refresh and adoption by a
@@ -92,6 +115,10 @@ Record its checksum and runtime version when qualifying it.
 The class and bundle coordinates differ from predecessor private builds. Use a
 new service and a fresh dedicated directory; old flow exports do not automatically
 resolve to this bundle. No on-disk migration or compatibility alias is provided.
+
+Before redistribution, complete source-rights and native-dependency license review.
+The RocksDB JNI artifact includes multiple native libraries but no embedded license
+files; a passing RAT check of this bundle is not third-party redistribution clearance.
 
 Keep the version at `0.1.0-SNAPSHOT` during contribution. A public PR is source
 disclosure; a release version merged to main can trigger automatic NAR publication.
