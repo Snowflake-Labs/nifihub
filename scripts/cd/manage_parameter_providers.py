@@ -160,27 +160,6 @@ def reconcile_parameter_providers(pp_specs, runtime_url, nifi_pat, nifi_auth=Non
     return all_context_names
 
 
-AUTO_PROVISIONED_PROVIDER_NAME = "Openflow - Snowflake Parameter Provider"
-
-
-def fetch_auto_provisioned_provider(sensitive_pattern=".*"):
-    """Fetch and apply the auto-provisioned Snowflake Parameter Provider.
-
-    This provider exists on every runtime by default. Fetching it discovers
-    Snowflake secrets and creates parameter contexts that are then added as
-    inherited to all flows.
-
-    Returns list of parameter context names created by the provider.
-    """
-    pp = find_parameter_provider(AUTO_PROVISIONED_PROVIDER_NAME)
-    if not pp:
-        print(f"[pp] Auto-provisioned provider '{AUTO_PROVISIONED_PROVIDER_NAME}' not found — skipping")
-        return []
-    print(f"[pp] Fetching auto-provisioned provider '{AUTO_PROVISIONED_PROVIDER_NAME}'...")
-    _fetch(pp)
-    return _apply(pp.id, sensitive_pattern) or []
-
-
 def delete_parameter_providers(pp_specs, runtime_url, nifi_pat, nifi_auth=None):
     configure_nifi(runtime_url, pat=nifi_pat, nifi_auth=nifi_auth)
     api = nipyapi.nifi.ParameterProvidersApi()

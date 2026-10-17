@@ -1,303 +1,39 @@
-# Running CD Locally and Against OSS Apache NiFi
+# Running CD Locally
 
-The NiFi Hub CD pipeline is implemented as a set of standalone Python scripts. You can run them directly from your machine — no GitHub Actions required. This is useful for:
-
-- Testing config changes before committing
-- Previewing what would change with `--dry-run`
-- Deploying against a local Apache NiFi instance for development
-- Force-reconciling a runtime after a manual change
-- Demonstrating that the same GitOps tooling works against any NiFi endpoint
-
----
-
-## Prerequisites
-
-- Python 3.12+
-- Dependencies installed: `pip install -r scripts/cd/requirements-cd.txt`
-- Snowflake CLI installed (`snow`) — required for SOM or mixed configs; URL-managed-only configs can run without it
-- A running NiFi instance (Snowflake Openflow or local Apache NiFi)
-
----
-
-## Quick Start — Snowflake Openflow
-
-Set environment variables and run:
+Point a configuration at an existing NiFi instance you can reach. Install Python
+dependencies and provide NiFi credentials:
 
 ```bash
-export SNOWFLAKE_ACCOUNT_URL="https://myorg-myaccount.snowflakecomputing.com"
-export SNOWFLAKE_USER="myuser"
-export SNOWFLAKE_PAT="pat-token"
-export SNOWFLAKE_ROLE="OPENFLOW_ADMIN"
-export NIFI_RUNTIME_PAT="nifi-pat-token"
-export NIFIHUB_REGISTRY_PAT="ghp_..."
-
-# Preview what would change (no apply)
-python scripts/run-cd.py environments/demo/config.yaml --dry-run
-
-# Apply changes
-python scripts/run-cd.py environments/demo/config.yaml
-```
-
-The script runs the same 4-step pipeline used by GitHub Actions:
-1. **Describe** — queries Snowflake SQL and NiFi REST API to build the live state
-2. **Diff** — compares live state against the desired YAML config
-3. **Translate** — converts diff output to the orchestrate.py change format
-4. **Apply** — executes creates, modifications, and deletes
-
-With `--dry-run`, the pipeline stops after step 3 and prints the change plan JSON without applying anything.
-
-### Environment Variable Reference
-
-| Variable | Required | Description |
-|---|---|---|
-| `SNOWFLAKE_ACCOUNT_URL` | Yes | Snowflake account URL (e.g. `https://myorg.snowflakecomputing.com`) |
-| `SNOWFLAKE_USER` | Yes | Snowflake username |
-| `SNOWFLAKE_PAT` | Yes | Snowflake Programmatic Access Token |
-| `SNOWFLAKE_ROLE` | Yes | Role for SQL operations (e.g. `OPENFLOW_ADMIN`) |
-| `NIFI_RUNTIME_PAT` | Yes* | NiFi Bearer token (*not required when `nifi_auth` is set in config.yaml) |
-| `NIFIHUB_REGISTRY_PAT` | Yes | GitHub PAT for Flow Registry Clients (repo read access) |
-| `GH_SECRETS_JSON` | No | JSON object of secrets for `${{ secrets.NAME }}` resolution (default `{}`) |
-| `GH_VARS_JSON` | No | JSON object of variables for `${{ vars.NAME }}` resolution (default `{}`) |
-
-> **Note:** `SNOWFLAKE_*` variables are required only when at least one configured runtime is managed through Snowflake (SOM or mixed configs). URL-managed-only configs skip Snowflake discovery entirely.
-
----
-
-## Manual Trigger via GitHub Actions
-
-If you want to run the CD pipeline on GitHub's infrastructure without pushing a config change, use the `workflow_dispatch` trigger:
-
-### From the GitHub UI
-
-1. Go to your repository → **Actions** → **Environment CD**
-2. Click **Run workflow**
-3. Enter the environment name (e.g. `demo`) and click **Run workflow**
-
-### From the GitHub CLI
-
-```bash
-# Deploy a specific environment
-gh workflow run environment-cd.yml --field environment_name=demo
-
-# List recent CD runs to check status
-gh run list --workflow=environment-cd.yml
-```
-
-This is equivalent to merging a change to `environments/demo/config.yaml` — the pipeline runs describe → diff → apply. Useful for:
-- Force-reconciling after a manual change on the Snowflake side
-- Triggering after a script fix (that doesn't affect any config YAML)
-- Testing the pipeline without a dummy commit
-
----
-
-## Running Against a Local Apache NiFi Instance
-
-This demonstrates that NiFi Hub's GitOps tooling is portable — the same `config.yaml` format and Python scripts work against any NiFi endpoint, not just Snowflake Openflow.
-
-### What Changes for Local NiFi
-
-When a runtime has a `url:` field, the CD pipeline:
-- **Skips** all Snowflake SQL operations (no `CREATE/ALTER OPENFLOW RUNTIME`, EAI, network rules)
-- **Still runs** NiFi API reconciliation (flow registries, flows, parameters, controller-level and root PG controller services, and service bindings)
-
-Authentication uses `nifi_auth` instead of `NIFI_RUNTIME_PAT`. See [Non-SOM Runtimes](Introduction-and-Concepts--Non-SOM-Runtimes) for the full model.
-
-### Step 1 — Start a Local NiFi Instance
-
-The simplest way is Docker. Apache NiFi 2.x includes a built-in single-user login:
-
-```bash
-docker run --name local-nifi \
-  -p 8443:8443 \
-  -e SINGLE_USER_CREDENTIALS_USERNAME=admin \
-  -e SINGLE_USER_CREDENTIALS_PASSWORD=adminpassword \
-  apache/nifi:latest
-```
-
-Wait for NiFi to start (check `docker logs -f local-nifi` until you see `Started Application`). The UI is at `https://localhost:8443/nifi`.
-
-> **Note on SSL:** The Docker image uses a self-signed certificate. Set `verify_ssl: false` in the `nifi_auth` config to skip SSL verification for local development.
-
-### Step 2 — Create a Local Environment Config
-
-Create `environments/local/config.yaml`:
-
-```yaml
-# yaml-language-server: $schema=../schema.json
-account:
-  name: local
-  github_environment: local
-
-deployments:
-  - name: LOCAL_DEPLOYMENT
-    deployment_type: SNOWFLAKE
-    runtimes:
-      - name: LOCAL_NIFI
-        database: ""
-        schema: ""
-        url: "https://localhost:8443"
-        nifi_auth:
-          type: username_password
-          username: ${{ vars.NIFI_USERNAME }}
-          password: ${{ secrets.NIFI_PASSWORD }}
-          verify_ssl: false   # local self-signed cert — remove in production
-        flow_registries:
-          - name: nifihub
-            type: org.apache.nifi.github.GitHubFlowRegistryClient
-            properties:
-              Repository Owner: Snowflake-Labs
-              Repository Name: nifihub
-              Authentication Type: PERSONAL_ACCESS_TOKEN
-              Personal Access Token: ${{ secrets.NIFIHUB_REGISTRY_PAT }}
-              Default Branch: main
-              Repository Path: flows
-        flows:
-          - name: "Hello World"
-            bucket: examples
-            flow: hello-world
-            version: latest
-            start: true
-```
-
-### Step 3 — Set Environment Variables and Run
-
-```bash
-# Credentials for the local NiFi (resolved via GH_SECRETS_JSON / GH_VARS_JSON)
-export GH_SECRETS_JSON='{"NIFI_PASSWORD":"adminpassword","NIFIHUB_REGISTRY_PAT":"ghp_..."}'
-export GH_VARS_JSON='{"NIFI_USERNAME":"admin"}'
-
-# Run (dry run first to preview)
+python -m pip install -r scripts/cd/requirements-cd.txt
+export NIFI_USERNAME=admin
+export NIFI_PASSWORD='your-nifi-password'
 python scripts/run-cd.py environments/local/config.yaml --dry-run
-
-# Apply
 python scripts/run-cd.py environments/local/config.yaml
 ```
 
-### What Happens
+Edit the URL in `environments/local/config.yaml` to match your instance. The
+example flow requires the example NAR to be installed first. For a quick check
+without installing a custom NAR, use a configuration containing only a
+`root_parameter_context` with a non-sensitive test parameter.
 
-1. **Describe** — no Snowflake SQL for the URL-managed runtime; NiFi state is read via REST API
-2. **Diff** — compares live NiFi state (flow registries, flows) against desired config
-3. **Translate** — URL-managed runtimes are always included in the apply list
-4. **Apply** — creates the `nifihub` registry client in NiFi, reconciles parameter providers, the root parameter context, and root controller services, deploys the flow, reconciles any declared `service_bindings`, and then applies the final start/stop state
+`NIFI_TOKEN` can supply an existing bearer token instead of username/password.
+`NIFI_VERIFY_SSL` defaults to `true`, accepts a private CA bundle path, or can be
+`false` for local self-signed development certificates. Authentication requires
+HTTPS. With unsecured local HTTP, leave credentials unset.
 
-If your local config uses `service_bindings`, declare the referenced controller services under `root_pg_controller_services` and set `start` explicitly on the flow. A binding change will stop the flow, update the target processor or controller service, validate it, and then let the final flow start logic restore the declared state. If NiFi Hub cannot read the live binding state safely, it fails closed and refuses to plan or apply binding changes for that runtime.
+Per-instance `nifi_auth` blocks support username/password with `${{ vars.NAME }}`
+and `${{ secrets.NAME }}` references. Locally those references resolve from
+`GH_VARS_JSON` and `GH_SECRETS_JSON`. Missing references fail before writes.
 
-If a root controller service needs parameters (a provided secret, a shared value, or a file), declare them under `root_parameter_context` and reference them normally:
+The dry run reads NiFi resources and prints the translated plan. The apply run
+repeats discovery and reconciliation; it never provisions or destroys servers.
+Review deletions: explicitly declared resource lists manage their whole scope,
+while omitted sections leave it untouched.
 
-```yaml
-root_parameter_context:
-  provided_parameter_contexts: ".*SECRETS"
-  parameters:
-    Shared Query Timeout: "30 secs"
-  assets:
-    - name: "mssql-jdbc-13.4.0.jre11.jar"
-      url: "https://example.invalid/mssql-jdbc-13.4.0.jre11.jar"
-      parameter: "Database Driver"
-root_pg_controller_services:
-  - name: SQL Server Pool
-    type: org.apache.nifi.dbcp.DBCPConnectionPool
-    properties:
-      Database Driver Locations: "#{Database Driver}"
-      Validation Query Timeout: "#{Shared Query Timeout}"
-```
+For flow integration tests, set `NIFI_URL` and credentials, run
+`scripts/ci/deploy_ci_flow.py` with the flow and its test YAML, and capture its
+`--output-file` process group ID. Set `DEPLOYED_PG_ID` to that ID when running
+pytest. Clean up that group with `scripts/cleanup-flow.py --pg-id <id>`; the URL
+and authentication are read from the same environment variables.
 
-NiFi Hub uses the root process group's existing parameter context, or creates and attaches `Root Parameter Context` when none exists. Provider contexts matching the regex are inherited additively, direct parameters are created or updated as non-sensitive values, and assets are uploaded and bound. To update asset content, change the asset filename; removing a declaration leaves the inherited contexts, parameters, assets, and bindings intact.
-
-After the run, open `https://localhost:8443/nifi` and you should see the Hello World flow running on the canvas.
-
-### Full End-to-End Example: Postgres CDC Demo
-
-For a more realistic demonstration including a data generator flow:
-
-```yaml
-runtimes:
-  - name: LOCAL_NIFI
-    database: ""
-    schema: ""
-    url: "https://localhost:8443"
-    nifi_auth:
-      type: username_password
-      username: ${{ vars.NIFI_USERNAME }}
-      password: ${{ secrets.NIFI_PASSWORD }}
-      verify_ssl: false
-    flow_registries:
-      - name: nifihub
-        type: org.apache.nifi.github.GitHubFlowRegistryClient
-        properties:
-          Repository Owner: Snowflake-Labs
-          Repository Name: nifihub
-          Authentication Type: PERSONAL_ACCESS_TOKEN
-          Personal Access Token: ${{ secrets.NIFIHUB_REGISTRY_PAT }}
-          Default Branch: main
-          Repository Path: flows
-    flows:
-      - name: "CDC Postgres Demo - Data Generator"
-        bucket: data-generator
-        flow: postgres-cdc-demo
-        version: latest
-        start: false
-        assets:
-          - name: "postgresql-42.7.10.jar"
-            url: "https://jdbc.postgresql.org/download/postgresql-42.7.10.jar"
-            parameter: "Database Driver"
-        parameters:
-          Database Connection URL: "jdbc:postgresql://your-postgres-host:5432/mydb?sslmode=require"
-          Database Name: "mydb"
-          Database User: "myuser"
-          Database Password: "mypassword"
-          Schema Name: "demo"
-          Publication Name: "demo_publication"
-```
-
----
-
-## How nifi_auth Works
-
-When `nifi_auth` with `type: username_password` is configured, the pipeline calls `nipyapi.security.service_login()` instead of setting a Bearer token. This:
-
-1. POSTs to `/nifi-api/access/token` with the username and password (form-encoded)
-2. Receives a JWT token from NiFi
-3. Caches the JWT in nipyapi's config for all subsequent API calls
-
-This is the standard authentication flow for OSS Apache NiFi instances that use username/password login (the `SingleUserLoginIdentityProvider` in NiFi 2.x).
-
-The credentials are **never hardcoded** in `config.yaml`. They are referenced via `${{ secrets.NAME }}` and `${{ vars.NAME }}` syntax, which is resolved from `GH_SECRETS_JSON` / `GH_VARS_JSON` environment variables at runtime.
-
----
-
-## Troubleshooting
-
-**SSL verification (`verify_ssl`):**
-
-| Value | Behavior |
-|---|---|
-| `true` (default) | Verify certificate against the system CA store |
-| `false` | Disable SSL verification — use only for local dev with self-signed certs |
-| `"/path/to/ca-bundle.crt"` | Verify against a custom CA certificate bundle (e.g. internal PKI) |
-
-Example with a custom CA bundle:
-```yaml
-nifi_auth:
-  type: username_password
-  username: ${{ vars.NIFI_USERNAME }}
-  password: ${{ secrets.NIFI_PASSWORD }}
-  verify_ssl: "/etc/ssl/certs/my-company-ca.crt"
-```
-
-**SSL certificate error (`CERTIFICATE_VERIFY_FAILED`)**
-Add `verify_ssl: false` to the `nifi_auth` block. Only use this for local development with self-signed certificates. For production NiFi instances with a custom CA, use `verify_ssl: "/path/to/ca-bundle.crt"` instead.
-
-**Connection refused**
-Verify NiFi is running: `docker logs local-nifi | tail -20`. Check that the port matches the `url` field.
-
-**Authentication failed (401)**
-Check that `NIFI_USERNAME`/`NIFI_PASSWORD` match the credentials in `SINGLE_USER_CREDENTIALS_USERNAME`/`SINGLE_USER_CREDENTIALS_PASSWORD` used when starting the container.
-
-**`SNOWFLAKE_ACCOUNT_URL not set` or Snowflake connection errors**
-This only applies when the config includes at least one SOM-managed runtime. URL-managed-only configs do not require any `SNOWFLAKE_*` variables.
-
-**`NIFI_RUNTIME_PAT` not set warning**
-This is expected when using `nifi_auth` in `config.yaml`. The `NIFI_RUNTIME_PAT` env var is not required when username/password auth is configured.
-
-**Flow registry client type not found**
-Ensure NiFi has the GitHub Flow Registry Client extension installed. This is included in standard NiFi distributions as of NiFi 2.x. Check NiFi's extension bundles if the registry type is unavailable.
+See [the full configuration reference](../environments/README.md).

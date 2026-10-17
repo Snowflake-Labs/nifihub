@@ -4,7 +4,6 @@
 
 import types
 
-from diff_environments import diff_environments
 from diff_live import _nifi_diff_has_changes, diff_nifi_root_parameter_context, diff_runtime
 from format_change_plan import format_change_plan, format_nifi_section
 from translate_live_diff import translate
@@ -345,64 +344,56 @@ def test_translate_and_render_include_root_parameter_context_changes_without_sec
             },
         },
     }
-    live_diff = {
-        "account": {"name": "example"},
-        "deployments": {
-            "unchanged": [{
-                "name": "UNCHANGED_DEPLOYMENT",
-                "status": "ACTIVE",
-                "runtimes": {"unchanged": [{
-                    "name": "UNCHANGED_RUNTIME",
-                    "status": "ACTIVE",
-                    "nifi": {
-                        "controller_services": {"created": [], "modified": [], "deleted": [], "unchanged": []},
-                        "root_pg_controller_services": {"created": [], "modified": [], "deleted": [], "unchanged": []},
-                        "parameter_providers": {"created": [], "modified": [], "deleted": [], "unchanged": []},
-                        "flow_registries": {"created": [], "modified": [], "deleted": [], "unchanged": []},
-                        "flows": {"created": [], "modified": [], "deleted": [], "unchanged": []},
-                        "parameters": {},
-                        "service_bindings": {"created": [], "modified": [], "deleted": [], "unchanged": [], "health": [], "blocked": []},
-                        "root_parameter_context": {
-                            "created": [],
-                            "modified": [],
-                            "deleted": [],
-                            "unchanged": [{"name": "stable-driver.jar", "parameter": "Stable Driver"}],
-                            "health": [],
-                            "blocked": [],
-                            "inheritance": {"missing": [], "unchanged": ["Provider POSTGRES"], "unmatched_pattern": False},
-                            "parameters": {"changes": {}, "unchanged": ["Shared Query Timeout"]},
-                        },
-                    },
-                }], "to_create": [], "to_modify": [], "to_delete": [], "url_managed": []},
-            }],
-            "to_create": [],
-            "to_delete": [],
-            "to_modify": [{
-                "name": "MY_DEPLOYMENT",
-                "dep_changes": {},
-                "runtimes": {
-                    "unchanged": [],
-                    "to_create": [],
-                    "to_delete": [],
-                    "url_managed": [],
-                    "to_modify": [{
-                        "name": "MY_RUNTIME",
-                        "live": {"status": "ACTIVE"},
-                        "desired": {"name": "MY_RUNTIME", "root_parameter_context": {"assets": [{"name": "driver.jar", "parameter": "Database Driver"}] }},
-                        "diff": {
-                            "changed_fields": {},
-                            "network_rule_changes": {"created": [], "modified": [], "deleted": []},
-                            "connector_changes": {"created": [], "modified": [], "deleted": []},
-                            "nifi": nifi_diff,
-                        },
-                    }],
-                },
-            }],
-        },
-    }
+    live_diff = {'name': 'example',
+     'runtimes': {'unchanged': [{'name': 'UNCHANGED_RUNTIME',
+                                 'diff': {'nifi': {'controller_services': {'created': [],
+                                                                           'modified': [],
+                                                                           'deleted': [],
+                                                                           'unchanged': []},
+                                                   'root_pg_controller_services': {'created': [],
+                                                                                   'modified': [],
+                                                                                   'deleted': [],
+                                                                                   'unchanged': []},
+                                                   'parameter_providers': {'created': [],
+                                                                           'modified': [],
+                                                                           'deleted': [],
+                                                                           'unchanged': []},
+                                                   'flow_registries': {'created': [],
+                                                                       'modified': [],
+                                                                       'deleted': [],
+                                                                       'unchanged': []},
+                                                   'flows': {'created': [], 'modified': [], 'deleted': [], 'unchanged': []},
+                                                   'parameters': {},
+                                                   'service_bindings': {'created': [],
+                                                                        'modified': [],
+                                                                        'deleted': [],
+                                                                        'unchanged': [],
+                                                                        'health': [],
+                                                                        'blocked': []},
+                                                   'root_parameter_context': {'created': [],
+                                                                              'modified': [],
+                                                                              'deleted': [],
+                                                                              'unchanged': [{'name': 'stable-driver.jar',
+                                                                                             'parameter': 'Stable Driver'}],
+                                                                              'health': [],
+                                                                              'blocked': [],
+                                                                              'inheritance': {'missing': [],
+                                                                                              'unchanged': ['Provider '
+                                                                                                            'POSTGRES'],
+                                                                                              'unmatched_pattern': False},
+                                                                              'parameters': {'changes': {},
+                                                                                             'unchanged': ['Shared Query '
+                                                                                                           'Timeout']}}}},
+                                 'desired': {'name': 'UNCHANGED_RUNTIME'}}],
+                  'to_modify': [{'name': 'MY_RUNTIME',
+                                 'live': {'status': 'ACTIVE'},
+                                 'desired': {'name': 'MY_RUNTIME',
+                                             'root_parameter_context': {'assets': [{'name': 'driver.jar',
+                                                                                    'parameter': 'Database Driver'}]}},
+                                 'diff': {'nifi': nifi_diff}}]}}
 
     translated = translate(live_diff)
-    runtime_mod = translated["deployments"]["modified"][0]["runtime_changes"]["modified"][0]
+    runtime_mod = translated["runtimes"]["modified"][0]
     assert runtime_mod["root_parameter_context_changes"]["created"][0]["status"] == "missing_asset"
     assert runtime_mod["root_parameter_context_changes"]["inheritance"]["missing"] == ["Provider POSTGRES"]
     assert runtime_mod["root_parameter_context_changes"]["parameters"]["changes"]["POSTGRES_PWD"]["desired"] == "${{ secrets.POSTGRES_PWD }}"
@@ -422,184 +413,27 @@ def test_translate_and_render_include_root_parameter_context_changes_without_sec
     assert "1 inherited context(s)" in plan
 
 
-def test_diff_environments_emits_root_parameter_context_changes(tmp_path):
-    old_path = tmp_path / "old.yaml"
-    new_path = tmp_path / "new.yaml"
-    old_path.write_text(
-        """
-account:
-  name: local
-deployments:
-  - name: DEPLOYMENT
-    runtimes:
-      - name: RUNTIME
-        root_parameter_context:
-          provided_parameter_contexts: ".*POSTGRES"
-          parameters:
-            Shared Query Timeout: 15 sec
-          assets:
-            - name: stable-driver.jar
-              url: https://example.invalid/stable-driver.jar
-              parameter: Stable Driver
-""",
-        encoding="utf-8",
-    )
-    new_path.write_text(
-        """
-account:
-  name: local
-deployments:
-  - name: DEPLOYMENT
-    runtimes:
-      - name: RUNTIME
-        root_parameter_context:
-          provided_parameter_contexts: "Base|.*POSTGRES"
-          parameters:
-            Shared Query Timeout: 30 sec
-          assets:
-            - name: stable-driver.jar
-              url: https://example.invalid/stable-driver.jar
-              parameter: Stable Driver
-            - name: new-driver.jar
-              url: https://example.invalid/new-driver.jar
-              parameter: New Driver
-""",
-        encoding="utf-8",
-    )
-
-    changes = diff_environments(str(old_path), str(new_path))
-    runtime_mod = changes["deployments"]["modified"][0]["runtime_changes"]["modified"][0]
-
-    assert "root_parameter_context" not in runtime_mod["changed_fields"]
-    assert runtime_mod["root_parameter_context_changes"] == {
-        "changed": True,
-        "old": {
-            "provided_parameter_contexts": ".*POSTGRES",
-            "parameters": {"Shared Query Timeout": "15 sec"},
-            "assets": [{"name": "stable-driver.jar", "url": "https://example.invalid/stable-driver.jar", "parameter": "Stable Driver"}],
-        },
-        "new": {
-            "provided_parameter_contexts": "Base|.*POSTGRES",
-            "parameters": {"Shared Query Timeout": "30 sec"},
-            "assets": [
-                {"name": "stable-driver.jar", "url": "https://example.invalid/stable-driver.jar", "parameter": "Stable Driver"},
-                {"name": "new-driver.jar", "url": "https://example.invalid/new-driver.jar", "parameter": "New Driver"},
-            ],
-        },
-    }
 
 
-def test_diff_environments_emits_unchanged_root_parameter_context_as_dict(tmp_path):
-    old_path = tmp_path / "old.yaml"
-    new_path = tmp_path / "new.yaml"
-    config = """
-account:
-  name: local
-deployments:
-  - name: DEPLOYMENT
-    runtimes:
-      - name: RUNTIME
-        comment: old
-        root_parameter_context:
-          parameters:
-            Shared Query Timeout: 15 sec
-"""
-    old_path.write_text(config, encoding="utf-8")
-    new_path.write_text(config.replace("comment: old", "comment: new"), encoding="utf-8")
-
-    changes = diff_environments(str(old_path), str(new_path))
-    runtime_mod = changes["deployments"]["modified"][0]["runtime_changes"]["modified"][0]
-
-    assert runtime_mod["root_parameter_context_changes"] == {
-        "changed": False,
-        "old": {"parameters": {"Shared Query Timeout": "15 sec"}},
-        "new": {"parameters": {"Shared Query Timeout": "15 sec"}},
-    }
 
 
-def test_describe_live_state_passes_desired_root_parameter_context_in_all_paths(tmp_path, import_cd_module, monkeypatch):
-    config_path = tmp_path / "config.yaml"
-    config_path.write_text(
-        """
-account:
-  name: local
-deployments:
-  - name: LOCAL_DEPLOYMENT
-    deployment_type: SNOWFLAKE
-    runtimes:
-      - name: LOCAL_NIFI
-        database: ""
-        schema: ""
-        url: https://localhost:8443
-        flows: []
-        root_parameter_context:
-          parameters:
-            Url Driver: present
-  - name: SOM_DEPLOYMENT
-    deployment_type: SNOWFLAKE
-    runtimes:
-      - name: SOM_RUNTIME
-        database: DB
-        schema: SCHEMA
-        flows: []
-        root_parameter_context:
-          assets:
-            - name: som-driver.jar
-              url: https://example.invalid/som-driver.jar
-              parameter: Som Driver
-""",
-        encoding="utf-8",
-    )
-    describe_calls = []
-    stubs = {
-        "describe_nifi_state": types.SimpleNamespace(
-            describe_nifi_state=lambda *args, **kwargs: describe_calls.append(kwargs.get("desired_root_parameter_context")) or {"flows": [], "flow_registries": [], "root_parameter_context": {"entries": []}}
-        ),
-        "manage_connectors": types.SimpleNamespace(get_connector_config=lambda *args, **kwargs: {}),
-        "manage_flows": types.SimpleNamespace(configure_nifi=lambda *args, **kwargs: None),
-    }
-    module = import_cd_module("describe_live_state", stubs)
-    module.load_config = lambda _path: {
-        "account": {"name": "local"},
-        "deployments": [
-            {
-                "name": "LOCAL_DEPLOYMENT",
-                "deployment_type": "SNOWFLAKE",
-                "runtimes": [{
-                    "name": "LOCAL_NIFI",
-                    "database": "",
-                    "schema": "",
-                    "url": "https://localhost:8443",
-                    "flows": [],
-                    "root_parameter_context": {"parameters": {"Url Driver": "present"}},
-                }],
-            },
-            {
-                "name": "SOM_DEPLOYMENT",
-                "deployment_type": "SNOWFLAKE",
-                "runtimes": [{
-                    "name": "SOM_RUNTIME",
-                    "database": "DB",
-                    "schema": "SCHEMA",
-                    "flows": [],
-                    "root_parameter_context": {
-                        "assets": [{"name": "som-driver.jar", "url": "https://example.invalid/som-driver.jar", "parameter": "Som Driver"}],
-                    },
-                }],
-            },
-        ],
-    }
-    module.list_deployments = lambda conn: [{"name": "SOM_DEPLOYMENT", "status": "ACTIVE", "type": "SNOWFLAKE"}]
-    module.list_runtimes = lambda conn: [{"name": "SOM_RUNTIME", "deployment": "SOM_DEPLOYMENT", "database_name": "DB", "schema_name": "SCHEMA", "status": "ACTIVE"}]
-    module.list_connectors = lambda conn: []
-    module.describe_runtime = lambda *args, **kwargs: {"server_url": "https://runtime.example.invalid/nifi"}
-    module.get_network_rules_for_runtime = lambda *args, **kwargs: []
-    module._resolve_nifi_auth = lambda rt_cfg: None
-    monkeypatch.setenv("NIFI_RUNTIME_PAT", "token")
 
-    module.build_live_state(str(config_path), conn={"account_url": "x", "pat": "y", "user": "z", "role": "r"})
 
-    assert describe_calls == [
-        {"parameters": {"Url Driver": "present"}},
-        {"assets": [{"name": "som-driver.jar", "url": "https://example.invalid/som-driver.jar", "parameter": "Som Driver"}]},
+def test_describe_live_state_passes_desired_root_parameter_context_to_each_instance(tmp_path, import_cd_module, monkeypatch):
+    import yaml
+    contexts = [
+        {"parameters": {"Shared Query Timeout": "30 sec"}},
+        {"assets": [{"name": "driver.jar", "url": "https://example.invalid/driver.jar", "parameter": "Driver"}]},
     ]
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml.safe_dump({"runtimes": [
+        {"name": f"nifi-{i}", "url": f"https://nifi-{i}.example.test:8443", "root_parameter_context": context}
+        for i, context in enumerate(contexts)
+    ]}))
+    describe_calls = []
+    module = import_cd_module("describe_live_state", {
+        "describe_nifi_state": types.SimpleNamespace(describe_nifi_state=lambda *args, **kwargs:
+            describe_calls.append(kwargs["desired_root_parameter_context"]) or {"flows": []}),
+    })
+    module.build_live_state(str(config_path))
+    assert describe_calls == contexts

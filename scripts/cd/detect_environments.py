@@ -16,10 +16,12 @@
 #!/usr/bin/env python3
 """Detect changed config environments and output GitHub Actions matrix.
 
-Emits one item per changed config environment, keyed by the account's
+Emits one item per changed config environment, keyed by the configuration's
 github_environment field.
 """
 import json
+import glob
+import re
 import os
 import subprocess
 import sys
@@ -93,14 +95,22 @@ def _diff_base():
 
 
 def main(output_path=None):
-    base = _diff_base()
-    print(f"[detect] Diffing {base} against HEAD")
-    result = subprocess.run(
-        ["git", "diff", "--name-only", base, "HEAD", "--", "environments/*/config.yaml"],
-        capture_output=True,
-        text=True,
-    )
-    changed = [f.strip() for f in result.stdout.strip().split("\n") if f.strip()]
+    requested = os.environ.get("INPUT_ENVIRONMENT", "")
+    if requested:
+        if not re.fullmatch(r"[A-Za-z0-9_-]+", requested):
+            raise ValueError("Invalid environment directory name")
+        filepath = f"environments/{requested}/config.yaml"
+        if not os.path.isfile(filepath):
+            raise ValueError("Requested environment configuration does not exist")
+        changed = [filepath]
+    elif os.environ.get("MANUAL_RUN") == "true":
+        changed = sorted(glob.glob("environments/*/config.yaml"))
+    else:
+        base = os.environ.get("DIFF_BASE") or _diff_base()
+        result = subprocess.run(["git", "diff", "--name-only", base, "HEAD"], capture_output=True, text=True, check=True)
+        paths = result.stdout.splitlines()
+        shared_changed = any(p == "environments/schema.json" or p.startswith("scripts/cd/") or p == "scripts/run-cd.py" for p in paths)
+        changed = sorted(glob.glob("environments/*/config.yaml")) if shared_changed else [p for p in paths if re.fullmatch(r"environments/[^/]+/config\.yaml", p)]
 
     items = []
     seen = set()
@@ -114,10 +124,12 @@ def main(output_path=None):
         try:
             with open(filepath) as f:
                 cfg = yaml.safe_load(f) or {}
-        except Exception:
+        except FileNotFoundError:
+            if requested or os.environ.get("MANUAL_RUN") == "true":
+                raise
             continue
 
-        github_env = cfg.get("account", {}).get("github_environment", config_env)
+        github_env = cfg.get("github_environment", config_env)
 
         if config_env not in seen:
             seen.add(config_env)

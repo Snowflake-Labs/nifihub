@@ -3,7 +3,7 @@
 **Bucket:** `data-generator`
 **File:** [`flows/data-generator/postgres-cdc-demo.json`](../flows/data-generator/postgres-cdc-demo.json)
 
-Simulates random data generation with INSERTs, UPDATEs, and DELETEs across three tables (`customers`, `orders`, `order_items`). Designed to be used in combination with the CDC PostgreSQL Connector to demonstrate change data capture pipelines.
+Simulates random data generation with INSERTs, UPDATEs, and DELETEs across three tables (`customers`, `orders`, `order_items`). Use it with a PostgreSQL CDC consumer to demonstrate change data capture pipelines.
 
 ---
 
@@ -15,13 +15,17 @@ This flow provides a continuous stream of realistic database mutations against a
 
 | Component | Type | Description |
 |-----------|------|-------------|
-| ExecuteScript (init) | Processor | Creates schema, tables, and publication on first run |
+| PutSQL (Initialize Database) | Processor | Creates schema, tables, and publication on first run |
 | GenerateFlowFile | Processor | Triggers periodic data generation |
-| ExecuteSQL | Processor | Runs randomised INSERT/UPDATE/DELETE statements |
+| ExecuteScript | Processor | Generates random records and operation attributes |
+| PutDatabaseRecord | Processor | Applies inserts, upserts, and deletes |
 
 ## Required NARs
 
-- `org.apache.nifi:nifi-standard-nar:2.8.0` — included with standard NiFi installations
+- `org.apache.nifi:nifi-standard-nar:2.12.0` — included with standard NiFi installations
+- `org.apache.nifi:nifi-scripting-nar:2.12.0` — Groovy data generation
+- `org.apache.nifi:nifi-dbcp-service-nar:2.12.0` — JDBC connection pool
+- `org.apache.nifi:nifi-record-serialization-services-nar:2.12.0` — JSON record reader
 - PostgreSQL JDBC driver (`postgresql-42.7.10.jar`) — uploaded as a Parameter Context Asset
 
 ## Parameters
@@ -39,7 +43,7 @@ This flow provides a continuous stream of realistic database mutations against a
 
 Deploy via the Environment CD pipeline using an `environments/<env>/config.yaml` entry, or test in CI using the test YAML at `flows/data-generator/tests/test_postgres_cdc_demo.yaml`.
 
-For secrets (`Database Connection URL`, `Database Password`), use the auto-provisioned Snowflake Parameter Provider with `#{PARAM_NAME}` references.
+For secrets, use explicitly configured NiFi parameter providers or `${{ secrets.NAME }}` references in flow parameters. The companion test YAML uses `POSTGRES_URL` and `POSTGRES_PASSWORD` from the selected GitHub Environment.
 
 ## Expected Behaviour
 
@@ -47,4 +51,4 @@ Once started, the flow continuously generates random INSERT, UPDATE, and DELETE 
 
 ## Validation Tests
 
-The test file at [`flows/data-generator/tests/test_postgres_cdc_demo.py`](../flows/data-generator/tests/test_postgres_cdc_demo.py) validates the flow deploys correctly and processes data against a live PostgreSQL instance provisioned via the ephemeral CI runtime.
+The test file at [`flows/data-generator/tests/test_postgres_cdc_demo.py`](../flows/data-generator/tests/test_postgres_cdc_demo.py) validates structure offline and can check execution on an existing NiFi test instance connected to PostgreSQL. Configure `NIFI_URL`, NiFi credentials, `POSTGRES_URL`, and `POSTGRES_PASSWORD` in the test GitHub Environment.

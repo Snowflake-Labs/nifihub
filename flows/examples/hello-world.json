@@ -23,7 +23,7 @@
         "bundle": {
           "group": "org.apache.nifi",
           "artifact": "nifi-standard-nar",
-          "version": "2.8.0"
+          "version": "2.12.0"
         },
         "properties": {
           "Log FlowFile Properties": "true",
@@ -142,7 +142,7 @@
         "bundle": {
           "group": "org.apache.nifi",
           "artifact": "nifi-standard-nar",
-          "version": "2.8.0"
+          "version": "2.12.0"
         },
         "properties": {
           "File Size": "0B",

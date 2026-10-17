@@ -1,43 +1,13 @@
 # yaml-language-server: $schema=../../../scripts/ci/ci-runtime-schema.json
 github_environment: example
-deployment: MY_DEPLOYMENT
-database: OPENFLOW
-schema: OPENFLOW
-node_type: MEDIUM
-min_nodes: 1
-max_nodes: 1
-execute_as_role: OPENFLOW_RUNTIME_ROLE
-sensitive_param_pattern: ".*PASSWORD.*|.*SECRET.*|.*_PWD"
-provided_parameter_contexts: ".*POSTGRES"
-network_rules:
-  - name: GITHUB_API
-    type: HOST_PORT
-    mode: EGRESS
-    values:
-      - "api.github.com:443"
-  - name: POSTGRES
-    type: HOST_PORT
-    mode: EGRESS
-    values:
-      - "your-postgres-service-id.your-account.region.aws.postgres.snowflake.app:5432"
-flow_registries:
-  - name: nifihub
-    type: org.apache.nifi.github.GitHubFlowRegistryClient
-    properties:
-      Repository Owner: Snowflake-Labs
-      Repository Name: nifihub
-      Authentication Type: PERSONAL_ACCESS_TOKEN
-      Personal Access Token: ${{ secrets.NIFIHUB_REGISTRY_PAT }}
-      Default Branch: main
-      Repository Path: flows
 flow:
   assets:
-    - name: "postgresql-42.7.10.jar"
-      url: "https://jdbc.postgresql.org/download/postgresql-42.7.10.jar"
-      parameter: "Database Driver"
+  - name: postgresql-42.7.10.jar
+    url: https://jdbc.postgresql.org/download/postgresql-42.7.10.jar
+    parameter: Database Driver
   parameters:
-    Database Connection URL: "#{POSTGRES_URL}" # coming from Snowflake Secrets Parameter Provider
-    Database Name: "mydb"
-    Database User: "my_user"
-    Database Password: "#{POSTGRES_PWD}" # coming from Snowflake Secrets Parameter Provider
-    Schema Name: "my_schema"
+    Database Connection URL: ${{ vars.POSTGRES_URL }}
+    Database Name: mydb
+    Database User: my_user
+    Database Password: ${{ secrets.POSTGRES_PASSWORD }}
+    Schema Name: my_schema

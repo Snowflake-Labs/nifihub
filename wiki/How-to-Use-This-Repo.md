@@ -48,20 +48,9 @@ See [GitHub Registry Client](Introduction-and-Concepts--GitHub-Registry-Client) 
 
 ---
 
-## Running Your Own Environment with Environment CD
+## Managing Your Own Environment
 
-If you want to manage Openflow deployments and runtimes using the GitOps pipeline:
-
-1. **Fork this repository**
-2. **Create an environment config** at `environments/<your-env>/config.yaml` following the [schema](../environments/README.md)
-3. **Set up a GitHub Environment** named `<your-env>` in your fork's Settings with these secrets/variables:
-   - `SNOWFLAKE_ACCOUNT_URL` (variable)
-   - `SNOWFLAKE_USER` (variable)
-   - `SNOWFLAKE_ROLE` (variable)
-   - `SNOWFLAKE_PAT` (secret) — Snowflake Personal Access Token
-   - `NIFI_RUNTIME_PAT` (secret) — PAT for the NiFi runtime REST API
-   - `NIFIHUB_REGISTRY_PAT` (secret) — GitHub PAT for the NiFi Flow Registry Client
-4. **Open a PR** — the Environment CD Validate workflow will post a change plan
-5. **Merge to `main`** — your infrastructure is provisioned automatically
-
-See [CD Pipeline](Introduction-and-Concepts--CD) for a full explanation of how the pipeline works.
+Configure existing NiFi URLs and resources in `environments/<name>/config.yaml`.
+Set NiFi username/password or bearer token authentication, preview the live plan,
+then reconcile resources with `scripts/run-cd.py`. GitHub Actions uses the same
+pipeline. See [the configuration reference](../environments/README.md).

@@ -31,5 +31,5 @@ NiFi has a built-in **Flow Registry** concept that lets flows be versioned in an
 | [GitHub Registry Client](Introduction-and-Concepts--GitHub-Registry-Client) | How NiFi's Git registry client works and how flows in this repo can be versioned and imported via it |
 | [Snowflake Flow Diff Action](Introduction-and-Concepts--Snowflake-Flow-Diff-GitHub-Action) | The GitHub Action that produces human-readable flow diffs and checkstyle reports on PRs |
 | [CI Pipeline](Introduction-and-Concepts--CI) | What automated checks run on every pull request |
-| [CD Pipeline](Introduction-and-Concepts--CD) | How flows are deployed to Snowflake runtimes and how Openflow infrastructure is managed as code |
-| [Non-SOM Runtimes](Introduction-and-Concepts--Non-SOM-Runtimes) | How to use the same NiFi reconciliation features against pre-provisioned or open-source NiFi runtimes |
+| [CD Pipeline](Introduction-and-Concepts--CD) | How flows are deployed to NiFi instances and how NiFi resources is managed as code |
+| [NiFi Runtimes](Introduction-and-Concepts--NiFi-Runtimes) | How to use the same NiFi reconciliation features against pre-provisioned or open-source NiFi runtimes |

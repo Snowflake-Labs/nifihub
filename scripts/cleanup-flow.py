@@ -12,28 +12,32 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-Clean up a deployed NiFi process group from a Snowflake runtime.
+Clean up a deployed NiFi process group from an Apache NiFi instance.
 
 Sequence: stop PG -> disable controller services -> purge queues -> delete PG.
 
 Usage:
     python scripts/cleanup-flow.py --pg-id <uuid> \
-        --runtime-url https://host.snowflakecomputing.app/instance-name --pat <token>
+        --runtime-url https://localhost:8443 --token <token>
 """
 
 import argparse
-import re
+from graphlib import TopologicalSorter
+import os
 import sys
+from pathlib import Path
 
 import nipyapi
 
+sys.path.insert(0, str(Path(__file__).resolve().parent / "cd"))
+from manage_flows import configure_nifi
+from nifi_config import get_nifi_auth
 
-def cleanup(pg_id, runtime_url, pat):
+
+def cleanup(pg_id, runtime_url, pat=None):
     """Remove a deployed process group from the runtime."""
-    base = re.sub(r"/nifi/?$", "", runtime_url.rstrip("/"))
-    api_base = base + "/nifi-api"
-    nipyapi.config.nifi_config.host = api_base
-    nipyapi.security.set_service_auth_token(service="nifi", token=pat)
+    configure_nifi(runtime_url, pat=pat, nifi_auth=get_nifi_auth())
+    contexts = _test_parameter_contexts(pg_id)
 
     print("Stopping process group %s ..." % pg_id, file=sys.stderr)
     nipyapi.canvas.schedule_process_group(pg_id, False)
@@ -47,26 +51,51 @@ def cleanup(pg_id, runtime_url, pat):
     print("Deleting process group ...", file=sys.stderr)
     nipyapi.canvas.delete_process_group(pg_id, force=True)
 
+    api = nipyapi.nifi.ParameterContextsApi()
+    for context_id in contexts:
+        context = api.get_parameter_context(id=context_id)
+        api.delete_parameter_context(id=context_id, version=context.revision.version)
+
     print("Cleanup complete for %s" % pg_id, file=sys.stderr)
+
+
+def _test_parameter_contexts(pg_id):
+    """Collect only contexts owned by this uniquely named CI process group."""
+    group = nipyapi.nifi.ProcessGroupsApi().get_process_group(id=pg_id)
+    if not group.component.name.startswith("CI_"):
+        return []
+    prefix = group.component.name + " - "
+    api = nipyapi.nifi.ParameterContextsApi()
+    contexts = {
+        context.id: api.get_parameter_context(id=context.id)
+        for context in nipyapi.nifi.FlowApi().get_parameter_contexts().parameter_contexts or []
+        if context.component.name.startswith(prefix)
+    }
+    delete_after = {context_id: set() for context_id in contexts}
+    for context_id, context in contexts.items():
+        for inherited in context.component.inherited_parameter_contexts or []:
+            if inherited.id in delete_after:
+                delete_after[inherited.id].add(context_id)
+    return list(TopologicalSorter(delete_after).static_order())
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Clean up a deployed NiFi process group from a Snowflake runtime"
+        description="Clean up a deployed NiFi process group from an Apache NiFi instance"
     )
     parser.add_argument(
         "--pg-id", required=True, help="Process group UUID to remove"
     )
     parser.add_argument(
-        "--runtime-url", required=True, help="Base URL of the Snowflake runtime"
+        "--runtime-url", default=os.environ.get("NIFI_URL"), required=not os.environ.get("NIFI_URL"), help="Existing Apache NiFi URL"
     )
     parser.add_argument(
-        "--pat", required=True, help="Personal Access Token for authentication"
+        "--token", default=os.environ.get("NIFI_TOKEN", ""), help="NiFi bearer token (or use NIFI_USERNAME/NIFI_PASSWORD)"
     )
     args = parser.parse_args()
 
     try:
-        cleanup(args.pg_id, args.runtime_url, args.pat)
+        cleanup(args.pg_id, args.runtime_url, args.token)
     except Exception as exc:
         print("Cleanup failed for %s: %s" % (args.pg_id, exc), file=sys.stderr)
         sys.exit(1)

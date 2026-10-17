@@ -2,7 +2,7 @@ name: Environment CD Validate
 
 on:
   pull_request:
-    paths: ['environments/**/config.yaml', 'environments/schema.json']
+    paths: ['environments/**', 'scripts/cd/**', 'scripts/run-cd.py']
 
 permissions:
   contents: read
@@ -12,34 +12,21 @@ jobs:
   detect:
     runs-on: ubuntu-latest
     outputs:
-      environments: ${{ steps.diff.outputs.environments }}
-      has_changes: ${{ steps.diff.outputs.has_changes }}
+      environments: ${{ steps.detect.outputs.items }}
+      has_changes: ${{ steps.detect.outputs.has_changes }}
     steps:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
-
-      - name: Detect changed environments
-        id: diff
-        run: |
-          base_sha=${{ github.event.pull_request.base.sha }}
-          changed=$(git diff --name-only "$base_sha" HEAD -- 'environments/*/config.yaml' || true)
-          envs=()
-          for f in $changed; do
-            if [ ! -f "$f" ]; then
-              continue
-            fi
-            env_name=$(echo "$f" | cut -d'/' -f2)
-            envs+=("\"$env_name\"")
-          done
-          if [ ${#envs[@]} -eq 0 ]; then
-            echo "has_changes=false" >> "$GITHUB_OUTPUT"
-            echo "environments=[]" >> "$GITHUB_OUTPUT"
-          else
-            joined=$(IFS=,; echo "${envs[*]}")
-            echo "has_changes=true" >> "$GITHUB_OUTPUT"
-            echo "environments=[$joined]" >> "$GITHUB_OUTPUT"
-          fi
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - run: pip install pyyaml
+      - name: Select environments
+        id: detect
+        env:
+          DIFF_BASE: ${{ github.event.pull_request.base.sha }}
+        run: python scripts/cd/detect_environments.py "$GITHUB_OUTPUT"
 
   validate:
     needs: detect
@@ -48,114 +35,59 @@ jobs:
     strategy:
       max-parallel: 1
       matrix:
-        env_name: ${{ fromJSON(needs.detect.outputs.environments) }}
-    environment: ${{ matrix.env_name }}
-
+        item: ${{ fromJSON(needs.detect.outputs.environments) }}
     steps:
       - uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
-
-      - name: Set up Python
-        uses: actions/setup-python@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
-
-      - name: Install Snowflake CLI
-        uses: snowflakedb/snowflake-cli-action@v2.0
-
-      - name: Install dependencies
-        run: pip install -r scripts/cd/requirements-cd.txt
-
-      - name: Run validation
-        id: validate
+      - run: pip install -r scripts/cd/requirements-cd.txt
+      - name: Validate configuration
         env:
-          SNOWFLAKE_ACCOUNT_URL: ${{ vars.SNOWFLAKE_ACCOUNT_URL }}
-          SNOWFLAKE_USER: ${{ vars.SNOWFLAKE_USER }}
-          SNOWFLAKE_PAT: ${{ secrets.SNOWFLAKE_PAT }}
-          SNOWFLAKE_ROLE: ${{ vars.SNOWFLAKE_ROLE }}
-        run: |
-          python scripts/cd/validate_pr.py \
-            environments/${{ matrix.env_name }}/config.yaml \
-            environments/schema.json || echo "validate_failed=true" >> "$GITHUB_OUTPUT"
+          CONFIG_ENV: ${{ matrix.item.config_env }}
+        run: python scripts/cd/validate_pr.py "environments/$CONFIG_ENV/config.yaml" environments/schema.json
 
-      - name: Query live environment state
-        id: live_state
-        env:
-          SNOWFLAKE_ACCOUNT_URL: ${{ vars.SNOWFLAKE_ACCOUNT_URL }}
-          SNOWFLAKE_USER: ${{ vars.SNOWFLAKE_USER }}
-          SNOWFLAKE_PAT: ${{ secrets.SNOWFLAKE_PAT }}
-          SNOWFLAKE_ROLE: ${{ vars.SNOWFLAKE_ROLE }}
-          NIFI_RUNTIME_PAT: ${{ secrets.NIFI_RUNTIME_PAT }}
+  plan:
+    needs: [detect, validate]
+    if: needs.detect.outputs.has_changes == 'true' && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    strategy:
+      max-parallel: 1
+      matrix:
+        item: ${{ fromJSON(needs.detect.outputs.environments) }}
+    environment: ${{ matrix.item.github_env }}
+    env:
+      NIFI_TOKEN: ${{ secrets.NIFI_TOKEN }}
+      NIFI_USERNAME: ${{ vars.NIFI_USERNAME }}
+      NIFI_PASSWORD: ${{ secrets.NIFI_PASSWORD }}
+      NIFI_VERIFY_SSL: ${{ vars.NIFI_VERIFY_SSL || 'true' }}
+      GH_SECRETS_JSON: ${{ toJSON(secrets) }}
+      GH_VARS_JSON: ${{ toJSON(vars) }}
+      CONFIG_ENV: ${{ matrix.item.config_env }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - run: pip install -r scripts/cd/requirements-cd.txt
+      - name: Read NiFi state and compute plan
         run: |
-          cd scripts/cd
-          python describe_live_state.py ../../environments/${{ matrix.env_name }}/config.yaml > /tmp/live-state.json
-          echo "--- Live State ---"
-          cat /tmp/live-state.json
-
-      - name: Compute live diff
-        run: |
-          cd scripts/cd
-          python diff_live.py /tmp/live-state.json ../../environments/${{ matrix.env_name }}/config.yaml > /tmp/change-plan.json
-          python format_change_plan.py /tmp/change-plan.json > /tmp/live-diff-comment.md
-          echo "--- Change Plan ---"
-          cat /tmp/change-plan.json
-
+          python scripts/cd/describe_live_state.py "environments/$CONFIG_ENV/config.yaml" > "$RUNNER_TEMP/live-state.json"
+          python scripts/cd/diff_live.py "$RUNNER_TEMP/live-state.json" "environments/$CONFIG_ENV/config.yaml" > "$RUNNER_TEMP/live-diff.json"
+          python scripts/cd/format_change_plan.py "$RUNNER_TEMP/live-diff.json" > "$RUNNER_TEMP/change-plan.md"
       - name: Comment on PR
         uses: actions/github-script@v9
         with:
           script: |
             const fs = require('fs');
-            const envName = `${{ matrix.env_name }}`;
-            const marker = `<!-- env-cd-validate:${envName} -->`;
-
-            let validation = '';
-            try { validation = fs.readFileSync('/tmp/pr-comment.md', 'utf8'); } catch {}
-
-            let liveDiff = '';
-            try { liveDiff = fs.readFileSync('/tmp/live-diff-comment.md', 'utf8'); } catch {}
-
-            let plan = '';
-            try { plan = fs.readFileSync('/tmp/change-plan.json', 'utf8'); } catch {}
-
-            let body = `${marker}\n`;
-            body += `# Environment: \`${envName}\`\n\n`;
-            if (validation) {
-              body += validation + '\n\n';
-            }
-            if (liveDiff) {
-              body += liveDiff + '\n\n';
-            }
-            if (plan) {
-              body += `<details>\n<summary>Raw change plan JSON</summary>\n\n\`\`\`json\n${plan}\n\`\`\`\n</details>\n`;
-            }
-
-            const { data: comments } = await github.rest.issues.listComments({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: context.issue.number,
+            const marker = `<!-- env-cd-validate:${process.env.CONFIG_ENV} -->`;
+            const body = `${marker}\n${fs.readFileSync(`${process.env.RUNNER_TEMP}/change-plan.md`, 'utf8')}`;
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner: context.repo.owner, repo: context.repo.repo, issue_number: context.issue.number
             });
-            const existing = comments.find(c =>
-              c.user.type === 'Bot' && c.body.includes(marker)
-            );
+            const existing = comments.find(c => c.user.type === 'Bot' && c.body.includes(marker));
             if (existing) {
-              await github.rest.issues.updateComment({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                comment_id: existing.id,
-                body,
-              });
+              await github.rest.issues.updateComment({owner: context.repo.owner, repo: context.repo.repo, comment_id: existing.id, body});
             } else {
-              await github.rest.issues.createComment({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: context.issue.number,
-                body,
-              });
+              await github.rest.issues.createComment({owner: context.repo.owner, repo: context.repo.repo, issue_number: context.issue.number, body});
             }
-
-      - name: Fail if validation errors
-        if: steps.validate.outputs.validate_failed == 'true'
-        run: |
-          echo "Validation failed — see PR comment for details."
-          exit 1

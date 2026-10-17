@@ -1,0 +1,28 @@
+name: Python CI
+
+on:
+  pull_request:
+    paths: ['scripts/**', 'flows/**', 'environments/**', '.github/workflows/**']
+  push:
+    branches: [main]
+    paths: ['scripts/**', 'flows/**', 'environments/**', '.github/workflows/**']
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - run: pip install -r scripts/cd/requirements-cd.txt -r flows/requirements.txt
+      - name: Run resource and flow tests
+        run: pytest scripts/cd/tests flows/ --import-mode=importlib -q
+      - name: Validate example configurations
+        run: |
+          for config in environments/*/config.yaml; do
+            python scripts/cd/validate_pr.py "$config" environments/schema.json
+          done

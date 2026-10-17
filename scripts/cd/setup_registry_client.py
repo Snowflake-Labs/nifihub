@@ -16,6 +16,7 @@
 #!/usr/bin/env python3
 import argparse
 import json
+import os
 import sys
 
 import nipyapi
@@ -128,20 +129,21 @@ def setup(name, properties, runtime_url, nifi_pat, type_override=None, nifi_auth
 
 
 def main():
+    from nifi_config import get_nifi_auth
     parser = argparse.ArgumentParser(description="Setup Flow Registry Client on NiFi runtime")
     parser.add_argument("--name", default="nifihub", help="Registry client name")
     parser.add_argument("--type", dest="type_override", default=None,
                         help="Fully-qualified Java type (auto-detected if omitted)")
     parser.add_argument("--properties", required=True,
                         help="JSON object of key-value properties for the registry client")
-    parser.add_argument("--runtime-url", required=True, help="NiFi runtime URL")
-    parser.add_argument("--nifi-pat", required=True, help="PAT for NiFi API auth")
+    parser.add_argument("--runtime-url", default=os.environ.get("NIFI_URL"), required=not os.environ.get("NIFI_URL"), help="NiFi URL")
+    parser.add_argument("--token", default=os.environ.get("NIFI_TOKEN", ""), help="NiFi bearer token")
     args = parser.parse_args()
 
     properties = json.loads(args.properties)
     result = setup(
-        args.name, properties, args.runtime_url, args.nifi_pat,
-        type_override=args.type_override,
+        args.name, properties, args.runtime_url, args.token,
+        type_override=args.type_override, nifi_auth=get_nifi_auth(),
     )
     json.dump({"id": result.id, "name": result.component.name}, sys.stdout, indent=2)
 

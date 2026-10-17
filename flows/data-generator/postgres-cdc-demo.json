@@ -33,7 +33,7 @@
         "bundle": {
           "group": "org.apache.nifi",
           "artifact": "nifi-standard-nar",
-          "version": "2026.5.8.8"
+          "version": "2.12.0"
         },
         "properties": {
           "Table Name": "${target_table}",
@@ -309,7 +309,7 @@
         "bundle": {
           "group": "org.apache.nifi",
           "artifact": "nifi-standard-nar",
-          "version": "2026.5.8.8"
+          "version": "2.12.0"
         },
         "properties": {
           "File Size": "0B",
@@ -402,7 +402,7 @@
         "bundle": {
           "group": "org.apache.nifi",
           "artifact": "nifi-standard-nar",
-          "version": "2026.5.8.8"
+          "version": "2.12.0"
         },
         "properties": {
           "File Size": "0B",
@@ -495,7 +495,7 @@
         "bundle": {
           "group": "org.apache.nifi",
           "artifact": "nifi-standard-nar",
-          "version": "2026.5.8.8"
+          "version": "2.12.0"
         },
         "properties": {
           "Table Name": "${target_table}",
@@ -771,7 +771,7 @@
         "bundle": {
           "group": "org.apache.nifi",
           "artifact": "nifi-standard-nar",
-          "version": "2026.5.8.8"
+          "version": "2.12.0"
         },
         "properties": {
           "Routing Strategy": "Route to Property name",
@@ -814,49 +814,73 @@
       {
         "identifier": "bb131e84-d45c-364f-8cd3-0b902f9e7bd8",
         "instanceIdentifier": "9629375c-8870-3cd9-a3e2-58e1444a54d5",
-        "name": "ExecuteSQLStatement",
+        "name": "Initialize Database",
         "comments": "",
         "position": {
           "x": -1760.0,
           "y": -2184.0
         },
-        "type": "com.snowflake.openflow.runtime.processors.database.ExecuteSQLStatement",
+        "type": "org.apache.nifi.processors.standard.PutSQL",
         "bundle": {
-          "group": "com.snowflake.openflow.runtime",
-          "artifact": "runtime-database-processors-nar",
-          "version": "2026.5.8.8"
+          "group": "org.apache.nifi",
+          "artifact": "nifi-standard-nar",
+          "version": "2.12.0"
         },
         "properties": {
-          "Max Batch Size": "1",
-          "Connection Pooling Service": "ce22d3a0-f94b-3a61-ffff-ffff82c298f6",
-          "Max Content Reference Size": "32 KB",
-          "SQL": "CREATE SCHEMA IF NOT EXISTS #{Schema Name};\n\nCREATE TABLE IF NOT EXISTS #{Schema Name}.customers (\n    customer_id INTEGER PRIMARY KEY,\n    first_name VARCHAR(100) NOT NULL,\n    last_name VARCHAR(100) NOT NULL,\n    email VARCHAR(255),\n    phone VARCHAR(50),\n    updated_at TIMESTAMP DEFAULT NOW()\n);\n\nCREATE TABLE IF NOT EXISTS #{Schema Name}.orders (\n    order_id INTEGER PRIMARY KEY,\n    customer_id INTEGER NOT NULL,\n    order_status VARCHAR(50) DEFAULT 'pending',\n    total_amount NUMERIC(10,2),\n    shipping_address TEXT,\n    updated_at TIMESTAMP DEFAULT NOW()\n);\n\nCREATE TABLE IF NOT EXISTS #{Schema Name}.order_items (\n    item_id SERIAL PRIMARY KEY,\n    order_id INTEGER NOT NULL,\n    product_name VARCHAR(255) NOT NULL,\n    quantity INTEGER DEFAULT 1,\n    unit_price NUMERIC(10,2)\n);\n\nDO $$\nBEGIN\n    IF NOT EXISTS (SELECT 1 FROM pg_publication WHERE pubname = '#{Publication Name}') THEN\n        CREATE PUBLICATION #{Publication Name} FOR TABLE\n            #{Schema Name}.customers,\n            #{Schema Name}.orders,\n            #{Schema Name}.order_items;\n    END IF;\nEND\n$$;"
+          "JDBC Connection Pool": "ce22d3a0-f94b-3a61-ffff-ffff82c298f6",
+          "SQL Statement": "CREATE SCHEMA IF NOT EXISTS #{Schema Name};\n\nCREATE TABLE IF NOT EXISTS #{Schema Name}.customers (\n    customer_id INTEGER PRIMARY KEY,\n    first_name VARCHAR(100) NOT NULL,\n    last_name VARCHAR(100) NOT NULL,\n    email VARCHAR(255),\n    phone VARCHAR(50),\n    updated_at TIMESTAMP DEFAULT NOW()\n);\n\nCREATE TABLE IF NOT EXISTS #{Schema Name}.orders (\n    order_id INTEGER PRIMARY KEY,\n    customer_id INTEGER NOT NULL,\n    order_status VARCHAR(50) DEFAULT 'pending',\n    total_amount NUMERIC(10,2),\n    shipping_address TEXT,\n    updated_at TIMESTAMP DEFAULT NOW()\n);\n\nCREATE TABLE IF NOT EXISTS #{Schema Name}.order_items (\n    item_id SERIAL PRIMARY KEY,\n    order_id INTEGER NOT NULL,\n    product_name VARCHAR(255) NOT NULL,\n    quantity INTEGER DEFAULT 1,\n    unit_price NUMERIC(10,2)\n);\n\nDO $$\nBEGIN\n    IF NOT EXISTS (SELECT 1 FROM pg_publication WHERE pubname = '#{Publication Name}') THEN\n        CREATE PUBLICATION #{Publication Name} FOR TABLE\n            #{Schema Name}.customers,\n            #{Schema Name}.orders,\n            #{Schema Name}.order_items;\n    END IF;\nEND\n$$;",
+          "Batch Size": "1",
+          "Support Fragmented Transactions": "false",
+          "Database Session AutoCommit": "false",
+          "Rollback On Failure": "false",
+          "Obtain Generated Keys": "false"
         },
         "propertyDescriptors": {
-          "Max Batch Size": {
-            "name": "Max Batch Size",
-            "displayName": "Max Batch Size",
-            "identifiesControllerService": false,
-            "sensitive": false,
-            "dynamic": false
-          },
-          "Connection Pooling Service": {
-            "name": "Connection Pooling Service",
-            "displayName": "Connection Pooling Service",
+          "JDBC Connection Pool": {
+            "name": "JDBC Connection Pool",
+            "displayName": "JDBC Connection Pool",
             "identifiesControllerService": true,
             "sensitive": false,
             "dynamic": false
           },
-          "Max Content Reference Size": {
-            "name": "Max Content Reference Size",
-            "displayName": "Max Content Reference Size",
+          "SQL Statement": {
+            "name": "SQL Statement",
+            "displayName": "SQL Statement",
             "identifiesControllerService": false,
             "sensitive": false,
             "dynamic": false
           },
-          "SQL": {
-            "name": "SQL",
-            "displayName": "SQL",
+          "Batch Size": {
+            "name": "Batch Size",
+            "displayName": "Batch Size",
+            "identifiesControllerService": false,
+            "sensitive": false,
+            "dynamic": false
+          },
+          "Support Fragmented Transactions": {
+            "name": "Support Fragmented Transactions",
+            "displayName": "Support Fragmented Transactions",
+            "identifiesControllerService": false,
+            "sensitive": false,
+            "dynamic": false
+          },
+          "Database Session AutoCommit": {
+            "name": "Database Session AutoCommit",
+            "displayName": "Database Session AutoCommit",
+            "identifiesControllerService": false,
+            "sensitive": false,
+            "dynamic": false
+          },
+          "Rollback On Failure": {
+            "name": "Rollback On Failure",
+            "displayName": "Rollback On Failure",
+            "identifiesControllerService": false,
+            "sensitive": false,
+            "dynamic": false
+          },
+          "Obtain Generated Keys": {
+            "name": "Obtain Generated Keys",
+            "displayName": "Obtain Generated Keys",
             "identifiesControllerService": false,
             "sensitive": false,
             "dynamic": false
@@ -893,7 +917,7 @@
         "bundle": {
           "group": "org.apache.nifi",
           "artifact": "nifi-scripting-nar",
-          "version": "2026.5.8.8"
+          "version": "2.12.0"
         },
         "properties": {
           "Script File": null,
@@ -1027,7 +1051,7 @@
           "id": "bb131e84-d45c-364f-8cd3-0b902f9e7bd8",
           "type": "PROCESSOR",
           "groupId": "1ba8dcd1-9298-3aa2-bc15-0d72080fb608",
-          "name": "ExecuteSQLStatement",
+          "name": "Initialize Database",
           "comments": "",
           "instanceIdentifier": "9629375c-8870-3cd9-a3e2-58e1444a54d5"
         },
@@ -1096,7 +1120,7 @@
           "id": "bb131e84-d45c-364f-8cd3-0b902f9e7bd8",
           "type": "PROCESSOR",
           "groupId": "1ba8dcd1-9298-3aa2-bc15-0d72080fb608",
-          "name": "ExecuteSQLStatement",
+          "name": "Initialize Database",
           "comments": "",
           "instanceIdentifier": "9629375c-8870-3cd9-a3e2-58e1444a54d5"
         },
@@ -1111,7 +1135,8 @@
         "labelIndex": 0,
         "zIndex": 8,
         "selectedRelationships": [
-          "failure"
+          "failure",
+          "retry"
         ],
         "backPressureObjectThreshold": 10000,
         "backPressureDataSizeThreshold": "1 GB",
@@ -1175,7 +1200,7 @@
           "id": "bb131e84-d45c-364f-8cd3-0b902f9e7bd8",
           "type": "PROCESSOR",
           "groupId": "1ba8dcd1-9298-3aa2-bc15-0d72080fb608",
-          "name": "ExecuteSQLStatement",
+          "name": "Initialize Database",
           "comments": "",
           "instanceIdentifier": "9629375c-8870-3cd9-a3e2-58e1444a54d5"
         },
@@ -1280,7 +1305,7 @@
         "bundle": {
           "group": "org.apache.nifi",
           "artifact": "nifi-dbcp-service-nar",
-          "version": "2026.5.8.8"
+          "version": "2.12.0"
         },
         "properties": {
           "Maximum Idle Connections": "8",
@@ -1436,7 +1461,7 @@
             "bundle": {
               "group": "org.apache.nifi",
               "artifact": "nifi-standard-services-api-nar",
-              "version": "2026.5.8.5"
+              "version": "2.12.0"
             }
           }
         ],
@@ -1454,7 +1479,7 @@
         "bundle": {
           "group": "org.apache.nifi",
           "artifact": "nifi-record-serialization-services-nar",
-          "version": "2026.5.8.8"
+          "version": "2.12.0"
         },
         "properties": {
           "Schema Branch": null,
@@ -1594,7 +1619,7 @@
             "bundle": {
               "group": "org.apache.nifi",
               "artifact": "nifi-standard-services-api-nar",
-              "version": "2026.5.8.5"
+              "version": "2.12.0"
             }
           }
         ],
@@ -1631,14 +1656,14 @@
           "description": "",
           "sensitive": false,
           "provided": false,
-          "value": "jdbc:postgresql://your-postgres-service-id.your-account.region.aws.postgres.snowflake.app:5432/mydb?sslmode=require"
+          "value": "jdbc:postgresql://postgres.example.com:5432/mydb"
         },
         {
           "name": "Database User",
           "description": "",
           "sensitive": false,
           "provided": false,
-          "value": "snowflake_admin"
+          "value": "nifi"
         },
         {
           "name": "Database Name",

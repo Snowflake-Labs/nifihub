@@ -12,14 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-Deploy a NiFi flow definition to a Snowflake runtime.
+Deploy a NiFi flow definition to an Apache NiFi instance.
 
 Uploads the flow JSON as a new process group under root using the
-NiFi-compatible REST API exposed by the Snowflake runtime.
+NiFi REST API.
 
 Usage:
     python scripts/deploy-flow.py --flow-path flows/bucket/flow.json \
-        --runtime-url https://host.snowflakecomputing.app/instance-name --pat <token>
+        --runtime-url https://localhost:8443 --token <token>
 
 The runtime URL should be the instance base path (without /nifi/ or /nifi-api).
 """
@@ -27,11 +27,15 @@ The runtime URL should be the instance base path (without /nifi/ or /nifi-api).
 import argparse
 import json
 import os
-import re
 import sys
+from pathlib import Path
 import uuid
 
 import nipyapi
+
+sys.path.insert(0, str(Path(__file__).resolve().parent / "cd"))
+from manage_flows import configure_nifi
+from nifi_config import get_nifi_auth
 
 
 def _collect_components(pg_id):
@@ -72,12 +76,9 @@ def _collect_components(pg_id):
     return processors, controller_services
 
 
-def deploy(flow_path, runtime_url, pat):
-    """Upload a flow definition to the Snowflake runtime and return deployment summary."""
-    base = re.sub(r"/nifi-api/?$", "", re.sub(r"/nifi/?$", "", runtime_url.rstrip("/")))
-    api_base = base + "/nifi-api"
-    nipyapi.config.nifi_config.host = api_base
-    nipyapi.security.set_service_auth_token(service="nifi", token=pat)
+def deploy(flow_path, runtime_url, pat=None):
+    """Upload a flow definition to the Apache NiFi instance and return deployment summary."""
+    configure_nifi(runtime_url, pat=pat, nifi_auth=get_nifi_auth())
 
     root_pg_id = nipyapi.canvas.get_root_pg_id()
     print("Connected to runtime. Root process group: %s" % root_pg_id, file=sys.stderr)
@@ -116,21 +117,21 @@ def deploy(flow_path, runtime_url, pat):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Deploy a NiFi flow definition to a Snowflake runtime"
+        description="Deploy a NiFi flow definition to an Apache NiFi instance"
     )
     parser.add_argument(
         "--flow-path", required=True, help="Path to the flow definition JSON file"
     )
     parser.add_argument(
-        "--runtime-url", required=True, help="Base URL of the Snowflake runtime"
+        "--runtime-url", default=os.environ.get("NIFI_URL"), required=not os.environ.get("NIFI_URL"), help="Existing Apache NiFi URL"
     )
     parser.add_argument(
-        "--pat", required=True, help="Personal Access Token for authentication"
+        "--token", default=os.environ.get("NIFI_TOKEN", ""), help="NiFi bearer token (or use NIFI_USERNAME/NIFI_PASSWORD)"
     )
     args = parser.parse_args()
 
     try:
-        deploy(args.flow_path, args.runtime_url, args.pat)
+        deploy(args.flow_path, args.runtime_url, args.token)
     except Exception as exc:
         print("Deployment failed: %s" % exc, file=sys.stderr)
         sys.exit(1)

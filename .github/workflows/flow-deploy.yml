@@ -64,7 +64,7 @@ jobs:
       - name: Checkout PR Branch
         uses: actions/checkout@v7
         with:
-          ref: ${{ steps.pr-info.outputs.ref }}
+          ref: ${{ steps.pr-info.outputs.sha }}
 
       - name: Detect Flows and Test Configs
         uses: actions/github-script@v9
@@ -130,14 +130,19 @@ jobs:
       matrix:
         item: ${{ fromJSON(needs.detect.outputs.items) }}
     environment: ${{ matrix.item.github_env }}
+    concurrency:
+      group: nifi-flow-tests-${{ matrix.item.github_env }}
+      queue: max
+      cancel-in-progress: false
     name: "Deploy: ${{ matrix.item.flow_base }}"
 
     env:
-      SNOWFLAKE_ACCOUNT_URL: ${{ vars.SNOWFLAKE_ACCOUNT_URL }}
-      SNOWFLAKE_USER: ${{ vars.SNOWFLAKE_USER }}
-      SNOWFLAKE_PAT: ${{ secrets.SNOWFLAKE_PAT }}
-      SNOWFLAKE_ROLE: ${{ vars.SNOWFLAKE_ROLE }}
-      NIFI_RUNTIME_PAT: ${{ secrets.NIFI_RUNTIME_PAT }}
+      NIFI_URL: ${{ vars.NIFI_URL }}
+      NIFI_TOKEN: ${{ secrets.NIFI_TOKEN }}
+      NIFI_USERNAME: ${{ vars.NIFI_USERNAME }}
+      NIFI_PASSWORD: ${{ secrets.NIFI_PASSWORD }}
+      NIFI_VERIFY_SSL: ${{ vars.NIFI_VERIFY_SSL || 'true' }}
+      PG_ID_FILE: ${{ runner.temp }}/nifihub-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.item.flow_base }}.pg-id
       NIFIHUB_REGISTRY_PAT: ${{ secrets.NIFIHUB_REGISTRY_PAT }}
       GH_SECRETS_JSON: ${{ toJSON(secrets) }}
       GH_VARS_JSON: ${{ toJSON(vars) }}
@@ -158,7 +163,7 @@ jobs:
               started_at: new Date().toISOString(),
               output: {
                 title: 'Flow Deploy Tests',
-                summary: `Deploying \`${{ matrix.item.flow_path }}\` to ephemeral runtime...`
+                summary: `Deploying \`${{ matrix.item.flow_path }}\` to the configured NiFi test instance...`
               }
             });
             core.setOutput('id', check.id);
@@ -166,7 +171,7 @@ jobs:
       - name: Checkout PR Branch
         uses: actions/checkout@v7
         with:
-          ref: ${{ needs.detect.outputs.ref || github.event.issue.pull_request.head.ref }}
+          ref: ${{ needs.detect.outputs.sha }}
           fetch-depth: 0
 
       - name: Set up Python
@@ -174,54 +179,21 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Install Snowflake CLI
-        uses: snowflakedb/snowflake-cli-action@v2.0
-
       - name: Install dependencies
         run: |
           pip install -r scripts/cd/requirements-cd.txt
           pip install -r flows/requirements.txt
 
-      - name: Generate Runtime Name
-        id: name
-        run: |
-          FLOW_BASE="${{ matrix.item.flow_base }}"
-          PR_NUM="${{ github.event.issue.number }}"
-          RUN_ID="${{ github.run_id }}"
-          RUNTIME_NAME="CI_$(echo "$FLOW_BASE" | tr '[:lower:]-' '[:upper:]_')_${PR_NUM}_${RUN_ID}"
-          RUNTIME_NAME="${RUNTIME_NAME:0:254}"
-          echo "runtime_name=$RUNTIME_NAME" >> "$GITHUB_OUTPUT"
-          echo "Runtime name: $RUNTIME_NAME"
-
-      - name: Provision Ephemeral Runtime
-        id: provision
-        run: |
-          URL_FILE=$(mktemp)
-          ERROR_LOG=$(mktemp)
-          echo "error_log=$ERROR_LOG" >> "$GITHUB_OUTPUT"
-          python scripts/ci/provision_ci_runtime.py \
-            --config "${{ matrix.item.test_yaml }}" \
-            --runtime-name "${{ steps.name.outputs.runtime_name }}" \
-            --output-file "$URL_FILE" 2>&1 | tee "$ERROR_LOG"
-          PROVISION_EXIT=${PIPESTATUS[0]}
-          if [ $PROVISION_EXIT -ne 0 ]; then
-            exit $PROVISION_EXIT
-          fi
-          RUNTIME_URL=$(cat "$URL_FILE")
-          echo "runtime_url=$RUNTIME_URL" >> "$GITHUB_OUTPUT"
-          echo "Runtime URL: $RUNTIME_URL"
-
       - name: Deploy Flow
         id: deploy
         run: |
-          PG_ID_FILE=$(mktemp)
           ERROR_LOG=$(mktemp)
           echo "error_log=$ERROR_LOG" >> "$GITHUB_OUTPUT"
           python scripts/ci/deploy_ci_flow.py \
             --flow-path "${{ matrix.item.flow_path }}" \
             --config "${{ matrix.item.test_yaml }}" \
-            --runtime-url "${{ steps.provision.outputs.runtime_url }}" \
-            --pat "$NIFI_RUNTIME_PAT" \
+            --runtime-url "$NIFI_URL" \
+            --token "$NIFI_TOKEN" \
             --output-file "$PG_ID_FILE" 2>&1 | tee "$ERROR_LOG"
           DEPLOY_EXIT=${PIPESTATUS[0]}
           if [ $DEPLOY_EXIT -ne 0 ]; then
@@ -242,8 +214,6 @@ jobs:
         id: tests
         env:
           DEPLOYED_PG_ID: ${{ steps.deploy.outputs.pg_id }}
-          SNOWFLAKE_RUNTIME_URL: ${{ steps.provision.outputs.runtime_url }}
-          SNOWFLAKE_RUNTIME_PAT: ${{ secrets.NIFI_RUNTIME_PAT }}
         run: |
           FLOW_PATH="${{ matrix.item.flow_path }}"
           FLOW_DIR=$(dirname "$FLOW_PATH")
@@ -253,7 +223,8 @@ jobs:
           RESULT_FILE=$(mktemp --suffix=.xml)
 
           if [ -f "$TEST_FILE" ]; then
-            pytest "$TEST_FILE" -v --tb=short --junitxml="$RESULT_FILE" || true
+            echo "result_file=$RESULT_FILE" >> "$GITHUB_OUTPUT"
+            pytest "$TEST_FILE" -v --tb=short --junitxml="$RESULT_FILE"
           else
             echo "No test file found at $TEST_FILE"
             echo "<testsuites><testsuite name=\"$FLOW_PATH\" tests=\"0\"/></testsuites>" > "$RESULT_FILE"
@@ -266,12 +237,13 @@ jobs:
             exit 1
           fi
 
-      - name: Teardown Runtime
-        if: always() && steps.provision.outcome == 'success' && !contains(github.event.comment.body, 'do not clean')
+      - name: Remove test process group
+        id: cleanup
+        if: always() && !contains(github.event.comment.body, 'do not clean')
         run: |
-          python scripts/ci/teardown_ci_runtime.py \
-            --config "${{ matrix.item.test_yaml }}" \
-            --runtime-name "${{ steps.name.outputs.runtime_name }}" || true
+          if [ -s "$PG_ID_FILE" ]; then
+            python scripts/cleanup-flow.py --pg-id "$(cat "$PG_ID_FILE")" --runtime-url "$NIFI_URL" --token "$NIFI_TOKEN"
+          fi
 
       - name: Comment Result
         uses: actions/github-script@v9
@@ -280,8 +252,6 @@ jobs:
           script: |
             const fs = require('fs');
             const flowPath = '${{ matrix.item.flow_path }}';
-            const runtimeName = '${{ steps.name.outputs.runtime_name }}';
-            const provisionOutcome = '${{ steps.provision.outcome }}';
             const deployOutcome = '${{ steps.deploy.outcome }}';
             const testsOutcome = '${{ steps.tests.outcome }}';
             const doNotClean = `${{ contains(github.event.comment.body, 'do not clean') }}` === 'true';
@@ -291,28 +261,9 @@ jobs:
             let checkSummary = '';
             let body = '';
 
-            if (provisionOutcome !== 'success') {
+            if (deployOutcome !== 'success') {
               body += `### ❌ Flow deployment failed\n\n`;
               body += `#### \`${flowPath}\`\n\n`;
-              body += `**Runtime:** \`${runtimeName}\`\n\n`;
-              body += `Runtime provisioning failed — see [workflow run](${runUrl})\n\n`;
-              const provisionLog = '${{ steps.provision.outputs.error_log }}';
-              if (provisionLog) {
-                try {
-                  const log = fs.readFileSync(provisionLog, 'utf8').trim();
-                  if (log) {
-                    const lines = log.split('\n');
-                    const tail = lines.slice(-30).join('\n');
-                    body += `<details><summary>Error output</summary>\n\n\`\`\`\n${tail}\n\`\`\`\n\n</details>\n\n`;
-                  }
-                } catch (e) {}
-              }
-              conclusion = 'failure';
-              checkSummary = 'Runtime provisioning failed';
-            } else if (deployOutcome !== 'success') {
-              body += `### ❌ Flow deployment failed\n\n`;
-              body += `#### \`${flowPath}\`\n\n`;
-              body += `**Runtime:** \`${runtimeName}\`\n\n`;
               body += `Flow deployment failed — see [workflow run](${runUrl})\n\n`;
               const deployLog = '${{ steps.deploy.outputs.error_log }}';
               if (deployLog) {
@@ -423,12 +374,17 @@ jobs:
               }
             }
 
-            if (doNotClean && provisionOutcome === 'success') {
+            if (doNotClean) {
               body += `### Cleanup\n\n`;
-              body += `⏭️ Cleanup skipped — runtime \`${runtimeName}\` left running for debugging.\n\n`;
-            } else if (provisionOutcome === 'success') {
+              body += `⏭️ Cleanup skipped — test process group left available for debugging.\n\n`;
+            } else if ('${{ steps.cleanup.outcome }}' === 'success') {
               body += `### Cleanup\n\n`;
-              body += `🧹 Cleaned up: \`${runtimeName}\`\n\n`;
+              body += `🧹 Removed the temporary test process group. Shared NARs and services remain installed.\n\n`;
+            }
+
+            if ('${{ steps.cleanup.outcome }}' === 'failure') {
+              conclusion = 'failure';
+              body += 'Test process group cleanup failed; see the workflow logs.\n\n';
             }
 
             body += `[Workflow run](${runUrl})`;

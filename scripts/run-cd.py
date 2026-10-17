@@ -14,46 +14,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Local CD runner — executes the full describe→diff→translate→orchestrate pipeline.
+"""Run describe → diff → translate → reconcile against existing Apache NiFi instances.
 
-Runs the same Python scripts used by the GitHub Actions Environment CD workflow,
-allowing you to apply config changes locally without pushing to main or waiting
-for a workflow trigger.
-
-Typical usage:
-
-    # Apply changes (Snowflake-managed runtime)
-    export SNOWFLAKE_ACCOUNT_URL=https://myorg.snowflakecomputing.com
-    export SNOWFLAKE_USER=myuser
-    export SNOWFLAKE_PAT=pat-token
-    export SNOWFLAKE_ROLE=OPENFLOW_ADMIN
-    export NIFI_RUNTIME_PAT=nifi-pat
-    export NIFIHUB_REGISTRY_PAT=ghp_...
-    python scripts/run-cd.py environments/demo/config.yaml
-
-    # Preview changes without applying (dry run)
-    python scripts/run-cd.py environments/demo/config.yaml --dry-run
-
-    # Apply against a local Apache NiFi using username/password auth
-    export GH_SECRETS_JSON='{"NIFI_PASSWORD":"admin","NIFIHUB_REGISTRY_PAT":"ghp_..."}'
-    export GH_VARS_JSON='{"NIFI_USERNAME":"admin"}'
-    python scripts/run-cd.py environments/local/config.yaml
-
-Required environment variables:
-    SNOWFLAKE_ACCOUNT_URL   Snowflake account URL for SOM or mixed configs
-    SNOWFLAKE_USER          Snowflake username for SOM or mixed configs
-    SNOWFLAKE_PAT           Snowflake Programmatic Access Token for SOM or mixed configs
-    SNOWFLAKE_ROLE          Snowflake role for SOM or mixed configs (e.g. OPENFLOW_ADMIN)
-    NIFI_RUNTIME_PAT        NiFi Bearer token — not required if nifi_auth is set
-                            in config.yaml with type: username_password
-    NIFIHUB_REGISTRY_PAT    GitHub PAT for Flow Registry Clients
-
-Optional environment variables:
-    GH_SECRETS_JSON         JSON object of secrets (for ${{ secrets.NAME }} resolution)
-    GH_VARS_JSON            JSON object of variables (for ${{ vars.NAME }} resolution)
-
-For URL-managed-only configs, the pipeline skips Snowflake discovery entirely and
-does not require any `SNOWFLAKE_*` environment variables.
+Set NIFI_USERNAME and NIFI_PASSWORD for NiFi login, or NIFI_TOKEN for an existing
+bearer token. GH_SECRETS_JSON and GH_VARS_JSON resolve configuration references.
+Use --dry-run to inspect the plan without modifying NiFi.
 """
 import argparse
 import json
@@ -100,7 +65,7 @@ def main():
         live_diff = os.path.join(tmp, "live-diff.json")
         changes = os.path.join(tmp, "changes.json")
 
-        # Step 1: Describe live state (queries NiFi, plus Snowflake for SOM or mixed configs)
+        # Step 1: Describe live NiFi resources
         print("[run-cd] Step 1/4: Describing live state...", file=sys.stderr)
         with open(live_state, "w") as out:
             _run(

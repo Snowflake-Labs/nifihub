@@ -12,29 +12,31 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-Delete NAR files from a Snowflake NiFi runtime.
+Delete NAR files from an Apache NiFi instance.
 
 Reads NAR identifiers (one per line) from a file and deletes each via
 the NiFi Controller API.
 
 Usage:
     python scripts/delete-nars.py --nar-ids-file /tmp/nar_ids.txt \
-        --runtime-url https://host.snowflakecomputing.app/instance-name --pat <token>
+        --runtime-url https://localhost:8443 --token <token>
 """
 
 import argparse
-import re
+import os
 import sys
+from pathlib import Path
 
 import nipyapi
 
+sys.path.insert(0, str(Path(__file__).resolve().parent / "cd"))
+from manage_flows import configure_nifi
+from nifi_config import get_nifi_auth
 
-def delete_nars(nar_ids_file, runtime_url, pat):
+
+def delete_nars(nar_ids_file, runtime_url, pat=None):
     """Delete NARs listed in the given file."""
-    base = re.sub(r"/nifi/?$", "", runtime_url.rstrip("/"))
-    api_base = base + "/nifi-api"
-    nipyapi.config.nifi_config.host = api_base
-    nipyapi.security.set_service_auth_token(service="nifi", token=pat)
+    configure_nifi(runtime_url, pat=pat, nifi_auth=get_nifi_auth())
 
     with open(nar_ids_file, "r") as f:
         nar_ids = [line.strip() for line in f if line.strip()]
@@ -57,21 +59,21 @@ def delete_nars(nar_ids_file, runtime_url, pat):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Delete NAR files from a Snowflake NiFi runtime"
+        description="Delete NAR files from an Apache NiFi instance"
     )
     parser.add_argument(
         "--nar-ids-file", required=True, help="File containing NAR identifiers (one per line)"
     )
     parser.add_argument(
-        "--runtime-url", required=True, help="Base URL of the Snowflake runtime"
+        "--runtime-url", default=os.environ.get("NIFI_URL"), required=not os.environ.get("NIFI_URL"), help="Existing Apache NiFi URL"
     )
     parser.add_argument(
-        "--pat", required=True, help="Personal Access Token for authentication"
+        "--token", default=os.environ.get("NIFI_TOKEN", ""), help="NiFi bearer token (or use NIFI_USERNAME/NIFI_PASSWORD)"
     )
     args = parser.parse_args()
 
     try:
-        delete_nars(args.nar_ids_file, args.runtime_url, args.pat)
+        delete_nars(args.nar_ids_file, args.runtime_url, args.token)
     except Exception as exc:
         print("NAR deletion failed: %s" % exc, file=sys.stderr)
         sys.exit(1)

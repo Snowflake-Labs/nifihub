@@ -3,11 +3,11 @@ name: Environment CD
 on:
   push:
     branches: [main]
-    paths: ['environments/**/config.yaml']
+    paths: ['environments/**', 'scripts/cd/**', 'scripts/run-cd.py']
   workflow_dispatch:
     inputs:
       environment_name:
-        description: 'Environment name to deploy (subdirectory under environments/). Leave empty to deploy all changed environments.'
+        description: 'Environment directory to reconcile; leave empty for all environments'
         required: false
         type: string
 
@@ -15,36 +15,32 @@ permissions:
   contents: read
   actions: read
 
+concurrency:
+  group: nifi-environment-cd
+  queue: max
+  cancel-in-progress: false
+
 jobs:
   detect:
     runs-on: ubuntu-latest
     outputs:
-      environments: ${{ steps.diff.outputs.items }}
-      has_changes: ${{ steps.diff.outputs.has_changes }}
+      environments: ${{ steps.detect.outputs.items }}
+      has_changes: ${{ steps.detect.outputs.has_changes }}
     steps:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
-
-      - name: Detect changed environments
-        id: diff
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - run: pip install pyyaml
+      - name: Select environments
+        id: detect
         env:
           GITHUB_TOKEN: ${{ github.token }}
-        run: |
-          pip install pyyaml -q
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ inputs.environment_name }}" ]; then
-            ENV="${{ inputs.environment_name }}"
-            CONFIG="environments/${ENV}/config.yaml"
-            if [ ! -f "$CONFIG" ]; then
-              echo "Error: $CONFIG not found" >&2
-              exit 1
-            fi
-            GITHUB_ENV_NAME=$(python -c "import yaml; c=yaml.safe_load(open('$CONFIG')); print(c['account']['github_environment'])")
-            echo "items=[{\"config_env\":\"${ENV}\",\"github_env\":\"${GITHUB_ENV_NAME}\"}]" >> "$GITHUB_OUTPUT"
-            echo "has_changes=true" >> "$GITHUB_OUTPUT"
-          else
-            python scripts/cd/detect_environments.py "$GITHUB_OUTPUT"
-          fi
+          INPUT_ENVIRONMENT: ${{ inputs.environment_name }}
+          MANUAL_RUN: ${{ github.event_name == 'workflow_dispatch' }}
+        run: python scripts/cd/detect_environments.py "$GITHUB_OUTPUT"
 
   apply:
     needs: detect
@@ -55,48 +51,19 @@ jobs:
       matrix:
         item: ${{ fromJSON(needs.detect.outputs.environments) }}
     environment: ${{ matrix.item.github_env }}
-
+    env:
+      NIFI_TOKEN: ${{ secrets.NIFI_TOKEN }}
+      NIFI_USERNAME: ${{ vars.NIFI_USERNAME }}
+      NIFI_PASSWORD: ${{ secrets.NIFI_PASSWORD }}
+      NIFI_VERIFY_SSL: ${{ vars.NIFI_VERIFY_SSL || 'true' }}
+      GH_SECRETS_JSON: ${{ toJSON(secrets) }}
+      GH_VARS_JSON: ${{ toJSON(vars) }}
+      CONFIG_ENV: ${{ matrix.item.config_env }}
     steps:
       - uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
-
-      - name: Set up Python
-        uses: actions/setup-python@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
-
-      - name: Install Snowflake CLI
-        uses: snowflakedb/snowflake-cli-action@v2.0
-
-      - name: Install dependencies
-        run: pip install -r scripts/cd/requirements-cd.txt
-
-      - name: Compute diff
-        env:
-          SNOWFLAKE_ACCOUNT_URL: ${{ vars.SNOWFLAKE_ACCOUNT_URL }}
-          SNOWFLAKE_USER: ${{ vars.SNOWFLAKE_USER }}
-          SNOWFLAKE_PAT: ${{ secrets.SNOWFLAKE_PAT }}
-          SNOWFLAKE_ROLE: ${{ vars.SNOWFLAKE_ROLE }}
-          NIFI_RUNTIME_PAT: ${{ secrets.NIFI_RUNTIME_PAT }}
-        run: |
-          cd scripts/cd
-          python describe_live_state.py ../../environments/${{ matrix.item.config_env }}/config.yaml > /tmp/live-state.json
-          python diff_live.py /tmp/live-state.json ../../environments/${{ matrix.item.config_env }}/config.yaml > /tmp/live-diff.json
-          python translate_live_diff.py /tmp/live-diff.json > /tmp/changes.json
-          echo "--- Change Plan ---"
-          cat /tmp/changes.json
-
-      - name: Apply changes
-        env:
-          SNOWFLAKE_ACCOUNT_URL: ${{ vars.SNOWFLAKE_ACCOUNT_URL }}
-          SNOWFLAKE_USER: ${{ vars.SNOWFLAKE_USER }}
-          SNOWFLAKE_PAT: ${{ secrets.SNOWFLAKE_PAT }}
-          SNOWFLAKE_ROLE: ${{ vars.SNOWFLAKE_ROLE }}
-          NIFI_RUNTIME_PAT: ${{ secrets.NIFI_RUNTIME_PAT }}
-          NIFIHUB_REGISTRY_PAT: ${{ secrets.NIFIHUB_REGISTRY_PAT }}
-          GH_SECRETS_JSON: ${{ toJSON(secrets) }}
-          GH_VARS_JSON: ${{ toJSON(vars) }}
-        run: |
-          cd scripts/cd
-          python orchestrate.py /tmp/changes.json ../../environments/${{ matrix.item.config_env }}/config.yaml
+      - run: pip install -r scripts/cd/requirements-cd.txt
+      - name: Reconcile NiFi resources
+        run: python scripts/run-cd.py "environments/$CONFIG_ENV/config.yaml"

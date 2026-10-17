@@ -1,10 +1,10 @@
 # Data Generator for CDC Postgres Demo
 
-Simulates random data generation with INSERTs, UPDATEs and DELETEs across 3 tables (`customers`, `orders`, `order_items`). Use in combination with the CDC PostgreSQL Connector.
+Simulates random data generation with INSERTs, UPDATEs and DELETEs across 3 tables (`customers`, `orders`, `order_items`). Use it with a PostgreSQL CDC consumer.
 
 ## How It Works
 
-The flow automatically creates the required Postgres schema, tables, and publication on first run via an init ExecuteScript processor. No manual SQL setup is needed.
+The flow automatically creates the required Postgres schema, tables, and publication on first run via an initialization PutSQL processor. No manual SQL setup is needed.
 
 ## Parameters
 
@@ -20,4 +20,4 @@ The flow automatically creates the required Postgres schema, tables, and publica
 
 ## Deployment
 
-Deploy via `environments/example/config.yaml` using the nifihub CD pipeline. See the [environments README](../../environments/README.md) for details.
+Import the JSON into an existing Apache NiFi instance, or add it to the flows in an environment YAML. Configure the PostgreSQL JDBC driver asset and connection parameters. The integration test YAML uses `POSTGRES_URL` and `POSTGRES_PASSWORD` from a GitHub Environment; the NiFi instance must be able to reach PostgreSQL. See the [configuration reference](../../environments/README.md).

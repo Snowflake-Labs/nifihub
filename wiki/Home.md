@@ -11,9 +11,9 @@ A community-driven repository of independently-versioned Apache NiFi extension b
 | Understand how this repo works | [Introduction & Concepts](Introduction-and-Concepts) |
 | Learn how flows are versioned with Git | [GitHub Registry Client](Introduction-and-Concepts--GitHub-Registry-Client) |
 | Understand what CI checks run on PRs | [CI Pipeline](Introduction-and-Concepts--CI) |
-| Deploy NiFi infrastructure declaratively | [CD Pipeline](Introduction-and-Concepts--CD) |
+| Manage NiFi resources declaratively | [CD Pipeline](Introduction-and-Concepts--CD) |
 | Run the CD pipeline locally or against a local NiFi | [Running CD Locally](How-to-Run-CD-Locally) |
-| Use the pipeline with a non-Snowflake NiFi instance | [Non-SOM Runtimes](Introduction-and-Concepts--Non-SOM-Runtimes) |
+| Connect an existing Apache NiFi instance | [NiFi Runtimes](Introduction-and-Concepts--NiFi-Runtimes) |
 | Download a NAR or import a flow | [How to Use This Repo](How-to-Use-This-Repo) |
 | Add a new extension bundle or flow | [How to Contribute](How-to-Contribute) |
 | Browse processor and controller service docs | [Components](Components) |
@@ -25,6 +25,6 @@ A community-driven repository of independently-versioned Apache NiFi extension b
 
 **Extension Bundles** (`extensions/`) — Reusable NiFi processors, controller services, and reporting tasks packaged as NARs. Each bundle has its own version and release lifecycle and is published to GitHub Releases as a downloadable NAR.
 
-**Flow Definitions** (`flows/`) — Versioned NiFi flow definitions exported as JSON, with companion documentation and automated validation tests. Flows can be imported directly into NiFi or deployed to a Snowflake Openflow runtime.
+**Flow Definitions** (`flows/`) — Versioned NiFi flow definitions exported as JSON, with companion documentation and automated validation tests. Flows can be imported directly into NiFi or deployed to an Apache NiFi instance.
 
-**Environments** (`environments/`) — GitOps configuration for managing Openflow deployments, runtimes, and flow assignments declaratively. Changes to `config.yaml` files are automatically applied to Snowflake via GitHub Actions.
+**Environments** (`environments/`) — GitOps configuration for managing NiFi resources, runtimes, and flow assignments declaratively. Changes to `config.yaml` files are automatically applied to the configured NiFi instances via GitHub Actions.

@@ -1,75 +1,59 @@
-# Environments — Openflow as Code
+# Environments — Apache NiFi resource configuration
 
-> **Disclaimer:** The contents of this repository are community-driven and provided on an "AS IS" basis, without warranties of any kind, express or implied. They are NOT supported by Snowflake and do not constitute a Snowflake product or service. Snowflake makes no guarantees regarding functionality, compatibility, availability, or fitness for any particular purpose, and assumes no liability arising from use of this repository. Community support is available through GitHub Issues and Pull Requests.
+Each `environments/<name>/config.yaml` describes resources on existing NiFi
+instances. Servers, clusters, storage, networking, and operating-system Python
+installations are managed outside NiFi Hub.
 
-Declarative management of Openflow deployments, runtimes, and flows via YAML configuration.
+## Environment and runtime
 
-## Directory Structure
-
+```yaml
+name: development
+github_environment: development
+runtimes:
+  - name: primary
+    url: https://nifi.example.com:8443
+    reconcile: true
 ```
-environments/
-  schema.json                    # JSON Schema for validation
-  <env-name>/
-    config.yaml                  # Environment configuration
+
+`runtimes` is required and must contain at least one entry. Each entry requires a
+unique `name` and HTTP(S) `url`. The URL may end in `/nifi` or `/nifi-api`; it must
+not contain credentials, query parameters, or a fragment. `name` and
+`github_environment` at the top level are optional; GitHub Environment selection
+defaults to the config directory name. `reconcile: false` skips reads and writes
+for that instance. A removed runtime is simply no longer managed.
+
+Runtime resource keys are `flow_registries`, `controller_services`,
+`root_pg_controller_services`, `parameter_providers`, `root_parameter_context`,
+and `flows`. An omitted list leaves that scope untouched. A declared list is
+authoritative: entries absent from it are removed, and an explicit empty list
+removes all resources in that scope. The root process group is the managed flow
+scope. Use a dedicated instance or declare all resources in a managed scope.
+
+## Authentication and TLS
+
+By default, set `NIFI_USERNAME` and `NIFI_PASSWORD`, or supply `NIFI_TOKEN` for an
+existing bearer token. For different credentials per instance:
+
+```yaml
+nifi_auth:
+  type: username_password
+  username: ${{ vars.NIFI_USERNAME }}
+  password: ${{ secrets.NIFI_PASSWORD }}
+  verify_ssl: true
 ```
 
-Each `config.yaml` defines one Snowflake account's Openflow resources. Changes merged to `main` are automatically applied by the **Environment CD** workflow.
+The explicit block overrides environment authentication. `verify_ssl` accepts
+`true`, `false` for local development, or a CA bundle path. Without an explicit
+setting, `NIFI_VERIFY_SSL` is used and defaults to `true`. Authentication requires
+HTTPS. Local unsecured HTTP works without credentials. NiFi API permissions must
+allow reading and modifying the resources declared by the configuration.
 
-## YAML Schema Reference
+`${{ vars.NAME }}` and `${{ secrets.NAME }}` resolve from the selected GitHub
+Environment. Locally, set `GH_VARS_JSON` and `GH_SECRETS_JSON` instead. Secrets are
+not compared in the change plan; declared resources are reconciled on every run
+so secret changes and `version: latest` can be applied.
 
-### Account
-
-| Field | Required | Description |
-|-------|----------|-------------|
-| `name` | Yes | Human-readable account name (used in logs and comments) |
-| `github_environment` | Yes | GitHub Environment name that holds secrets for this account |
-
-### Deployment
-
-Only one deployment per account is allowed.
-
-| Field | Required | Description |
-|-------|----------|-------------|
-| `name` | Yes | Snowflake identifier (uppercase, pattern: `^[A-Z][A-Z0-9_-]{0,254}$`) |
-| `deployment_type` | Yes | Must be `SNOWFLAKE` (SPCS) |
-| `display_name` | No | Free-text alias shown in the Openflow UI (max 256 chars) |
-| `comment` | No | Description (max 1024 chars) |
-| `runtimes` | No | Array of runtime definitions |
-
-### Runtime
-
-| Field | Required | Description |
-|-------|----------|-------------|
-| `name` | Yes | Snowflake identifier (uppercase, pattern: `^[A-Z][A-Z0-9_-]{0,254}$`) |
-| `database` | Yes | Database where the runtime is scoped |
-| `schema` | Yes | Schema where the runtime is scoped |
-| `url` | No | NiFi runtime URL (without `/nifi-api` suffix). When set, SOM SQL-based lifecycle management is skipped entirely — only NiFi API operations are performed. Use this for pre-provisioned or non-SOM runtimes. |
-| `node_type` | No | `SMALL`, `MEDIUM`, or `LARGE` |
-| `min_nodes` | No | Minimum node count (1-50) |
-| `max_nodes` | No | Maximum node count (1-50) |
-| `suspend` | No | When `true`, runtime is suspended after creation. Defaults to `false`. |
-| `reconcile` | No | When `false`, CD skips NiFi-level reconciliation (flows, parameters, registries, controller services). Infrastructure (SQL-level) is still managed. Defaults to `true`. |
-| `sensitive_param_pattern` | No | Regex pattern to classify parameters from the auto-provisioned Snowflake Parameter Provider as sensitive. Parameters matching this pattern are marked `SENSITIVE`; others are `NON_SENSITIVE`. Defaults to `.*` (all sensitive). |
-| `execute_as_role` | No | Role that connectors and runtime operations use for Snowflake data access |
-| `display_name` | No | Free-text alias (max 256 chars) |
-| `comment` | No | Description (max 1024 chars) |
-| `network_rules` | No | Array of network rule definitions |
-| `flow_registries` | No | Array of Flow Registry Client definitions |
-| `controller_services` | No | Array of controller-level services — visible to parameter providers and reporting tasks; shared across the entire NiFi instance. See [Controller Services](#controller-services). |
-| `root_pg_controller_services` | No | Array of root process group-scoped services — accessible to all flow processors deployed to this runtime. See [Controller Services](#controller-services). |
-| `root_parameter_context` | No | Parameter context managed on the root process group: inherited provider contexts, shared non-sensitive parameters, and assets for root-PG controller services. See [Root Parameter Context](#root-parameter-context). |
-| `parameter_providers` | No | Array of parameter provider definitions |
-| `flows` | No | Array of flow definitions |
-| `connectors` | No | Array of Openflow connector definitions |
-
-### Network Rule
-
-| Field | Required | Description |
-|-------|----------|-------------|
-| `name` | Yes | Snowflake identifier (uppercase, pattern: `^[A-Z][A-Z0-9_-]{0,254}$`) |
-| `type` | Yes | Must be `HOST_PORT` |
-| `mode` | Yes | Must be `EGRESS` |
-| `values` | Yes | Array of host:port strings (at least one required) |
+## Resource reference
 
 ### Flow Registry Client
 
@@ -81,52 +65,29 @@ Only one deployment per account is allowed.
 
 ### Controller Services
 
-NiFi has two scopes for controller services. Use the right key depending on what needs to reference the service:
+`controller_services` creates controller-scoped services for parameter providers
+and reporting tasks. `root_pg_controller_services` creates shared services in the
+root process group for use by processors in child flows. Both accept `name`,
+fully qualified `type`, optional `bundle` (`group`, `artifact`, `version`), and
+`properties`. Secret and variable references are resolved before writing.
+Controller service names in provider properties resolve to their current UUIDs.
 
 ```yaml
-# These fields belong inside a runtime definition.
-controller_services:
-  - name: SnowflakeConnection
-    type: com.snowflake.openflow.runtime.services.snowflake.SnowflakeConnectionService
-    properties:
-      Authentication Strategy: SNOWFLAKE_MANAGED
-
 root_pg_controller_services:
   - name: SharedSSLContext
     type: org.apache.nifi.ssl.StandardRestrictedSSLContextService
     properties:
-      TrustStore Filename: /etc/ssl/certs/ca-certificates.crt
+      TrustStore Filename: /etc/nifi/truststore.jks
       TrustStore Type: JKS
-      Keystore Password: ${{ secrets.KEYSTORE_PASSWORD }}
+      TrustStore Password: ${{ secrets.TRUSTSTORE_PASSWORD }}
 ```
-
-> **`controller_services`** — Created at the NiFi controller level (`POST /controller/controller-services`). Visible to parameter providers and reporting tasks across the entire instance. Use this when a service must be referenced by a **parameter provider** (e.g. `SnowflakeConnectionService` consumed by `SnowflakeParameterProvider`). Controller service names in parameter provider `properties` are automatically resolved to their NiFi UUIDs at apply time.
->
-> **`root_pg_controller_services`** — Created inside the root process group (`POST /process-groups/root/controller-services`). Accessible to processors in all flows deployed to this runtime, but not visible outside the process group hierarchy. Use this for services shared across multiple flows that do not need to be at the NiFi controller level (e.g. `StandardRestrictedSSLContextService`, `StandardHttpContextMap`).
-
-Both keys accept the same object structure:
-
-| Field | Required | Description |
-|-------|----------|-------------|
-| `name` | Yes | Controller service name in NiFi (unique identity for reconciliation) |
-| `type` | Yes | Fully-qualified Java type |
-| `bundle.group` | No | Exact NiFi bundle group coordinate to use when type lookup is ambiguous |
-| `bundle.artifact` | No | Exact NiFi bundle artifact coordinate |
-| `bundle.version` | No | Exact NiFi bundle version coordinate |
-| `properties` | No | Key-value configuration properties |
-
-When `bundle` is omitted, NiFi infers the implementation from `type`. When `bundle` is provided, all three fields are required and are passed through unchanged during creation. For an existing controller service, `bundle` is creation-time selection only; NiFi Hub does not attempt to switch an existing service to a different bundle.
 
 ### Root Parameter Context
 
 Use `root_parameter_context` when root process group controller services need parameters: secrets coming from a parameter provider, shared values reused across services, or files such as a JDBC driver.
 
 ```yaml
-parameter_providers:
-  - name: SnowflakeSecrets
-    type: com.snowflake.openflow.runtime.parameter.snowflake.SnowflakeParameterProvider
-    properties:
-      Snowflake Connection Service: SnowflakeConnection
+# Assumes an explicitly configured NiFi parameter provider exposes a context named Postgres.
 
 root_parameter_context:
   provided_parameter_contexts: ".*POSTGRES"
@@ -149,7 +110,7 @@ root_pg_controller_services:
 
 | Field | Required | Description |
 |-------|----------|-------------|
-| `provided_parameter_contexts` | No | Regex matched (full match) against parameter provider context names, including the auto-provisioned Snowflake provider. Matching contexts are added as inherited contexts of the root context. Inheritance is additive: existing inherited contexts are never removed. |
+| `provided_parameter_contexts` | No | Regex matched (full match) against parameter provider context names. Matching contexts are added as inherited contexts of the root context. Inheritance is additive: existing inherited contexts are never removed. |
 | `parameters` | No | Non-sensitive parameters created or updated directly in the root context. Values support `${{ vars.NAME }}`; `${{ secrets.NAME }}` is rejected because these parameters are stored in NiFi as non-sensitive values. Use provided parameter contexts for secrets. `null` clears the value; omitted parameters are left untouched. Existing sensitive or asset-bound parameters with the same name are rejected. |
 | `assets` | No | Files downloaded and uploaded as assets, each bound to a non-sensitive parameter. Same shape as flow `assets`. A parameter may not be declared in both `parameters` and `assets`. |
 
@@ -238,160 +199,34 @@ Rules and behavior:
 | `url` | Yes | URL to download the asset file from |
 | `parameter` | Yes | Parameter name to bind this asset to |
 
-### Connector
+## Running the pipeline
 
-| Field | Required | Description |
-|-------|----------|-------------|
-| `name` | Yes | Snowflake identifier (uppercase, pattern: `^[A-Z][A-Z0-9_-]{0,254}$`) |
-| `definition` | Yes | Connector definition name (e.g. `OPENFLOW_POSTGRES_CDC`) |
-| `display_name` | No | Free-text alias (max 256 chars) |
-| `comment` | No | Description (max 1024 chars) |
-| `start` | No | If `true`, start the connector after configuration. Defaults to `false`. |
-| `parameters` | No | Parameter values for the connector config. Keys are property names. For `STRING_LITERAL`: value is set directly. For `SECRET_REFERENCE`: value is the fully qualified secret name (e.g. `MY_DATABASE.MY_SCHEMA.SECRET_NAME`). For `ASSET_REFERENCE`: handled via the `assets` array. |
-| `assets` | No | Array of files to upload to the connector stage. |
-
-#### Connector Asset
-
-| Field | Required | Description |
-|-------|----------|-------------|
-| `name` | Yes | Filename for the asset in the connector stage |
-| `url` | Yes | URL to download the asset file from |
-| `parameter` | Yes | `ASSET_REFERENCE` parameter name to bind this asset to |
-
-## Full Example
-
-```yaml
-account:
-  name: example
-  github_environment: example
-
-deployments:
-  - name: MY_DEPLOYMENT
-    deployment_type: SNOWFLAKE
-    display_name: "My Deployment"
-    runtimes:
-      - name: MY_RUNTIME
-        database: OPENFLOW
-        schema: OPENFLOW
-        node_type: SMALL
-        min_nodes: 1
-        max_nodes: 1
-        execute_as_role: OPENFLOW_RUNTIME_ROLE
-        sensitive_param_pattern: ".*PASSWORD.*|.*SECRET.*|.*_KEY"
-        network_rules:
-          - name: GITHUB_API
-            type: HOST_PORT
-            mode: EGRESS
-            values:
-              - "api.github.com:443"
-        flow_registries:
-          - name: nifihub
-            type: org.apache.nifi.github.GitHubFlowRegistryClient
-            properties:
-              Repository Owner: Snowflake-Labs
-              Repository Name: nifihub
-              Authentication Type: PERSONAL_ACCESS_TOKEN
-              Personal Access Token: ${{ secrets.NIFIHUB_REGISTRY_PAT }}
-              Default Branch: main
-              Repository Path: flows
-        root_parameter_context:
-          provided_parameter_contexts: ".*POSTGRES"
-          assets:
-            - name: "postgresql-42.7.10.jar"
-              url: "https://jdbc.postgresql.org/download/postgresql-42.7.10.jar"
-              parameter: "Database Driver"
-        root_pg_controller_services:
-          - name: SharedDBCPConnectionPool
-            type: org.apache.nifi.dbcp.DBCPConnectionPool
-            bundle:
-              group: org.apache.nifi
-              artifact: nifi-dbcp-service-nar
-              version: 2.9.0
-            properties:
-              Database Connection URL: "jdbc:postgresql://postgres.example.com:5432/mydb"
-              Database Driver Class Name: org.postgresql.Driver
-              Database Driver Locations: "#{Database Driver}"
-              Database User: my_user
-              Password: "#{POSTGRES_PWD}"
-        flows:
-          - name: "CDC Postgres Demo - Data Generator"
-            bucket: data-generator
-            flow: postgres-cdc-demo
-            version: latest
-            start: true
-            service_bindings:
-              - target: ExecuteSQLStatement
-                properties:
-                  Connection Pooling Service: SharedDBCPConnectionPool
-            provided_parameter_contexts: ".*"
-            parameters:
-              My Parameter: "some value"
+```bash
+python scripts/cd/validate_pr.py environments/local/config.yaml environments/schema.json
+python scripts/run-cd.py environments/local/config.yaml --dry-run
+python scripts/run-cd.py environments/local/config.yaml
 ```
 
-## SOM vs Non-SOM
+The pipeline validates configuration, reads live NiFi state, computes a resource
+diff, translates it, and applies it. Registry clients, controller-scoped services,
+parameter providers, the root parameter context, root process-group services, and
+flows are reconciled in that order. Flow assets, parameters, and service bindings
+are configured before the requested start/stop state. Required NARs must already
+be installed. Unreadable live state blocks reconciliation; one instance's apply
+failure does not prevent other instances from being attempted.
 
-**SOM-enabled accounts** (default): The pipeline manages the full lifecycle via Snowflake SQL (`CREATE/ALTER/DROP OPENFLOW DEPLOYMENT/RUNTIME/CONNECTOR`, network rules, EAIs). Declare runtimes with `node_type`, `min_nodes`, `max_nodes`.
+## Migrating older configurations
 
-**Non-SOM accounts** (URL-managed): Set `url` on a runtime to point at an existing NiFi endpoint. All SOM SQL operations are skipped. Only NiFi API operations (registries, flows, parameters, controller services) are performed.
+Move each entry from `deployments[].runtimes` to the top-level `runtimes` list and
+give it an explicit NiFi `url`. Move `account.github_environment` to top-level
+`github_environment`, and optionally move `account.name` to `name`.
 
-```yaml
-runtimes:
-  - name: MY_RUNTIME
-    database: OPENFLOW
-    schema: OPENFLOW
-    url: "https://of--my-account.snowflakecomputing.app/my-runtime"
-    flows:
-      - name: "My Flow"
-        bucket: examples
-        flow: hello-world
-        version: latest
-```
+Remove deployment, database/schema, node sizing, suspension, network-rule,
+connector, and infrastructure role fields. These fields are rejected by the new
+schema. Rename authentication variables to `NIFI_USERNAME` / `NIFI_PASSWORD` or
+`NIFI_TOKEN`; flow integration tests use `NIFI_URL`. Declare parameter providers
+explicitly; there is no automatic platform-specific provider lookup.
 
-## GitHub Environment Secrets
-
-Each environment requires a GitHub Environment with the following secrets and variables:
-
-| Name | Type | Description |
-|------|------|-------------|
-| `SNOWFLAKE_ACCOUNT_URL` | Variable | Snowflake account URL (e.g. `https://myorg-myaccount.snowflakecomputing.com`) |
-| `SNOWFLAKE_USER` | Variable | Snowflake user for PAT-based authentication |
-| `SNOWFLAKE_ROLE` | Variable | Role for SOM operations (e.g. `OPENFLOW_ADMIN`) |
-| `SNOWFLAKE_PAT` | Secret | Programmatic Access Token for Snowflake SQL operations |
-| `NIFI_RUNTIME_PAT` | Secret | Programmatic Access Token for NiFi REST API calls |
-| `NIFIHUB_REGISTRY_PAT` | Secret | GitHub PAT for Flow Registry Client (needs repo read access) |
-
-Additional secrets/variables can be referenced in `config.yaml` using `${{ secrets.NAME }}` or `${{ vars.NAME }}` syntax — they are resolved from the same GitHub Environment at deploy time.
-
-## Prerequisites
-
-Before adding an environment, ensure the Snowflake account has the required grants:
-
-```sql
-USE ROLE ACCOUNTADMIN;
-
-GRANT CREATE OPENFLOW DEPLOYMENT ON ACCOUNT TO ROLE OPENFLOW_ADMIN;
-GRANT CREATE OPENFLOW RUNTIME ON SCHEMA <database>.<schema> TO ROLE OPENFLOW_ADMIN;
-GRANT CREATE COMPUTE POOL ON ACCOUNT TO ROLE OPENFLOW_ADMIN;
-GRANT CREATE NETWORK RULE ON SCHEMA <database>.<schema> TO ROLE OPENFLOW_ADMIN;
-GRANT CREATE INTEGRATION ON ACCOUNT TO ROLE OPENFLOW_ADMIN;
-```
-
-## Adding a New Environment
-
-1. Create `environments/<name>/config.yaml` using `schema.json` for validation
-2. Create a GitHub Environment named `<name>` with the required secrets
-3. Open a PR — the **Environment CD Validate** check will show a change plan
-4. Merge — the **Environment CD** workflow creates all resources
-
-## Modifying Resources
-
-Edit the YAML and merge. The workflow detects changes via live state diffing and runs the appropriate `ALTER` commands.
-
-## Removing Resources
-
-Remove entries from the YAML and merge. The workflow runs the full delete lifecycle:
-- **Flows**: stop process group, delete
-- **Connectors**: STOP -> TERMINATE -> DROP
-- **Runtimes**: SUSPEND -> TERMINATE -> DROP
-- **EAIs / Network Rules**: DROP
-- **Deployments**: TERMINATE -> DROP
+Java package names and Maven coordinates retain their original values, preserving
+compatibility with existing released NARs and flow snapshots. Changing the
+configuration format does not migrate or delete any running infrastructure.

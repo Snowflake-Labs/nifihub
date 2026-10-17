@@ -263,10 +263,10 @@ class TestInitSQL:
     @pytest.fixture
     def init_sql(self, processors):
         sql_procs = [p for p in processors
-                     if "ExecuteSQLStatement" in p["type"]]
+                     if p["type"] == "org.apache.nifi.processors.standard.PutSQL"]
         if not sql_procs:
-            pytest.skip("No ExecuteSQLStatement processor found")
-        return sql_procs[0]["properties"].get("SQL", "")
+            pytest.fail("Apache NiFi PutSQL initialization processor is required")
+        return sql_procs[0]["properties"]["SQL Statement"]
 
     def test_creates_schema(self, init_sql):
         assert "CREATE SCHEMA IF NOT EXISTS" in init_sql
@@ -311,18 +311,17 @@ except ImportError:
 
 @pytest.fixture(scope="module")
 def nifi_runtime():
-    url = os.environ.get("SNOWFLAKE_RUNTIME_URL", "")
-    pat = os.environ.get("SNOWFLAKE_RUNTIME_PAT", "")
-    if not url or not pat:
-        pytest.skip("No runtime URL/PAT — skipping runtime tests")
+    url = os.environ.get("NIFI_URL", "")
+    if not url or not os.environ.get("DEPLOYED_PG_ID"):
+        pytest.skip("Set NIFI_URL and DEPLOYED_PG_ID to run integration tests")
     if nipyapi is None:
         pytest.skip("nipyapi not available")
-    api_url = url.rstrip("/")
-    if not api_url.endswith("/nifi-api"):
-        api_url += "/nifi-api"
-    nipyapi.config.nifi_config.host = api_url
-    nipyapi.config.nifi_config.api_key["bearerAuth"] = f"Bearer {pat}"
-    nipyapi.config.nifi_config.api_client = None
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "scripts/cd"))
+    from manage_flows import configure_nifi
+    from nifi_config import get_nifi_auth
+    configure_nifi(url, pat=os.environ.get("NIFI_TOKEN", ""), nifi_auth=get_nifi_auth())
     return nipyapi
 
 

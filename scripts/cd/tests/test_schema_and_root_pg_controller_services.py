@@ -27,24 +27,11 @@ SCHEMA_PATH = os.path.join(REPO_ROOT, "environments", "schema.json")
 
 
 def _base_config():
-    return {
-        "account": {"name": "example", "github_environment": "example"},
-        "deployments": [{
-            "name": "MY_DEPLOYMENT",
-            "deployment_type": "SNOWFLAKE",
-            "runtimes": [{
-                "name": "MY_RUNTIME",
-                "database": "OPENFLOW",
-                "schema": "OPENFLOW",
-                "flows": [{
-                    "name": "Example Flow",
-                    "bucket": "examples",
-                    "flow": "hello-world",
-                    "version": "latest",
-                }],
-            }],
-        }],
-    }
+    return {"name": "example", "github_environment": "example", "runtimes": [{
+        "name": "MY_RUNTIME", "url": "https://nifi.example.test:8443",
+        "flows": [{"name": "Example Flow", "bucket": "examples", "flow": "hello-world", "version": "latest"}],
+    }]}
+
 
 
 def _validate(config):
@@ -68,7 +55,7 @@ def test_existing_flow_shape_remains_valid():
 
 def test_root_parameter_context_shape_is_valid():
     config = _base_config()
-    config["deployments"][0]["runtimes"][0]["root_parameter_context"] = {
+    config["runtimes"][0]["root_parameter_context"] = {
         "provided_parameter_contexts": ".*POSTGRES",
         "parameters": {"Shared Query Timeout": "30 sec"},
         "assets": [{
@@ -89,19 +76,19 @@ def test_root_parameter_context_rejects_empty_asset_identity_fields(field):
         "parameter": "Database Driver",
     }
     asset[field] = ""
-    config["deployments"][0]["runtimes"][0]["root_parameter_context"] = {"assets": [asset]}
+    config["runtimes"][0]["root_parameter_context"] = {"assets": [asset]}
     assert _validate(config)
 
 
 def test_root_parameter_context_rejects_unknown_keys():
     config = _base_config()
-    config["deployments"][0]["runtimes"][0]["root_parameter_context"] = {"unexpected": True}
+    config["runtimes"][0]["root_parameter_context"] = {"unexpected": True}
     assert any("Additional properties are not allowed" in message for message in _validate(config))
 
 
 def test_validate_root_parameter_context_rejects_duplicate_names_parameters_and_overlap(import_cd_module):
     config = _base_config()
-    config["deployments"][0]["runtimes"][0]["root_parameter_context"] = {
+    config["runtimes"][0]["root_parameter_context"] = {
         "parameters": {"Driver A": "literal"},
         "assets": [
             {"name": "driver.jar", "url": "https://example.invalid/a", "parameter": "Driver A"},
@@ -117,7 +104,7 @@ def test_validate_root_parameter_context_rejects_duplicate_names_parameters_and_
 
 def test_validate_root_parameter_context_rejects_secret_refs_in_direct_parameters(import_cd_module):
     config = _base_config()
-    config["deployments"][0]["runtimes"][0]["root_parameter_context"] = {
+    config["runtimes"][0]["root_parameter_context"] = {
         "parameters": {"Shared Query Timeout": "${{ secrets.QUERY_TIMEOUT }}"},
     }
     module = import_cd_module("validate_pr")
@@ -133,7 +120,7 @@ def test_validate_root_parameter_context_rejects_secret_refs_in_direct_parameter
 
 def test_service_bindings_require_explicit_start():
     config = _base_config()
-    config["deployments"][0]["runtimes"][0]["flows"][0]["service_bindings"] = [{
+    config["runtimes"][0]["flows"][0]["service_bindings"] = [{
         "target": "Parse Records",
         "properties": {"Record Reader": "Shared Reader"},
     }]
@@ -143,7 +130,7 @@ def test_service_bindings_require_explicit_start():
 
 def test_service_bindings_allow_optional_bundle_and_null_removal():
     config = _base_config()
-    runtime = config["deployments"][0]["runtimes"][0]
+    runtime = config["runtimes"][0]
     runtime["root_pg_controller_services"] = [{
         "name": "Shared Reader",
         "type": "org.apache.nifi.json.JsonTreeReader",
@@ -167,7 +154,7 @@ def test_service_bindings_allow_optional_bundle_and_null_removal():
 
 def test_service_bindings_reject_non_string_values():
     config = _base_config()
-    flow = config["deployments"][0]["runtimes"][0]["flows"][0]
+    flow = config["runtimes"][0]["flows"][0]
     flow["start"] = True
     flow["service_bindings"] = [{
         "target": "Parse Records",
@@ -179,7 +166,7 @@ def test_service_bindings_reject_non_string_values():
 
 def test_service_bindings_reject_empty_string_service_name():
     config = _base_config()
-    flow = config["deployments"][0]["runtimes"][0]["flows"][0]
+    flow = config["runtimes"][0]["flows"][0]
     flow["start"] = True
     flow["service_bindings"] = [{
         "target": "Parse Records",
@@ -191,7 +178,7 @@ def test_service_bindings_reject_empty_string_service_name():
 
 def test_controller_service_bundle_must_be_complete():
     config = _base_config()
-    runtime = config["deployments"][0]["runtimes"][0]
+    runtime = config["runtimes"][0]
     runtime["root_pg_controller_services"] = [{
         "name": "Shared Reader",
         "type": "org.apache.nifi.json.JsonTreeReader",

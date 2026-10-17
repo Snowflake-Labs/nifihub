@@ -128,81 +128,65 @@ def test_diff_separates_health_from_start_and_blocks_unknown_live_reads():
 
 
 def test_translate_and_render_include_service_binding_changes():
-    live_diff = {
-        "account": {"name": "example"},
-        "deployments": {
-            "unchanged": [],
-            "to_create": [],
-            "to_delete": [],
-            "to_modify": [{
-                "name": "MY_DEPLOYMENT",
-                "dep_changes": {},
-                "runtimes": {
-                    "unchanged": [],
-                    "to_create": [],
-                    "to_delete": [],
-                    "url_managed": [],
-                    "to_modify": [{
-                        "name": "MY_RUNTIME",
-                        "live": {"status": "ACTIVE"},
-                        "desired": {"name": "MY_RUNTIME"},
-                        "diff": {
-                            "changed_fields": {},
-                            "network_rule_changes": {"created": [], "modified": [], "deleted": []},
-                            "connector_changes": {"created": [], "modified": [], "deleted": []},
-                            "nifi": {
-                                "controller_services": {"created": [], "modified": [], "deleted": [], "unchanged": []},
-                                "root_pg_controller_services": {"created": [], "modified": [], "deleted": [], "unchanged": []},
-                                "parameter_providers": {"created": [], "modified": [], "deleted": [], "unchanged": []},
-                                "flow_registries": {"created": [], "modified": [], "deleted": [], "unchanged": []},
-                                "flows": {"created": [], "modified": [{
-                                    "name": "Example Flow",
-                                    "changes": {"start": {"live": False, "desired": True}},
-                                    "live": {"running": False},
-                                    "desired": {"start": True},
-                                }], "deleted": [], "unchanged": []},
-                                "parameters": {},
-                                "service_bindings": {
-                                    "created": [],
-                                    "modified": [{
-                                        "flow": "Example Flow",
-                                        "target": "Parse Records",
-                                        "target_kind": "processor",
-                                        "process_group_path": "Example Flow",
-                                        "property": "Record Reader",
-                                        "live": "Legacy Reader",
-                                        "desired": "Shared Reader",
-                                        "action": "change",
-                                    }],
-                                    "deleted": [],
-                                    "unchanged": [],
-                                    "health": [{
-                                        "flow": "Example Flow",
-                                        "target": "Parse Records",
-                                        "status": "INVALID",
-                                        "messages": ["Controller service missing"],
-                                    }],
-                                    "blocked": [{
-                                        "flow": "Example Flow",
-                                        "target": "Reader | Lookup",
-                                        "status": "UNKNOWN",
-                                        "messages": ["HTTP 403 Forbidden", "bad | markdown `raw` <tag>"],
-                                    }],
-                                },
-                            },
-                        },
-                    }],
-                },
-            }],
-        },
-    }
+    live_diff = {'name': 'example',
+     'runtimes': {'unchanged': [],
+                  'to_modify': [{'name': 'MY_RUNTIME',
+                                 'live': {'status': 'ACTIVE'},
+                                 'desired': {'name': 'MY_RUNTIME'},
+                                 'diff': {'nifi': {'controller_services': {'created': [],
+                                                                           'modified': [],
+                                                                           'deleted': [],
+                                                                           'unchanged': []},
+                                                   'root_pg_controller_services': {'created': [],
+                                                                                   'modified': [],
+                                                                                   'deleted': [],
+                                                                                   'unchanged': []},
+                                                   'parameter_providers': {'created': [],
+                                                                           'modified': [],
+                                                                           'deleted': [],
+                                                                           'unchanged': []},
+                                                   'flow_registries': {'created': [],
+                                                                       'modified': [],
+                                                                       'deleted': [],
+                                                                       'unchanged': []},
+                                                   'flows': {'created': [],
+                                                             'modified': [{'name': 'Example Flow',
+                                                                           'changes': {'start': {'live': False,
+                                                                                                 'desired': True}},
+                                                                           'live': {'running': False},
+                                                                           'desired': {'start': True}}],
+                                                             'deleted': [],
+                                                             'unchanged': []},
+                                                   'parameters': {},
+                                                   'service_bindings': {'created': [],
+                                                                        'modified': [{'flow': 'Example Flow',
+                                                                                      'target': 'Parse Records',
+                                                                                      'target_kind': 'processor',
+                                                                                      'process_group_path': 'Example Flow',
+                                                                                      'property': 'Record Reader',
+                                                                                      'live': 'Legacy Reader',
+                                                                                      'desired': 'Shared Reader',
+                                                                                      'action': 'change'}],
+                                                                        'deleted': [],
+                                                                        'unchanged': [],
+                                                                        'health': [{'flow': 'Example Flow',
+                                                                                    'target': 'Parse Records',
+                                                                                    'status': 'INVALID',
+                                                                                    'messages': ['Controller service '
+                                                                                                 'missing']}],
+                                                                        'blocked': [{'flow': 'Example Flow',
+                                                                                     'target': 'Reader | Lookup',
+                                                                                     'status': 'UNKNOWN',
+                                                                                     'messages': ['HTTP 403 Forbidden',
+                                                                                                  'bad | markdown `raw` '
+                                                                                                  '<tag>']}]}}}}]}}
 
     translated = translate(live_diff)
-    runtime_mod = translated["deployments"]["modified"][0]["runtime_changes"]["modified"][0]
+    runtime_mod = translated["runtimes"]["modified"][0]
     assert runtime_mod["service_binding_changes"]["modified"][0]["desired"] == "Shared Reader"
     assert runtime_mod["service_binding_changes"]["blocked"][0]["messages"][0] == "HTTP 403 Forbidden"
 
-    rendered = format_nifi_section(live_diff["deployments"]["to_modify"][0]["runtimes"]["to_modify"][0]["diff"]["nifi"])
+    rendered = format_nifi_section(live_diff["runtimes"]["to_modify"][0]["diff"]["nifi"])
     assert any("Service Bindings" in line for line in rendered)
     assert any("Shared Reader" in line for line in rendered)
     assert any("start: False→True" in line for line in rendered)

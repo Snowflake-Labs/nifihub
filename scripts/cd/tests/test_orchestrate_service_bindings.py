@@ -20,31 +20,6 @@ import pytest
 
 
 def _orchestrate_stubs(call_order, flow_pg_lookup=None):
-    manage_deployment = types.SimpleNamespace(
-        create_deployment=lambda *args, **kwargs: None,
-        alter_deployment=lambda *args, **kwargs: None,
-        delete_deployment=lambda *args, **kwargs: None,
-        describe_deployment=lambda *args, **kwargs: None,
-        snow_sql=lambda *args, **kwargs: [],
-    )
-    manage_eai = types.SimpleNamespace(
-        create_runtime_eai=lambda *args, **kwargs: None,
-        delete_runtime_eai=lambda *args, **kwargs: None,
-        eai_name_for_runtime=lambda name: f"EAI_{name}",
-        namespaced_nr_name=lambda runtime_name, rule_name: f"{runtime_name}_{rule_name}",
-        create_network_rule=lambda *args, **kwargs: None,
-        alter_network_rule=lambda *args, **kwargs: None,
-        drop_network_rule=lambda *args, **kwargs: None,
-        drop_eai=lambda *args, **kwargs: None,
-    )
-    manage_runtime = types.SimpleNamespace(
-        create_runtime=lambda *args, **kwargs: None,
-        alter_runtime=lambda *args, **kwargs: None,
-        delete_runtime=lambda *args, **kwargs: None,
-        describe_runtime=lambda *args, **kwargs: None,
-        suspend_runtime=lambda *args, **kwargs: None,
-        resume_runtime=lambda *args, **kwargs: None,
-    )
     manage_parameters = types.SimpleNamespace(
         resolve_value=lambda value: value,
         reconcile_flow_parameters=lambda *args, **kwargs: call_order.append("parameters"),
@@ -79,29 +54,8 @@ def _orchestrate_stubs(call_order, flow_pg_lookup=None):
     manage_parameter_providers = types.SimpleNamespace(
         reconcile_parameter_providers=lambda *args, **kwargs: [],
         delete_parameter_providers=lambda *args, **kwargs: None,
-        fetch_auto_provisioned_provider=lambda *args, **kwargs: [],
-    )
-    manage_connectors = types.SimpleNamespace(
-        create_connector=lambda *args, **kwargs: None,
-        connector_exists=lambda *args, **kwargs: False,
-        describe_connector=lambda *args, **kwargs: None,
-        apply_connector_config=lambda *args, **kwargs: None,
-        get_connector_config=lambda *args, **kwargs: None,
-        put_connector_config=lambda *args, **kwargs: None,
-        upload_connector_asset=lambda *args, **kwargs: None,
-        download_asset=lambda *args, **kwargs: None,
-        start_connector=lambda *args, **kwargs: None,
-        stop_connector=lambda *args, **kwargs: None,
-        delete_connector=lambda *args, **kwargs: None,
-        get_connector_config_uri=lambda *args, **kwargs: None,
-        add_live_version=lambda *args, **kwargs: None,
-        commit_connector=lambda *args, **kwargs: None,
-        wait_for_connector=lambda *args, **kwargs: None,
     )
     return {
-        "manage_deployment": manage_deployment,
-        "manage_eai": manage_eai,
-        "manage_runtime": manage_runtime,
         "manage_parameters": manage_parameters,
         "setup_registry_client": setup_registry_client,
         "manage_flows": manage_flows,
@@ -109,7 +63,6 @@ def _orchestrate_stubs(call_order, flow_pg_lookup=None):
         "manage_root_parameter_context": manage_root_parameter_context,
         "manage_controller_services": manage_controller_services,
         "manage_parameter_providers": manage_parameter_providers,
-        "manage_connectors": manage_connectors,
     }
 
 
@@ -171,18 +124,17 @@ def test_runtime_modification_reconciles_root_parameter_context_before_root_serv
     monkeypatch.setattr(module, "_setup_flow_registries", lambda *args, **kwargs: None)
     monkeypatch.setattr(module, "_reconcile_parameter_providers", lambda *args, **kwargs: call_order.append("providers") or [])
     monkeypatch.setattr(module, "_reconcile_flows", lambda *args, **kwargs: None)
-    monkeypatch.setattr(module, "_reconcile_connectors", lambda *args, **kwargs: None)
 
     module.apply_runtime_modification({
         "new": {
-            "name": "MY_RUNTIME", "database": "DB", "schema": "SCHEMA", "url": "https://example.invalid",
+            "name": "MY_RUNTIME", "url": "https://example.invalid",
             "controller_services": [{"name": "Controller Service"}],
             "root_parameter_context": {"assets": [{"name": "driver.jar", "url": "https://example.invalid/driver.jar", "parameter": "Driver"}]},
             "root_pg_controller_services": [{"name": "Pool"}],
         },
         "old": {},
         "root_parameter_context_changes": {"blocked": []},
-    }, {})
+    })
 
     assert call_order == ["controller-services", "providers", "root-context", "root-services"]
 
@@ -195,12 +147,12 @@ def test_runtime_modification_blocks_when_root_parameter_context_state_is_unread
 
     with pytest.raises(RuntimeError, match="Root parameter context live-state read failed"):
         module.apply_runtime_modification({
-            "new": {"name": "MY_RUNTIME", "database": "DB", "schema": "SCHEMA", "url": "https://example.invalid"},
+            "new": {"name": "MY_RUNTIME", "url": "https://example.invalid"},
             "old": {},
             "root_parameter_context_changes": {
                 "blocked": [{"parameter": "Driver", "name": "driver.jar", "messages": ["HTTP 403 Forbidden"]}],
             },
-        }, {})
+        })
 
 
 def test_reconcile_flows_rebinds_after_version_update_using_current_ids_before_start(fake_nipyapi, import_cd_module):
@@ -336,8 +288,6 @@ def test_reconcile_flows_rebinds_after_version_update_using_current_ids_before_s
 
 def test_apply_runtime_modification_rejects_blocked_live_binding_state(fake_nipyapi, import_cd_module):
     stubs = _orchestrate_stubs([])
-    stubs["manage_deployment"].deployment_exists = lambda *args, **kwargs: True
-    stubs["manage_runtime"].runtime_exists = lambda *args, **kwargs: True
     stubs["manage_service_bindings"] = types.SimpleNamespace(reconcile_service_bindings=lambda *args, **kwargs: None)
 
     module = import_cd_module(
@@ -346,7 +296,7 @@ def test_apply_runtime_modification_rejects_blocked_live_binding_state(fake_nipy
     )
 
     mod = {
-        "new": {"name": "MY_RUNTIME", "database": "OPENFLOW", "schema": "OPENFLOW", "url": "https://example.invalid"},
+        "new": {"name": "MY_RUNTIME", "url": "https://example.invalid"},
         "service_binding_changes": {
             "blocked": [{"flow": "Example Flow", "target": "Lookup", "messages": ["HTTP 403 Forbidden"]}],
         },
@@ -361,7 +311,7 @@ def test_apply_runtime_modification_rejects_blocked_live_binding_state(fake_nipy
     }
 
     with pytest.raises(RuntimeError, match="Service binding live-state read failed; refusing to apply runtime 'MY_RUNTIME': Example Flow / Lookup: HTTP 403 Forbidden"):
-        module.apply_runtime_modification(mod, {"account": "example"})
+        module.apply_runtime_modification(mod)
 
 
 class _LeakyDeleteError(Exception):
@@ -369,65 +319,30 @@ class _LeakyDeleteError(Exception):
         return "HTTP response headers: Set-Cookie: secret\nHTTP response body: sensitive"
 
 
-def test_apply_deployment_modifications_sanitizes_delete_failures(fake_nipyapi, import_cd_module, capsys):
+
+
+
+
+
+
+def test_orchestrate_sanitizes_failures_and_continues_other_instances(tmp_path, import_cd_module, monkeypatch, capsys):
+    import json
     stubs = _orchestrate_stubs([])
     stubs["manage_service_bindings"] = types.SimpleNamespace(reconcile_service_bindings=lambda *args, **kwargs: None)
     module = import_cd_module("orchestrate", stubs)
-    module.runtime_exists = lambda *args, **kwargs: True
-    module._delete_connectors = lambda *args, **kwargs: (_ for _ in ()).throw(_LeakyDeleteError())
-
-    errors = []
-    module.apply_deployment_modifications(
-        [{
-            "name": "DEPLOYMENT",
-            "runtime_changes": {
-                "created": [],
-                "modified": [],
-                "deleted": [{"name": "RUNTIME", "database": "DB", "schema": "SCHEMA", "url": "https://example.invalid", "flows": []}],
-            },
-        }],
-        {"account": "example"},
-        errors,
-    )
-
-    out = capsys.readouterr().out
-    assert errors == ["Runtime RUNTIME delete failed: _LeakyDeleteError"]
-    assert "Set-Cookie" not in out
-    assert "sensitive" not in out
-    assert "traceback" not in out.lower()
-
-
-def test_apply_deployment_deletes_sanitizes_delete_failures_and_aggregates_errors(fake_nipyapi, import_cd_module, capsys):
-    stubs = _orchestrate_stubs([])
-    stubs["manage_service_bindings"] = types.SimpleNamespace(reconcile_service_bindings=lambda *args, **kwargs: None)
-    module = import_cd_module("orchestrate", stubs)
-
-    def failing_delete_flows(flows, rt, runtime_url):
+    config = tmp_path / "config.yaml"
+    config.write_text("runtimes:\n  - name: one\n    url: https://one.example.test\n  - name: two\n    url: https://two.example.test\n")
+    plan = tmp_path / "changes.json"
+    plan.write_text(json.dumps({"runtimes": {"modified": [{"name": "one"}, {"name": "two"}]}}))
+    calls = []
+    def fail(runtime):
+        calls.append(runtime["name"])
         raise _LeakyDeleteError()
-
-    module._delete_flows = failing_delete_flows
-    module._delete_connectors = lambda *args, **kwargs: None
-    module.delete_runtime = lambda *args, **kwargs: None
-    module.delete_runtime_eai = lambda *args, **kwargs: None
-
-    errors = []
-    module.apply_deployment_deletes(
-        [{
-            "name": "DEPLOYMENT",
-            "runtimes_to_delete": [
-                {"name": "RUNTIME_ONE", "database": "DB", "schema": "SCHEMA", "url": "https://example.invalid", "flows": [{"name": "Flow One"}]},
-                {"name": "RUNTIME_TWO", "database": "DB", "schema": "SCHEMA", "url": "https://example.invalid", "flows": [{"name": "Flow Two"}]},
-            ],
-        }],
-        {"account": "example"},
-        errors,
-    )
-
-    out = capsys.readouterr().out
-    assert errors == [
-        "Runtime RUNTIME_ONE delete failed: _LeakyDeleteError",
-        "Runtime RUNTIME_TWO delete failed: _LeakyDeleteError",
-    ]
-    assert "Set-Cookie" not in out
-    assert "sensitive" not in out
-    assert "traceback" not in out.lower()
+    monkeypatch.setattr(module, "apply_runtime_modification", fail)
+    with pytest.raises(SystemExit):
+        module.orchestrate(str(plan), str(config))
+    assert calls == ["one", "two"]
+    err = capsys.readouterr().err
+    assert "_LeakyDeleteError" in err
+    assert "Set-Cookie" not in err
+    assert "sensitive" not in err

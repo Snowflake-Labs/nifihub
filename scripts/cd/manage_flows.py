@@ -16,6 +16,7 @@
 #!/usr/bin/env python3
 import argparse
 import json
+import os
 import sys
 import time
 
@@ -366,35 +367,36 @@ def _remove_process_group(pg_id, flow_name):
 
 
 def configure_nifi(runtime_url, pat=None, nifi_auth=None):
-    """Configure nipyapi to connect to a NiFi instance.
-
-    Args:
-        runtime_url: NiFi base URL (with or without /nifi-api suffix).
-        pat: Bearer token (Snowflake PAT). Used when nifi_auth is not provided.
-        nifi_auth: Dict with auth config. Supported types:
-            {"type": "username_password", "username": "...", "password": "...",
-             "verify_ssl": True}
-            When provided, uses nipyapi.security.service_login() to obtain a JWT
-            via POST /nifi-api/access/token (standard OSS NiFi auth flow).
-    """
+    """Connect to NiFi using username/password, a bearer token, or local HTTP."""
+    from urllib.parse import urlsplit
     api_url = runtime_url.rstrip("/")
+    parsed = urlsplit(api_url)
+    if parsed.scheme not in ("http", "https") or not parsed.hostname or parsed.username or parsed.password or parsed.query or parsed.fragment:
+        raise ValueError("NiFi URL must be an HTTP(S) URL without credentials, query, or fragment.")
     if api_url.endswith("/nifi"):
         api_url = api_url[:-5]
     if not api_url.endswith("/nifi-api"):
         api_url += "/nifi-api"
+    if parsed.scheme != "https" and (pat or nifi_auth):
+        raise ValueError("NiFi authentication requires HTTPS.")
+    verify_ssl = os.environ.get("NIFI_VERIFY_SSL", "true")
+    if verify_ssl.lower() in ("true", "false"):
+        verify_ssl = verify_ssl.lower() == "true"
+    if nifi_auth:
+        verify_ssl = nifi_auth.get("verify_ssl", verify_ssl)
     nipyapi.config.nifi_config.host = api_url
     nipyapi.config.nifi_config.api_client = None
-
-    if nifi_auth and nifi_auth.get("type") == "username_password":
-        verify_ssl = nifi_auth.get("verify_ssl", True)
-        nipyapi.config.nifi_config.verify_ssl = verify_ssl
-        nipyapi.security.service_login(
-            service="nifi",
-            username=nifi_auth["username"],
-            password=nifi_auth["password"],
-        )
+    nipyapi.config.nifi_config.verify_ssl = True if isinstance(verify_ssl, str) else verify_ssl
+    nipyapi.config.nifi_config.ssl_ca_cert = verify_ssl if isinstance(verify_ssl, str) else None
+    nipyapi.config.nifi_config.api_key.pop("bearerAuth", None)
+    if nifi_auth:
+        if nifi_auth.get("type") != "username_password":
+            raise ValueError("Unsupported NiFi authentication type.")
+        logged_in = nipyapi.security.service_login(service="nifi", username=nifi_auth["username"], password=nifi_auth["password"])
+        if logged_in is False:
+            raise RuntimeError("NiFi username/password login failed.")
     elif pat:
-        nipyapi.config.nifi_config.api_key["bearerAuth"] = f"Bearer {pat}"
+        nipyapi.security.set_service_auth_token(service="nifi", token=pat)
 
 
 def find_registry_client(name):
@@ -614,19 +616,20 @@ def delete_flows(flows, registry_client_name, runtime_url, nifi_pat, nifi_auth=N
 
 
 def main():
+    from nifi_config import get_nifi_auth
     parser = argparse.ArgumentParser(description="Manage flows on NiFi runtime")
     parser.add_argument("action", choices=["reconcile", "delete"])
     parser.add_argument("--flows", required=True, help="JSON array of flow specs")
     parser.add_argument("--registry-client-name", default="nifihub")
-    parser.add_argument("--runtime-url", required=True)
-    parser.add_argument("--nifi-pat", required=True)
+    parser.add_argument("--runtime-url", default=os.environ.get("NIFI_URL"), required=not os.environ.get("NIFI_URL"))
+    parser.add_argument("--token", default=os.environ.get("NIFI_TOKEN", ""), help="NiFi bearer token")
     args = parser.parse_args()
 
     flows = json.loads(args.flows)
     if args.action == "reconcile":
-        reconcile_flows(flows, args.registry_client_name, args.runtime_url, args.nifi_pat)
+        reconcile_flows(flows, args.registry_client_name, args.runtime_url, args.token, nifi_auth=get_nifi_auth())
     elif args.action == "delete":
-        delete_flows(flows, args.registry_client_name, args.runtime_url, args.nifi_pat)
+        delete_flows(flows, args.registry_client_name, args.runtime_url, args.token, nifi_auth=get_nifi_auth())
 
 
 if __name__ == "__main__":

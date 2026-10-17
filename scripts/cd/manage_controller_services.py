@@ -16,6 +16,7 @@
 #!/usr/bin/env python3
 import argparse
 import json
+import os
 import time
 
 import nipyapi
@@ -303,11 +304,12 @@ def delete_root_pg_controller_services(services, runtime_url, nifi_pat, nifi_aut
 
 
 def main():
+    from nifi_config import get_nifi_auth
     parser = argparse.ArgumentParser(description="Manage controller services on NiFi runtime")
     parser.add_argument("action", choices=["reconcile", "delete"])
     parser.add_argument("--services", required=True, help="JSON array of controller service specs")
-    parser.add_argument("--runtime-url", required=True)
-    parser.add_argument("--nifi-pat", required=True)
+    parser.add_argument("--runtime-url", default=os.environ.get("NIFI_URL"), required=not os.environ.get("NIFI_URL"))
+    parser.add_argument("--token", default=os.environ.get("NIFI_TOKEN", ""), help="NiFi bearer token")
     parser.add_argument("--scope", choices=["controller", "root-pg"], default="controller",
                         help="Scope: controller-level (default) or root process group-scoped")
     args = parser.parse_args()
@@ -317,9 +319,9 @@ def main():
     else:
         reconcile_fn, delete_fn = reconcile_controller_services, delete_controller_services
     if args.action == "reconcile":
-        reconcile_fn(services, args.runtime_url, args.nifi_pat)
+        reconcile_fn(services, args.runtime_url, args.token, nifi_auth=get_nifi_auth())
     elif args.action == "delete":
-        delete_fn(services, args.runtime_url, args.nifi_pat)
+        delete_fn(services, args.runtime_url, args.token, nifi_auth=get_nifi_auth())
 
 
 if __name__ == "__main__":

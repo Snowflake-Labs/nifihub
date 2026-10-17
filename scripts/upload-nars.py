@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-Upload all NAR files from a directory to a Snowflake NiFi runtime.
+Upload all NAR files from a directory to an Apache NiFi instance.
 
 Finds every *.nar file under the given directory.  For each NAR, reads
 its coordinates (group, artifact, version) from META-INF/MANIFEST.MF and
@@ -25,18 +25,22 @@ line) so the caller can record them for later cleanup.
 
 Usage:
     python scripts/upload-nars.py --nar-dir extensions/ \
-        --runtime-url https://host.snowflakecomputing.app/instance-name --pat <token>
+        --runtime-url https://localhost:8443 --token <token>
 """
 
 import argparse
 import glob
 import os
-import re
 import sys
+from pathlib import Path
 import time
 import zipfile
 
 import nipyapi
+
+sys.path.insert(0, str(Path(__file__).resolve().parent / "cd"))
+from manage_flows import configure_nifi
+from nifi_config import get_nifi_auth
 
 
 def _read_nar_coordinates(nar_path):
@@ -79,12 +83,9 @@ def _wait_for_nar_install(api, nar_id, timeout=15):
     raise Exception("Timed out waiting for NAR %s to install (last state: %s)" % (nar_id, state))
 
 
-def upload_nars(nar_dir, runtime_url, pat):
+def upload_nars(nar_dir, runtime_url, pat=None):
     """Upload all .nar files found under nar_dir and return their identifiers."""
-    base = re.sub(r"/nifi/?$", "", runtime_url.rstrip("/"))
-    api_base = base + "/nifi-api"
-    nipyapi.config.nifi_config.host = api_base
-    nipyapi.security.set_service_auth_token(service="nifi", token=pat)
+    configure_nifi(runtime_url, pat=pat, nifi_auth=get_nifi_auth())
 
     nar_files = sorted(glob.glob(os.path.join(nar_dir, "**", "*.nar"), recursive=True))
     if not nar_files:
@@ -129,21 +130,21 @@ def upload_nars(nar_dir, runtime_url, pat):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Upload NAR files to a Snowflake NiFi runtime"
+        description="Upload NAR files to an Apache NiFi instance"
     )
     parser.add_argument(
         "--nar-dir", required=True, help="Directory to search for .nar files"
     )
     parser.add_argument(
-        "--runtime-url", required=True, help="Base URL of the Snowflake runtime"
+        "--runtime-url", default=os.environ.get("NIFI_URL"), required=not os.environ.get("NIFI_URL"), help="Existing Apache NiFi URL"
     )
     parser.add_argument(
-        "--pat", required=True, help="Personal Access Token for authentication"
+        "--token", default=os.environ.get("NIFI_TOKEN", ""), help="NiFi bearer token (or use NIFI_USERNAME/NIFI_PASSWORD)"
     )
     args = parser.parse_args()
 
     try:
-        upload_nars(args.nar_dir, args.runtime_url, args.pat)
+        upload_nars(args.nar_dir, args.runtime_url, args.token)
     except Exception as exc:
         print("NAR upload failed: %s" % exc, file=sys.stderr)
         sys.exit(1)

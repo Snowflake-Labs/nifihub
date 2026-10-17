@@ -17,8 +17,8 @@
 Validation tests for the Hello World example flow.
 
 Structural tests validate the flow definition JSON without a running instance.
-Runtime tests require SNOWFLAKE_RUNTIME_URL, SNOWFLAKE_RUNTIME_PAT, and
-DEPLOYED_PG_ID environment variables (set by the flow-deploy workflow).
+Runtime tests require NIFI_URL, DEPLOYED_PG_ID, and NiFi authentication
+environment variables (set by the flow-deploy workflow).
 """
 
 import json
@@ -107,17 +107,17 @@ class TestFlowStructure:
 
 @pytest.fixture(scope="module")
 def nifi_runtime():
-    url = os.environ.get("SNOWFLAKE_RUNTIME_URL", "")
-    pat = os.environ.get("SNOWFLAKE_RUNTIME_PAT", "")
-    if not url or not pat:
-        pytest.skip("No runtime URL/PAT — skipping runtime tests")
+    url = os.environ.get("NIFI_URL", "")
+    if not url or not os.environ.get("DEPLOYED_PG_ID"):
+        pytest.skip("Set NIFI_URL and DEPLOYED_PG_ID to run integration tests")
     if nipyapi is None:
         pytest.skip("nipyapi not available")
-    api_url = url.rstrip("/")
-    if not api_url.endswith("/nifi-api"):
-        api_url += "/nifi-api"
-    nipyapi.config.nifi_config.host = api_url
-    nipyapi.security.set_service_auth_token(service="nifi", token=pat)
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "scripts/cd"))
+    from manage_flows import configure_nifi
+    from nifi_config import get_nifi_auth
+    configure_nifi(url, pat=os.environ.get("NIFI_TOKEN", ""), nifi_auth=get_nifi_auth())
     return nipyapi
 
 

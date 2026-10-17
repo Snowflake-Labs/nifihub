@@ -14,31 +14,9 @@
 # limitations under the License.
 
 #!/usr/bin/env python3
-"""Translate diff_live.py output into the changes.json format that orchestrate.py expects."""
+"""Translate a live NiFi diff to the resource changes consumed by the orchestrator."""
 import json
 import sys
-
-
-def _remap_changed_fields(fields):
-    return {k: {"old": v["live"], "new": v["desired"]} for k, v in (fields or {}).items()}
-
-
-def _translate_nr_modifications(nr_mods):
-    result = []
-    for nr_mod in (nr_mods or []):
-        result.append({"old": nr_mod.get("old", {}), "new": nr_mod.get("new", {})})
-    return result
-
-
-def _translate_connector_changes(conn_diff):
-    if not conn_diff:
-        return {"created": [], "modified": [], "deleted": []}
-    return {
-        "created": conn_diff.get("created", []),
-        "modified": [{"old": m.get("live", {}), "new": m.get("desired", {})}
-                     for m in conn_diff.get("modified", [])],
-        "deleted": conn_diff.get("deleted", []),
-    }
 
 
 def _translate_nifi_changes(nifi_diff):
@@ -130,87 +108,20 @@ def _translate_nifi_changes(nifi_diff):
     }
 
 
-def _translate_runtime_mod(rt_mod):
-    desired = rt_mod["desired"]
-    live = rt_mod.get("live", {})
-    diff = rt_mod.get("diff", {})
-
-    changed_fields = _remap_changed_fields(diff.get("changed_fields", {}))
-
-    nr_changes = diff.get("network_rule_changes", {})
-    network_rule_changes = {
-        "created": nr_changes.get("created", []),
-        "modified": _translate_nr_modifications(nr_changes.get("modified", [])),
-        "deleted": nr_changes.get("deleted", []),
-    }
-
-    connector_changes = _translate_connector_changes(diff.get("connector_changes"))
-    nifi_changes = _translate_nifi_changes(diff.get("nifi"))
-
-    return {
-        "name": desired["name"],
-        "old": desired,
-        "new": desired,
-        "changed_fields": changed_fields,
-        "network_rule_changes": network_rule_changes,
-        "connector_changes": connector_changes,
-        **nifi_changes,
-    }
-
-
 def translate(live_diff):
-    changes = {
-        "account": live_diff.get("account", {}),
-        "deployments": {"created": [], "modified": [], "deleted": []},
-    }
-
-    deps = live_diff.get("deployments", {})
-
-    for dep in deps.get("to_create", []):
-        entry = dict(dep)
-        entry["runtimes_to_create"] = entry.pop("runtimes", [])
-        changes["deployments"]["created"].append(entry)
-
-    for dep in deps.get("to_modify", []):
-        changed_fields = _remap_changed_fields(dep.get("dep_changes", {}))
-
-        rt_info = dep.get("runtimes", {})
-        # url_managed runtimes are always reconciled (no SOM state to diff — NiFi
-        # content is applied on every run via apply_runtime_create non-SOM path).
-        url_managed = rt_info.get("url_managed", [])
-        runtime_changes = {
-            "created": rt_info.get("to_create", []) + url_managed,
-            "modified": [_translate_runtime_mod(m) for m in rt_info.get("to_modify", [])],
-            "deleted": rt_info.get("to_delete", []),
-        }
-
-        changes["deployments"]["modified"].append({
-            "name": dep["name"],
-            "changed_fields": changed_fields,
-            "runtime_changes": runtime_changes,
+    changes = {"runtimes": {"modified": []}}
+    runtimes = live_diff.get("runtimes", {})
+    for runtime in runtimes.get("to_modify", []) + runtimes.get("unchanged", []):
+        nifi = runtime.get("diff", {}).get("nifi", {})
+        if nifi.get("error"):
+            raise RuntimeError(f"Cannot read NiFi runtime '{runtime['name']}'; refusing to apply changes.")
+        if nifi.get("skipped"):
+            continue
+        changes["runtimes"]["modified"].append({
+            "name": runtime["name"],
+            "new": runtime["desired"],
+            **_translate_nifi_changes(nifi),
         })
-
-    for dep in deps.get("unchanged", []):
-        rt_info = dep.get("runtimes", {})
-        url_managed = rt_info.get("url_managed", [])
-        has_rt_changes = (
-            rt_info.get("to_create")
-            or rt_info.get("to_modify")
-            or rt_info.get("to_delete")
-            or url_managed
-        )
-        if has_rt_changes:
-            runtime_changes = {
-                "created": rt_info.get("to_create", []) + url_managed,
-                "modified": [_translate_runtime_mod(m) for m in rt_info.get("to_modify", [])],
-                "deleted": rt_info.get("to_delete", []),
-            }
-            changes["deployments"]["modified"].append({
-                "name": dep["name"],
-                "changed_fields": {},
-                "runtime_changes": runtime_changes,
-            })
-
     return changes
 
 

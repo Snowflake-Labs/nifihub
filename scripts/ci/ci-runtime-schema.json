@@ -1,119 +1,37 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "title": "NiFi Hub Flow CI Test Configuration",
-  "description": "Defines the ephemeral runtime configuration for testing a flow in CI. The runtime is created before tests and destroyed after.",
+  "description": "Flow integration test configuration for an existing NiFi instance. The temporary process group and its isolated parameter contexts are cleaned up.",
   "type": "object",
-  "required": ["github_environment", "deployment", "database", "schema", "node_type", "execute_as_role"],
+  "required": [
+    "github_environment"
+  ],
   "additionalProperties": false,
   "properties": {
     "github_environment": {
       "type": "string",
-      "description": "GitHub Environment that holds secrets (SNOWFLAKE_PAT, NIFI_RUNTIME_PAT, etc.) for the target Snowflake account."
-    },
-    "deployment": {
-      "type": "string",
-      "description": "Existing Openflow deployment name to create the ephemeral runtime in."
-    },
-    "database": {
-      "type": "string",
-      "description": "Database where the ephemeral runtime is scoped."
-    },
-    "schema": {
-      "type": "string",
-      "description": "Schema where the ephemeral runtime is scoped."
-    },
-    "node_type": {
-      "type": "string",
-      "enum": ["SMALL", "MEDIUM", "LARGE"]
-    },
-    "min_nodes": {
-      "type": "integer",
-      "minimum": 1,
-      "maximum": 50,
-      "default": 1
-    },
-    "max_nodes": {
-      "type": "integer",
-      "minimum": 1,
-      "maximum": 50,
-      "default": 1
-    },
-    "execute_as_role": {
-      "type": "string",
-      "description": "Role that the runtime uses for Snowflake data access."
-    },
-    "sensitive_param_pattern": {
-      "type": "string",
-      "description": "Regex pattern to classify parameters from the auto-provisioned Snowflake Parameter Provider as sensitive. Defaults to '.*' (all sensitive).",
-      "default": ".*"
-    },
-    "nifi_auth": {
-      "type": "object",
-      "description": "Authentication configuration for the NiFi REST API. If omitted, the NIFI_RUNTIME_PAT environment variable is used (Bearer token). Set this for CI runtimes pointing at OSS NiFi instances that use username/password login.",
-      "additionalProperties": false,
-      "required": ["type", "username", "password"],
-      "properties": {
-        "type": { "type": "string", "enum": ["username_password"] },
-        "username": { "type": "string" },
-        "password": { "type": "string" },
-        "verify_ssl": { "type": "boolean", "default": true, "description": "Boolean only (CI runtimes are always SPCS — CA bundle path not applicable here; use environments/schema.json for local/BYOC configs that need a custom CA path)." }
-      }
+      "description": "GitHub Environment containing NIFI_URL and NiFi credentials for a dedicated test instance."
     },
     "provided_parameter_contexts": {
       "type": "string",
       "description": "Regex pattern to filter which parameter contexts from providers are added as inherited. Only contexts with names matching this pattern are added. If not specified, no provider contexts are inherited."
     },
-    "network_rules": {
-      "type": "array",
-      "items": {
-        "type": "object",
-        "required": ["name", "type", "mode", "values"],
-        "additionalProperties": false,
-        "properties": {
-          "name": { "type": "string" },
-          "type": { "type": "string", "enum": ["HOST_PORT"] },
-          "mode": { "type": "string", "enum": ["EGRESS"] },
-          "values": { "type": "array", "items": { "type": "string" }, "minItems": 1 }
-        }
-      }
-    },
     "flow_registries": {
       "type": "array",
       "items": {
-        "type": "object",
-        "required": ["name", "properties"],
-        "additionalProperties": false,
-        "properties": {
-          "name": { "type": "string" },
-          "type": { "type": "string" },
-          "properties": { "type": "object", "additionalProperties": { "type": "string" } }
-        }
+        "$ref": "#/definitions/flow_registry_client"
       }
     },
     "parameter_providers": {
       "type": "array",
       "items": {
-        "type": "object",
-        "required": ["name", "type"],
-        "additionalProperties": false,
-        "properties": {
-          "name": { "type": "string" },
-          "type": { "type": "string" },
-          "properties": { "type": "object", "additionalProperties": { "type": ["string", "null"] } }
-        }
+        "$ref": "#/definitions/parameter_provider"
       }
     },
     "controller_services": {
       "type": "array",
       "items": {
-        "type": "object",
-        "required": ["name", "type"],
-        "additionalProperties": false,
-        "properties": {
-          "name": { "type": "string" },
-          "type": { "type": "string" },
-          "properties": { "type": "object", "additionalProperties": { "type": "string" } }
-        }
+        "$ref": "#/definitions/controller_service"
       }
     },
     "nars": {
@@ -131,20 +49,168 @@
         "parameters": {
           "type": "object",
           "description": "Parameter values to set on the flow's parameter context(s) after upload.",
-          "additionalProperties": { "type": ["string", "null"] }
+          "additionalProperties": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
         },
         "assets": {
           "type": "array",
           "description": "Files to download and bind to parameter context assets.",
           "items": {
-            "type": "object",
-            "required": ["name", "url", "parameter"],
-            "additionalProperties": false,
-            "properties": {
-              "name": { "type": "string" },
-              "url": { "type": "string", "format": "uri" },
-              "parameter": { "type": "string" }
-            }
+            "$ref": "#/definitions/nifi_asset"
+          }
+        },
+        "parameter_overrides": {
+          "type": "object",
+          "description": "Parameter values to set as overrides in the flow's direct parameter context, shadowing any inherited values. Use this when deploying multiple instances with dedicated_parameter_context: true and different values for inherited parameters.",
+          "additionalProperties": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      }
+    }
+  },
+  "definitions": {
+    "controller_service": {
+      "type": "object",
+      "required": [
+        "name",
+        "type"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "Controller service name in NiFi. Used as the unique identity for reconciliation."
+        },
+        "type": {
+          "type": "string",
+          "description": "Fully-qualified Java type of the controller service."
+        },
+        "bundle": {
+          "$ref": "#/definitions/nifi_bundle"
+        },
+        "properties": {
+          "type": "object",
+          "description": "Key-value properties to configure on the controller service.",
+          "additionalProperties": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "nifi_bundle": {
+      "type": "object",
+      "required": [
+        "group",
+        "artifact",
+        "version"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "group": {
+          "type": "string",
+          "minLength": 1,
+          "description": "NiFi bundle group coordinate."
+        },
+        "artifact": {
+          "type": "string",
+          "minLength": 1,
+          "description": "NiFi bundle artifact coordinate."
+        },
+        "version": {
+          "type": "string",
+          "minLength": 1,
+          "description": "NiFi bundle version coordinate."
+        }
+      }
+    },
+    "nifi_asset": {
+      "type": "object",
+      "required": [
+        "name",
+        "url",
+        "parameter"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Filename for the asset in the NiFi Parameter Context. Use a new filename when the asset content changes."
+        },
+        "url": {
+          "type": "string",
+          "minLength": 1,
+          "format": "uri",
+          "description": "URL to download the asset file from."
+        },
+        "parameter": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Non-sensitive Parameter name to bind this asset to."
+        }
+      }
+    },
+    "flow_registry_client": {
+      "type": "object",
+      "required": [
+        "name",
+        "properties"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "Name of the Flow Registry Client in NiFi."
+        },
+        "type": {
+          "type": "string",
+          "description": "Fully-qualified Java type of the registry client. If omitted, the first available Git-based type is used."
+        },
+        "properties": {
+          "type": "object",
+          "description": "Key-value properties passed to the registry client API. Sensitive values (e.g. Personal Access Token) are injected from GitHub Environment secrets at deploy time.",
+          "additionalProperties": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "parameter_provider": {
+      "type": "object",
+      "required": [
+        "name",
+        "type"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "Parameter provider name in NiFi. Used as the unique identity for reconciliation."
+        },
+        "type": {
+          "type": "string",
+          "description": "Fully-qualified Java type of the parameter provider."
+        },
+        "sensitive_param_pattern": {
+          "type": "string",
+          "description": "Regex pattern applied to parameter names to determine sensitivity. Defaults to '.*' (all parameters are sensitive)."
+        },
+        "properties": {
+          "type": "object",
+          "description": "Key-value properties to configure on the parameter provider. Controller service names are automatically resolved to their NiFi UUIDs.",
+          "additionalProperties": {
+            "type": [
+              "string",
+              "null"
+            ]
           }
         }
       }

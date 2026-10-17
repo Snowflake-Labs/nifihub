@@ -1,11 +1,4 @@
 # yaml-language-server: $schema=../../../scripts/ci/ci-runtime-schema.json
 github_environment: example
-deployment: MY_DEPLOYMENT
-database: OPENFLOW
-schema: OPENFLOW
-node_type: SMALL
-min_nodes: 1
-max_nodes: 1
-execute_as_role: OPENFLOW_RUNTIME_ROLE
 nars:
-  - ${GITHUB_RELEASES}/nifi-example-bundle-0.3.0/nifi-example-nar-0.3.0.nar
+- ${GITHUB_RELEASES}/nifi-example-bundle-0.3.0/nifi-example-nar-0.3.0.nar

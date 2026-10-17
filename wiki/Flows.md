@@ -1,6 +1,6 @@
 # Flows
 
-This section documents the NiFi flow definitions available in this repository. Each flow can be imported into NiFi or deployed to a Snowflake Openflow runtime.
+This section documents the NiFi flow definitions available in this repository. Each flow can be imported into NiFi or deployed to a Apache NiFi instance.
 
 See [How to Use This Repo](How-to-Use-This-Repo) for instructions on importing or deploying a flow.
 
@@ -49,4 +49,4 @@ When a PR modifies a flow, the [CI pipeline](Introduction-and-Concepts--CI) runs
 - **Flow checkstyle** — checks for best-practice violations (concurrent tasks, backpressure, self-loops, etc.)
 - **Validation tests** — runs the `tests/` suite for changed flows
 
-Maintainers can also trigger a live deploy test against a Snowflake Openflow runtime by commenting `deploy this flow` on the PR. See [CD Pipeline](Introduction-and-Concepts--CD).
+Maintainers can also trigger a live deploy test against a Apache NiFi instance by commenting `deploy this flow` on the PR. See [CD Pipeline](Introduction-and-Concepts--CD).

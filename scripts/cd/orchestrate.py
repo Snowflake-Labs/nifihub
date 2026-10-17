@@ -14,21 +14,13 @@
 # limitations under the License.
 
 #!/usr/bin/env python3
+"""Reconcile resources on existing Apache NiFi instances."""
 import argparse
 import json
 import os
 import sys
 from collections import defaultdict
 
-from manage_deployment import (
-    create_deployment, alter_deployment, delete_deployment, describe_deployment, snow_sql
-)
-from manage_eai import create_runtime_eai, delete_runtime_eai, eai_name_for_runtime, namespaced_nr_name
-from manage_eai import create_network_rule, alter_network_rule, drop_network_rule, drop_eai
-from manage_runtime import (
-    create_runtime, alter_runtime, delete_runtime, describe_runtime,
-    suspend_runtime, resume_runtime
-)
 from manage_parameters import resolve_value
 from setup_registry_client import setup as setup_registry, find_registry_client, delete_registry_client
 from manage_flows import reconcile_flows, delete_flows, find_flow_pg_by_name, configure_nifi, start_flow, stop_flow
@@ -39,113 +31,29 @@ from manage_controller_services import (
     reconcile_root_pg_controller_services, delete_root_pg_controller_services,
 )
 from manage_root_parameter_context import reconcile_root_parameter_context
-from manage_parameter_providers import reconcile_parameter_providers, delete_parameter_providers, fetch_auto_provisioned_provider
+from manage_parameter_providers import reconcile_parameter_providers, delete_parameter_providers
 from manage_service_bindings import reconcile_service_bindings
 from safe_exceptions import format_safe_exception
-from manage_connectors import (
-    create_connector, connector_exists, describe_connector,
-    apply_connector_config, get_connector_config, put_connector_config,
-    upload_connector_asset, download_asset, start_connector, stop_connector,
-    delete_connector, get_connector_config_uri, add_live_version,
-    commit_connector, wait_for_connector
-)
-
-
-def get_conn():
-    return {
-        "account_url": os.environ.get("SNOWFLAKE_ACCOUNT_URL", ""),
-        "pat": os.environ.get("SNOWFLAKE_PAT", ""),
-        "user": os.environ.get("SNOWFLAKE_USER", ""),
-        "role": os.environ.get("SNOWFLAKE_ROLE", "OPENFLOW_ADMIN"),
-    }
-
-
-def get_nifi_conn():
-    return {
-        "runtime_url": os.environ.get("NIFI_RUNTIME_URL", ""),
-        "nifi_pat": os.environ.get("NIFI_RUNTIME_PAT", ""),
-    }
+from nifi_config import get_nifi_auth, load_config
 
 
 def _get_nifi_pat():
-    """Return NIFI_RUNTIME_PAT env var, or empty string if not set.
-    When nifi_auth is configured on a runtime (username/password mode), this
-    value is unused and it is safe for it to be absent.
-    """
-    return os.environ.get("NIFI_RUNTIME_PAT", "")
+    return os.environ.get("NIFI_TOKEN", "")
 
 
-def _get_nifi_auth(rt):
-    """Resolve and return the nifi_auth dict for a runtime, or None.
-
-    When nifi_auth is present, credentials are resolved from GH_SECRETS_JSON /
-    GH_VARS_JSON so that ${{ secrets.X }} / ${{ vars.X }} syntax works.
-    """
-    nifi_auth = rt.get("nifi_auth")
-    if not nifi_auth:
-        return None
-    return {
-        "type": nifi_auth["type"],
-        "username": resolve_value(nifi_auth["username"]),
-        "password": resolve_value(nifi_auth["password"]),
-        "verify_ssl": nifi_auth.get("verify_ssl", True),
-    }
+def _get_nifi_auth(runtime):
+    return get_nifi_auth(runtime)
 
 
-def deployment_exists(name, conn):
-    try:
-        desc = describe_deployment(name, **conn)
-        return desc is not None
-    except Exception:
-        return False
+def _runtime_url(runtime):
+    return runtime["url"]
 
 
-def runtime_exists(name, database, schema, conn):
-    try:
-        desc = describe_runtime(name, database, schema, **conn)
-        return desc is not None
-    except Exception:
-        return False
-
-
-def get_runtime_url(database, schema, runtime_name, account_url="", **conn):
-    rows = snow_sql(
-        f"DESCRIBE OPENFLOW RUNTIME {database}.{schema}.{runtime_name}",
-        account_url=account_url, **conn
-    )
-    if not rows:
-        return ""
-    row = rows[0] if isinstance(rows, list) else rows
-    server_url = row.get("server_url") or row.get("SERVER_URL")
-    if server_url:
-        url = server_url.rstrip("/")
-        if url.endswith("/nifi"):
-            url = url[:-5] + "/nifi-api"
-        else:
-            url = url + "/nifi-api"
-        return url
-    key = row.get("key") or row.get("KEY")
-    if not key:
-        return ""
-    host = account_url.replace("https://", "").replace("http://", "").split(".snowflakecomputing.com")[0]
-    account_id = host.lower().replace("_", "-")
-    return f"https://of--{account_id}.snowflakecomputing.app/{key}/nifi-api"
-
-
-def _has_som_api(rt):
-    """Return True if this runtime is managed via SOM SQL API (no explicit url)."""
-    return not rt.get("url")
-
-
-
-def _runtime_url(rt, conn):
-    """Return the NiFi runtime URL from config if present, otherwise query via SQL."""
-    url = rt.get("url", "")
-    if url:
-        if not url.rstrip("/").endswith("/nifi-api"):
-            url = url.rstrip("/") + "/nifi-api"
-        return url
-    return get_runtime_url(rt["database"], rt["schema"], rt["name"], **conn)
+def _reconcile_parameter_providers(runtime, runtime_url):
+    providers = runtime.get("parameter_providers", [])
+    if not providers:
+        return []
+    return reconcile_parameter_providers(providers, runtime_url, _get_nifi_pat(), nifi_auth=_get_nifi_auth(runtime)) or []
 
 
 def _reconcile_controller_services(rt, runtime_url):
@@ -209,25 +117,6 @@ def _delete_root_pg_controller_services(services, runtime_url, nifi_auth=None):
         return
     nifi_pat = _get_nifi_pat()
     delete_root_pg_controller_services(services, runtime_url, nifi_pat, nifi_auth=nifi_auth)
-
-
-def _reconcile_parameter_providers(rt, runtime_url):
-    """Reconcile all desired parameter providers on the runtime, plus the auto-provisioned one."""
-    providers = rt.get("parameter_providers", [])
-    nifi_pat = _get_nifi_pat()
-    nifi_auth = _get_nifi_auth(rt)
-    from manage_flows import configure_nifi
-    configure_nifi(runtime_url, pat=nifi_pat, nifi_auth=nifi_auth)
-    all_context_names = []
-    if providers:
-        names = reconcile_parameter_providers(providers, runtime_url, nifi_pat, nifi_auth=nifi_auth)
-        if names:
-            all_context_names.extend(names)
-    sensitive_pattern = rt.get("sensitive_param_pattern", ".*")
-    auto_names = fetch_auto_provisioned_provider(sensitive_pattern=sensitive_pattern)
-    if auto_names:
-        all_context_names.extend(auto_names)
-    return all_context_names
 
 
 def _delete_parameter_providers(providers, runtime_url, nifi_auth=None):
@@ -377,275 +266,11 @@ def _delete_flows(flows, rt, runtime_url):
         delete_flows(group, registry_name, runtime_url, nifi_pat, nifi_auth=_get_nifi_auth(rt))
 
 
-def _reconcile_connectors(rt, conn):
-    connectors = rt.get("connectors", [])
-    if not connectors:
-        return
-    database = rt["database"]
-    schema = rt["schema"]
-    runtime_name = rt["name"]
-
-    for c in connectors:
-        name = c["name"]
-        definition = c["definition"]
-        is_new = not connector_exists(name, database, schema, **conn)
-
-        if is_new:
-            create_connector(
-                name, runtime_name, database, schema, definition,
-                display_name=c.get("display_name"),
-                comment=c.get("comment"),
-                **conn
-            )
-            wait_for_connector(name, database, schema, "STOPPED", **conn)
-        else:
-            desc = describe_connector(name, database, schema, **conn)
-            status = (desc.get("status") or desc.get("STATUS")) if desc else None
-            if status in ("STARTING", "CREATING", "STOPPING"):
-                print(f"[connector] {name} is in {status} state — skipping reconciliation")
-                continue
-            if status == "RUNNING":
-                stop_connector(name, database, schema, **conn)
-            live_uri = get_connector_config_uri(name, database, schema, **conn)
-            if not live_uri:
-                add_live_version(name, database, schema, **conn)
-
-        config_json = get_connector_config(name, database, schema, **conn)
-        if not config_json:
-            print(f"[connector] WARNING: Could not retrieve config for {name}")
-            continue
-
-        params = c.get("parameters", {})
-        resolved_params = {}
-        for k, v in params.items():
-            resolved_params[k] = resolve_value(v) if v else v
-
-        for asset in c.get("assets", []):
-            if asset.get("parameter"):
-                resolved_params[asset["parameter"]] = asset["name"]
-
-        config_json = apply_connector_config(config_json, resolved_params)
-
-        for asset in c.get("assets", []):
-            import tempfile as _tf
-            tmp_dir = _tf.mkdtemp()
-            local_path = os.path.join(tmp_dir, asset["name"])
-            download_asset(asset["url"], local_path)
-            upload_connector_asset(name, database, schema, local_path, asset["name"], **conn)
-
-        put_connector_config(name, database, schema, config_json, **conn)
-        commit_connector(name, database, schema, **conn)
-        wait_for_connector(name, database, schema, "STOPPED", **conn)
-
-        if c.get("start"):
-            start_connector(name, database, schema, **conn)
-        elif "start" in c and not c["start"]:
-            stop_connector(name, database, schema, **conn)
-
-
-def _delete_connectors(connectors, database, schema, conn):
-    if not connectors:
-        return
-    for c in connectors:
-        if connector_exists(c["name"], database, schema, **conn):
-            stop_connector(c["name"], database, schema, **conn)
-            delete_connector(c["name"], database, schema, **conn)
-        else:
-            print(f"[connector] {c['name']} not found — skipping delete")
-
-
-def apply_deployment_creates(created_deps, conn, errors):
-    for dep in created_deps:
-        runtimes = dep.get("runtimes_to_create", [])
-        som_needed = any(_has_som_api(rt) for rt in runtimes)
-        if som_needed:
-            create_deployment(
-                dep["name"], dep.get("deployment_type", "SNOWFLAKE"),
-                display_name=dep.get("display_name"),
-                comment=dep.get("comment"),
-                **conn
-            )
-        else:
-            print(f"[orchestrate] Deployment {dep['name']} has only URL-managed runtimes — skipping SOM create")
-        for rt in runtimes:
-            try:
-                apply_runtime_create(dep["name"], rt, conn)
-            except Exception as e:
-                msg = f"Runtime {rt['name']} create failed: {format_safe_exception(e)}"
-                print(f"[orchestrate] ERROR: {msg}")
-                errors.append(msg)
-
-
-def apply_runtime_create(deployment_name, rt, conn):
-    database = rt["database"]
-    schema = rt["schema"]
-
-    if _has_som_api(rt):
-        eai = create_runtime_eai(
-            rt["name"], rt.get("network_rules", []),
-            database, schema, execute_as_role=rt.get("execute_as_role"), **conn
-        )
-        create_runtime(
-            rt["name"], deployment_name, database, schema,
-            rt["node_type"], rt["min_nodes"], rt["max_nodes"],
-            rt["execute_as_role"],
-            eai_names=[eai],
-            display_name=rt.get("display_name"),
-            comment=rt.get("comment"),
-            **conn
-        )
-    else:
-        print(f"[orchestrate] Runtime {rt['name']} has explicit URL — skipping SOM API create")
-
-    if rt.get("suspend"):
-        if _has_som_api(rt):
-            suspend_runtime(rt["name"], database, schema, **conn)
-        print(f"[orchestrate] Runtime {rt['name']} has suspend=true — skipping NiFi reconciliation")
-        return
-
-    if rt.get("reconcile") is False:
-        print(f"[orchestrate] Runtime {rt['name']} has reconcile=false — skipping NiFi reconciliation")
-        return
-
-    runtime_url = _runtime_url(rt, conn)
-    if not runtime_url:
-        print(f"[orchestrate] No runtime URL for {rt['name']} — skipping registry and flow setup")
-        return
-
-    _setup_flow_registries(rt, runtime_url)
-    _reconcile_controller_services(rt, runtime_url)
-    pp_context_names = _reconcile_parameter_providers(rt, runtime_url)
-    _reconcile_root_parameter_context(rt, runtime_url, pp_context_names)
-    _reconcile_root_pg_controller_services(rt, runtime_url)
-    _reconcile_flows(rt, runtime_url, provider_context_names=pp_context_names)
-    _reconcile_connectors(rt, conn)
-
-
-def apply_deployment_modifications(modified_deps, conn, errors):
-    for dep in modified_deps:
-        rtc = dep.get("runtime_changes", {})
-        all_rts = (rtc.get("created", [])
-                   + [m["new"] for m in rtc.get("modified", [])]
-                   + rtc.get("deleted", []))
-        som_needed = any(_has_som_api(rt) for rt in all_rts)
-
-        if som_needed and not deployment_exists(dep["name"], conn):
-            print(f"[orchestrate] Deployment {dep['name']} not found — falling back to CREATE")
-            all_create = rtc.get("created", []) + [m["new"] for m in rtc.get("modified", [])]
-            fallback = {**dep, "runtimes_to_create": all_create}
-            apply_deployment_creates([fallback], conn, errors)
-            continue
-
-        if som_needed and dep.get("changed_fields"):
-            alter_deployment(dep["name"], dep["changed_fields"], **conn)
-
-        for rt in rtc.get("created", []):
-            try:
-                apply_runtime_create(dep["name"], rt, conn)
-            except Exception as e:
-                msg = f"Runtime {rt['name']} create failed: {format_safe_exception(e)}"
-                print(f"[orchestrate] ERROR: {msg}")
-                errors.append(msg)
-
-        for mod in rtc.get("modified", []):
-            rt_new = mod["new"]
-            rt_old = mod.get("old", rt_new)
-            try:
-                if _has_som_api(rt_new):
-                    exists = (
-                        runtime_exists(rt_old["name"], rt_old["database"], rt_old["schema"], conn)
-                        or runtime_exists(rt_new["name"], rt_new["database"], rt_new["schema"], conn)
-                    )
-                    if not exists:
-                        print(f"[orchestrate] Runtime {rt_new['name']} not found — falling back to CREATE")
-                        apply_runtime_create(dep["name"], rt_new, conn)
-                        continue
-                apply_runtime_modification(mod, conn)
-            except Exception as e:
-                msg = f"Runtime {rt_new['name']} modify failed: {format_safe_exception(e)}"
-                print(f"[orchestrate] ERROR: {msg}")
-                errors.append(msg)
-
-        for rt in rtc.get("deleted", []):
-            try:
-                if _has_som_api(rt):
-                    if not runtime_exists(rt["name"], rt["database"], rt["schema"], conn):
-                        print(f"[orchestrate] Runtime {rt['name']} not found — skipping delete")
-                        continue
-                else:
-                    print(f"[orchestrate] Runtime {rt['name']} has explicit URL — skipping SOM API delete (NiFi cleanup only)")
-                _delete_connectors(rt.get("connectors", []), rt["database"], rt["schema"], conn)
-                runtime_url = _runtime_url(rt, conn)
-                if runtime_url:
-                    _delete_flows(rt.get("flows", []), rt, runtime_url)
-                    _delete_parameter_providers(rt.get("parameter_providers", []), runtime_url, nifi_auth=_get_nifi_auth(rt))
-                    _delete_controller_services(rt.get("controller_services", []), runtime_url, nifi_auth=_get_nifi_auth(rt))
-                    _delete_root_pg_controller_services(rt.get("root_pg_controller_services", []), runtime_url, nifi_auth=_get_nifi_auth(rt))
-                if _has_som_api(rt):
-                    delete_runtime(rt["name"], rt["database"], rt["schema"], **conn)
-                    delete_runtime_eai(
-                        rt["name"], rt.get("network_rules", []),
-                        database=rt["database"], schema=rt["schema"], **conn
-                    )
-            except Exception as e:
-                msg = f"Runtime {rt['name']} delete failed: {format_safe_exception(e)}"
-                print(f"[orchestrate] ERROR: {msg}")
-                errors.append(msg)
-
-
-def apply_runtime_modification(mod, conn):
+def apply_runtime_modification(mod):
     rt = mod["new"]
-    database = rt["database"]
-    schema = rt["schema"]
-    som = _has_som_api(rt)
-    suspend_change = None
-
-    if som:
-        nr_changes = mod.get("network_rule_changes", {})
-        nr_created_or_deleted = any(nr_changes.get(k) for k in ("created", "deleted"))
-        for nr in nr_changes.get("created", []):
-            create_network_rule(namespaced_nr_name(rt["name"], nr["name"]), nr["type"], nr["mode"], nr["values"],
-                               database, schema, **conn)
-        for nr in nr_changes.get("deleted", []):
-            drop_network_rule(namespaced_nr_name(rt["name"], nr["name"]), database, schema, **conn)
-        for nr_mod in nr_changes.get("modified", []):
-            nr_new = nr_mod["new"]
-            alter_network_rule(namespaced_nr_name(rt["name"], nr_new["name"]), nr_new["values"],
-                               database, schema, **conn)
-        if nr_created_or_deleted:
-            create_runtime_eai(
-                rt["name"], rt.get("network_rules", []),
-                database, schema, execute_as_role=rt.get("execute_as_role"), **conn
-            )
-            eai = eai_name_for_runtime(rt["name"])
-            alter_runtime(rt["name"], database, schema, {},
-                          eai_names=[eai], **conn)
-
-        changed_fields = mod.get("changed_fields", {})
-        suspend_change = changed_fields.pop("suspend", None)
-
-        if suspend_change and not suspend_change["new"]:
-            resume_runtime(rt["name"], database, schema, **conn)
-
-        if changed_fields:
-            if rt.get("network_rules") or nr_created_or_deleted:
-                create_runtime_eai(
-                    rt["name"], rt.get("network_rules", []),
-                    database, schema, execute_as_role=rt.get("execute_as_role"), **conn
-                )
-            eai = eai_name_for_runtime(rt["name"])
-            alter_runtime(rt["name"], database, schema, changed_fields,
-                          eai_names=[eai], **conn)
-
-    runtime_url = _runtime_url(rt, conn)
-    if not runtime_url:
-        print(f"[orchestrate] No runtime URL for {rt['name']} — skipping registry and flow updates")
+    if rt.get("reconcile") is False:
         return
-
-    if rt.get("suspend"):
-        print(f"[orchestrate] Runtime {rt['name']} has suspend=true — skipping NiFi reconciliation")
-        return
-
+    runtime_url = _runtime_url(rt)
     blocked_bindings = mod.get("service_binding_changes", {}).get("blocked", [])
     if blocked_bindings:
         details = "; ".join(
@@ -667,7 +292,6 @@ def apply_runtime_modification(mod, conn):
     _reconcile_root_parameter_context(rt, runtime_url, pp_context_names)
     _reconcile_root_pg_controller_services(rt, runtime_url)
     _reconcile_flows(rt, runtime_url, provider_context_names=pp_context_names)
-    _reconcile_connectors(rt, conn)
 
     flow_changes = mod.get("flow_changes", {})
     if flow_changes.get("deleted"):
@@ -689,71 +313,30 @@ def apply_runtime_modification(mod, conn):
     if reg_changes.get("deleted"):
         _delete_flow_registries(reg_changes["deleted"], runtime_url, rt)
 
-    connector_changes = mod.get("connector_changes", {})
-    if connector_changes.get("deleted"):
-        _delete_connectors(connector_changes["deleted"], database, schema, conn)
-
-    if suspend_change and suspend_change["new"]:
-        suspend_runtime(rt["name"], database, schema, **conn)
-
-
-def apply_deployment_deletes(deleted_deps, conn, errors):
-    for dep in deleted_deps:
-        for rt in dep.get("runtimes_to_delete", []):
-            try:
-                runtime_url = _runtime_url(rt, conn)
-                if runtime_url:
-                    _delete_flows(rt.get("flows", []), rt, runtime_url)
-                    _delete_parameter_providers(rt.get("parameter_providers", []), runtime_url, nifi_auth=_get_nifi_auth(rt))
-                    _delete_controller_services(rt.get("controller_services", []), runtime_url, nifi_auth=_get_nifi_auth(rt))
-                    _delete_root_pg_controller_services(rt.get("root_pg_controller_services", []), runtime_url, nifi_auth=_get_nifi_auth(rt))
-                _delete_connectors(rt.get("connectors", []), rt["database"], rt["schema"], conn)
-
-                if _has_som_api(rt):
-                    delete_runtime(rt["name"], rt["database"], rt["schema"], **conn)
-                    delete_runtime_eai(
-                        rt["name"], rt.get("network_rules", []),
-                        database=rt["database"], schema=rt["schema"], **conn
-                    )
-            except Exception as e:
-                msg = f"Runtime {rt['name']} delete failed: {format_safe_exception(e)}"
-                print(f"[orchestrate] ERROR: {msg}")
-                errors.append(msg)
-
-        som_rts = [rt for rt in dep.get("runtimes_to_delete", []) if _has_som_api(rt)]
-        if som_rts:
-            delete_deployment(dep["name"], **conn)
-        else:
-            print(f"[orchestrate] Deployment {dep['name']} has only URL-managed runtimes — skipping deployment delete")
 
 
 def orchestrate(changes_path, config_path):
-    with open(changes_path) as f:
-        changes = json.load(f)
-
-    conn = get_conn()
-    deployments = changes.get("deployments", {})
+    load_config(config_path)
+    with open(changes_path) as handle:
+        changes = json.load(handle)
     errors = []
-
-    apply_deployment_creates(deployments.get("created", []), conn, errors)
-    apply_deployment_modifications(deployments.get("modified", []), conn, errors)
-    apply_deployment_deletes(deployments.get("deleted", []), conn, errors)
-
+    for runtime in changes.get("runtimes", {}).get("modified", []):
+        try:
+            apply_runtime_modification(runtime)
+        except Exception as exc:
+            errors.append(f"Runtime {runtime['name']} reconciliation failed: {format_safe_exception(exc)}")
     if errors:
-        print(f"\n[orchestrate] Completed with {len(errors)} error(s):")
-        for i, err in enumerate(errors, 1):
-            print(f"  {i}. {err}")
+        for error in errors:
+            print(error, file=sys.stderr)
         sys.exit(1)
-    else:
-        print("[orchestrate] All changes applied successfully")
+    print("[orchestrate] All NiFi resources reconciled successfully")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Orchestrate environment changes")
-    parser.add_argument("changes", help="Path to changes JSON from diff_environments.py")
-    parser.add_argument("config", help="Path to current config.yaml")
+    parser = argparse.ArgumentParser(description="Reconcile resources on existing NiFi instances")
+    parser.add_argument("changes", help="Path to translated live diff JSON")
+    parser.add_argument("config", help="Path to environment YAML")
     args = parser.parse_args()
-
     orchestrate(args.changes, args.config)
 
 

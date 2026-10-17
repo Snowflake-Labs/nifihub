@@ -4,6 +4,8 @@
 
 NiFi Hub is a repository of independently-versioned Apache NiFi extension bundles and versioned flow definitions. All Java code is under package `com.snowflake.nifihub`.
 
+Deployment automation manages resources on existing Apache NiFi instances through the NiFi REST API. Server installation, scaling, storage, and networking are operated separately. Environment files use a top-level `runtimes` list with a unique `name` and explicit `url` for each instance.
+
 ## Repository Structure
 
 - `extensions/<category>/<sub-category>/nifi-<name>-bundle/` -- NiFi extension bundles (Java, Maven)
@@ -11,6 +13,9 @@ NiFi Hub is a repository of independently-versioned Apache NiFi extension bundle
 - `flows/<bucket>/<flow-name>.md` -- Flow documentation (Markdown)
 - `flows/<bucket>/tests/test_<flow-name>.py` -- Flow validation tests (Python, nipyapi)
 - `pom.xml` -- Root parent POM (no modules, defines shared config)
+- `environments/<name>/config.yaml` -- Desired NiFi resources; validated against `environments/schema.json`
+- `scripts/cd/` -- Live resource discovery, diffing, and reconciliation
+- `scripts/ci/` -- Flow integration tests on existing NiFi instances, using isolated process groups and parameter contexts
 - `checkstyle.xml` -- Checkstyle rules (NiFi conventions)
 - `pmd-ruleset.xml` -- PMD rules (NiFi conventions)
 
@@ -73,6 +78,12 @@ Child modules (processors, NARs, etc.) reference the parent version as `${revisi
 # Run flow tests
 pip install -r flows/requirements.txt
 pytest flows/<bucket>/tests/ -v
+
+# Run CD regression tests and offline flow tests
+pytest scripts/cd/tests flows/ --import-mode=importlib -q
+
+# Preview resource changes on an existing NiFi instance
+python scripts/run-cd.py environments/local/config.yaml --dry-run
 ```
 
 ## Code Style
@@ -92,3 +103,5 @@ pytest flows/<bucket>/tests/ -v
 - Tests are named `Test<ClassName>.java` and live in `src/test/java/`
 - Code coverage must be >= 80%
 - Flow tests use `pytest` with `nipyapi`
+- Live flow tests require `NIFI_URL`, `DEPLOYED_PG_ID`, and NiFi authentication through `NIFI_USERNAME`/`NIFI_PASSWORD` or `NIFI_TOKEN`
+- CI cleanup removes only the temporary test process group and its isolated parameter contexts; installed NARs and explicitly configured shared services/providers remain available

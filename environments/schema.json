@@ -1,98 +1,66 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "title": "NiFi Hub Environment Configuration",
-  "description": "Declarative configuration for Openflow deployments, runtimes, and flow assignments.",
+  "description": "Declarative resource configuration for existing Apache NiFi instances.",
   "type": "object",
-  "required": ["account", "deployments"],
+  "required": [
+    "runtimes"
+  ],
   "additionalProperties": false,
   "properties": {
-    "account": {
-      "type": "object",
-      "required": ["name", "github_environment"],
-      "additionalProperties": false,
-      "properties": {
-        "name": {
-          "type": "string",
-          "description": "Human-readable account name (used in logs and comments)."
-        },
-        "github_environment": {
-          "type": "string",
-          "description": "GitHub Environment name that holds secrets for this account."
-        }
-      }
+    "name": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Environment name for logs and change plans."
     },
-    "deployments": {
+    "github_environment": {
+      "type": "string",
+      "minLength": 1,
+      "description": "GitHub Environment holding NiFi credentials; defaults to the config directory name."
+    },
+    "runtimes": {
       "type": "array",
       "minItems": 1,
-      "maxItems": 1,
-      "description": "Only one SNOWFLAKE deployment is allowed per account.",
       "items": {
-        "type": "object",
-        "required": ["name", "deployment_type"],
-        "additionalProperties": false,
-        "properties": {
-          "name": {
-            "type": "string",
-            "pattern": "^[A-Z][A-Z0-9_-]{0,254}$",
-            "description": "Snowflake identifier for the deployment."
-          },
-          "deployment_type": {
-            "type": "string",
-            "enum": ["SNOWFLAKE"],
-            "description": "Deployment type. Only SNOWFLAKE (SPCS) is supported."
-          },
-          "display_name": {
-            "type": "string",
-            "maxLength": 256,
-            "description": "Free-text alias shown in the Openflow UI."
-          },
-          "comment": {
-            "type": "string",
-            "maxLength": 1024
-          },
-          "runtimes": {
-            "type": "array",
-            "items": {
-              "$ref": "#/definitions/runtime"
-            }
-          }
-        }
+        "$ref": "#/definitions/runtime"
       }
     }
   },
   "definitions": {
     "runtime": {
       "type": "object",
-      "required": ["name", "database", "schema"],
+      "required": [
+        "name",
+        "url"
+      ],
       "additionalProperties": false,
       "properties": {
         "name": {
           "type": "string",
-          "pattern": "^[A-Z][A-Z0-9_-]{0,254}$",
-          "description": "Snowflake identifier for the runtime."
-        },
-        "database": {
-          "type": "string",
-          "description": "Database where the runtime is scoped."
-        },
-        "schema": {
-          "type": "string",
-          "description": "Schema where the runtime is scoped."
+          "minLength": 1,
+          "description": "Unique name for an existing Apache NiFi instance."
         },
         "url": {
           "type": "string",
           "format": "uri",
-          "description": "NiFi runtime URL (without /nifi-api suffix). When set, SOM SQL-based runtime lifecycle management (CREATE/ALTER/DROP, EAI, network rules, SUSPEND/RESUME) is skipped entirely. Only NiFi API operations (registries, flows, parameters, controller services, and service bindings) are performed."
+          "description": "Existing NiFi base URL, optionally ending in /nifi or /nifi-api.",
+          "pattern": "^https?://[^/]+"
         },
         "nifi_auth": {
           "type": "object",
-          "description": "Authentication configuration for the NiFi REST API. If omitted, the NIFI_RUNTIME_PAT environment variable is used (Bearer token — standard for Snowflake Openflow). Set this when connecting to an open-source Apache NiFi instance that uses username/password login.",
+          "description": "Username/password login configuration. If omitted, use NIFI_USERNAME/NIFI_PASSWORD or NIFI_TOKEN from the environment.",
           "additionalProperties": false,
-          "required": ["type", "username", "password"],
+          "required": [
+            "type",
+            "username",
+            "password"
+          ],
           "properties": {
             "type": {
               "type": "string",
-              "enum": ["username_password"],
+              "enum": [
+                "username_password"
+              ],
               "description": "Authentication type. Currently only username_password is supported."
             },
             "username": {
@@ -104,57 +72,18 @@
               "description": "NiFi password. Supports ${{ secrets.NAME }} syntax to reference GitHub Environment secrets."
             },
             "verify_ssl": {
-              "description": "SSL verification for the NiFi HTTPS endpoint. Accepts three values: true (default — verify against system CA store), false (disable verification, local dev only), or a string path to a custom CA certificate bundle (e.g. '/path/to/ca-bundle.crt'). Never disable in production."
+              "type": [
+                "boolean",
+                "string"
+              ],
+              "description": "Verify TLS (default true), false for local development, or a CA bundle path."
             }
           }
         },
-        "node_type": {
-          "type": "string",
-          "enum": ["SMALL", "MEDIUM", "LARGE"]
-        },
-        "min_nodes": {
-          "type": "integer",
-          "minimum": 1,
-          "maximum": 50
-        },
-        "max_nodes": {
-          "type": "integer",
-          "minimum": 1,
-          "maximum": 50
-        },
-        "suspend": {
-          "type": "boolean",
-          "description": "When true, the runtime is suspended (SUSPEND). When false, the runtime is resumed (RESUME). Defaults to false.",
-          "default": false
-        },
         "reconcile": {
           "type": "boolean",
-          "description": "When false, the CD pipeline skips NiFi-level reconciliation (flows, parameters, registries, controller services) for this runtime. The runtime infrastructure (SQL-level) is still managed. Defaults to true.",
+          "description": "Set false to skip all reads and changes for this NiFi instance.",
           "default": true
-        },
-        "sensitive_param_pattern": {
-          "type": "string",
-          "description": "Regex pattern to classify parameters from the auto-provisioned Snowflake Parameter Provider as sensitive. Parameters matching this pattern are marked SENSITIVE; others are NON_SENSITIVE. Defaults to '.*' (all sensitive).",
-          "default": ".*"
-        },
-        "execute_as_role": {
-          "type": "string",
-          "description": "Role that connectors use for Snowflake data access."
-        },
-        "display_name": {
-          "type": "string",
-          "maxLength": 256
-        },
-        "comment": {
-          "type": "string",
-          "maxLength": 1024
-        },
-        "network_rules": {
-          "type": "array",
-          "description": "Custom network rules for external access. A registry NR and EAI are auto-created by the pipeline.",
-          "items": {
-            "$ref": "#/definitions/network_rule"
-          }
         },
         "flow_registries": {
           "type": "array",
@@ -165,7 +94,7 @@
         },
         "controller_services": {
           "type": "array",
-          "description": "Controller-level controller services to provision on this runtime. These are created at the NiFi controller scope (not inside any process group) and are visible to parameter providers and reporting tasks. Use this for services that must be referenced by a parameter provider (e.g. SnowflakeConnectionService).",
+          "description": "Controller-scoped services for parameter providers and reporting tasks.",
           "items": {
             "$ref": "#/definitions/controller_service"
           }
@@ -190,7 +119,10 @@
               "type": "object",
               "description": "Non-sensitive parameters created or updated directly in the root parameter context. Use null to clear a value. Omitted parameters are left untouched.",
               "additionalProperties": {
-                "type": ["string", "null"]
+                "type": [
+                  "string",
+                  "null"
+                ]
               }
             },
             "assets": {
@@ -214,19 +146,15 @@
           "items": {
             "$ref": "#/definitions/parameter_provider"
           }
-        },
-        "connectors": {
-          "type": "array",
-          "description": "OpenFlow connectors to deploy on this runtime via SQL API.",
-          "items": {
-            "$ref": "#/definitions/connector"
-          }
         }
       }
     },
     "controller_service": {
       "type": "object",
-      "required": ["name", "type"],
+      "required": [
+        "name",
+        "type"
+      ],
       "additionalProperties": false,
       "properties": {
         "name": {
@@ -251,7 +179,11 @@
     },
     "nifi_bundle": {
       "type": "object",
-      "required": ["group", "artifact", "version"],
+      "required": [
+        "group",
+        "artifact",
+        "version"
+      ],
       "additionalProperties": false,
       "properties": {
         "group": {
@@ -273,7 +205,11 @@
     },
     "nifi_asset": {
       "type": "object",
-      "required": ["name", "url", "parameter"],
+      "required": [
+        "name",
+        "url",
+        "parameter"
+      ],
       "additionalProperties": false,
       "properties": {
         "name": {
@@ -296,7 +232,10 @@
     },
     "service_binding": {
       "type": "object",
-      "required": ["target", "properties"],
+      "required": [
+        "target",
+        "properties"
+      ],
       "additionalProperties": false,
       "properties": {
         "target": {
@@ -322,35 +261,12 @@
         }
       }
     },
-    "network_rule": {
-      "type": "object",
-      "required": ["name", "type", "mode", "values"],
-      "additionalProperties": false,
-      "properties": {
-        "name": {
-          "type": "string",
-          "pattern": "^[A-Z][A-Z0-9_-]{0,254}$"
-        },
-        "type": {
-          "type": "string",
-          "enum": ["HOST_PORT"]
-        },
-        "mode": {
-          "type": "string",
-          "enum": ["EGRESS"]
-        },
-        "values": {
-          "type": "array",
-          "minItems": 1,
-          "items": {
-            "type": "string"
-          }
-        }
-      }
-    },
     "flow_registry_client": {
       "type": "object",
-      "required": ["name", "properties"],
+      "required": [
+        "name",
+        "properties"
+      ],
       "additionalProperties": false,
       "properties": {
         "name": {
@@ -372,7 +288,10 @@
     },
     "parameter_provider": {
       "type": "object",
-      "required": ["name", "type"],
+      "required": [
+        "name",
+        "type"
+      ],
       "additionalProperties": false,
       "properties": {
         "name": {
@@ -391,78 +310,27 @@
           "type": "object",
           "description": "Key-value properties to configure on the parameter provider. Controller service names are automatically resolved to their NiFi UUIDs.",
           "additionalProperties": {
-            "type": ["string", "null"]
-          }
-        }
-      }
-    },
-    "connector": {
-      "type": "object",
-      "required": ["name", "definition"],
-      "additionalProperties": false,
-      "properties": {
-        "name": {
-          "type": "string",
-          "pattern": "^[A-Z][A-Z0-9_-]{0,254}$",
-          "description": "Snowflake identifier for the connector instance."
-        },
-        "definition": {
-          "type": "string",
-          "description": "Connector definition name (e.g. OPENFLOW_POSTGRES_CDC)."
-        },
-        "display_name": {
-          "type": "string",
-          "maxLength": 256
-        },
-        "comment": {
-          "type": "string",
-          "maxLength": 1024
-        },
-        "start": {
-          "type": "boolean",
-          "description": "If true, start the connector after configuration. Defaults to false."
-        },
-        "parameters": {
-          "type": "object",
-          "description": "Parameter values to apply to the connector config.json. Keys are property names from the config sections. For STRING_LITERAL: value is set directly. For SECRET_REFERENCE: value is the fully qualified secret name. For ASSET_REFERENCE: handled via assets array.",
-          "additionalProperties": {
-            "type": ["string", "null"]
-          }
-        },
-        "assets": {
-          "type": "array",
-          "description": "Files to upload to the connector stage. Each asset is bound to an ASSET_REFERENCE parameter.",
-          "items": {
-            "type": "object",
-            "required": ["name", "url", "parameter"],
-            "additionalProperties": false,
-            "properties": {
-              "name": {
-                "type": "string",
-                "description": "Filename for the asset in the connector stage."
-              },
-              "url": {
-                "type": "string",
-                "format": "uri",
-                "description": "URL to download the asset file from."
-              },
-              "parameter": {
-                "type": "string",
-                "description": "ASSET_REFERENCE parameter name to bind this asset to."
-              }
-            }
+            "type": [
+              "string",
+              "null"
+            ]
           }
         }
       }
     },
     "flow": {
       "type": "object",
-      "required": ["name", "bucket", "flow", "version"],
+      "required": [
+        "name",
+        "bucket",
+        "flow",
+        "version"
+      ],
       "additionalProperties": false,
       "properties": {
         "name": {
           "type": "string",
-          "description": "Process group name in NiFi. Uniquely identifies this checkout — the same versioned flow may be checked out multiple times under different names."
+          "description": "Process group name in NiFi. Uniquely identifies this checkout \u2014 the same versioned flow may be checked out multiple times under different names."
         },
         "registry": {
           "type": "string",
@@ -496,14 +364,20 @@
           "type": "object",
           "description": "Parameter values to set on the flow's parameter context(s). Keys are parameter names (context membership is resolved automatically). Values are strings; use null to clear a parameter.",
           "additionalProperties": {
-            "type": ["string", "null"]
+            "type": [
+              "string",
+              "null"
+            ]
           }
         },
         "parameter_overrides": {
           "type": "object",
           "description": "Parameter values to set as overrides in the flow's direct parameter context, shadowing any inherited values. Use this when deploying multiple instances with dedicated_parameter_context: true and different values for inherited parameters.",
           "additionalProperties": {
-            "type": ["string", "null"]
+            "type": [
+              "string",
+              "null"
+            ]
           }
         },
         "assets": {
@@ -524,10 +398,14 @@
       "allOf": [
         {
           "if": {
-            "required": ["service_bindings"]
+            "required": [
+              "service_bindings"
+            ]
           },
           "then": {
-            "required": ["start"],
+            "required": [
+              "start"
+            ],
             "properties": {
               "start": {
                 "type": "boolean"

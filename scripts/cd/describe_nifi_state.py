@@ -439,15 +439,16 @@ def describe_nifi_state(runtime_url, pat=None, nifi_auth=None, desired_flows=Non
 
 
 def main():
-    if len(sys.argv) < 3:
-        print("Usage: describe_nifi_state.py <runtime_url> <pat>", file=sys.stderr)
+    if len(sys.argv) < 2:
+        print("Usage: describe_nifi_state.py <runtime_url> [token]", file=sys.stderr)
         sys.exit(1)
 
     runtime_url = sys.argv[1]
-    pat = sys.argv[2] if len(sys.argv) > 2 else os.environ.get("NIFI_RUNTIME_PAT", "")
+    pat = sys.argv[2] if len(sys.argv) > 2 else os.environ.get("NIFI_TOKEN", "")
 
     import json
-    state = describe_nifi_state(runtime_url, pat)
+    from nifi_config import get_nifi_auth
+    state = describe_nifi_state(runtime_url, pat, nifi_auth=get_nifi_auth())
     json.dump(state, sys.stdout, indent=2)
     print()
 

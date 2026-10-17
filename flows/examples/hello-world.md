@@ -1,26 +1,17 @@
 # Hello World Flow
 
-## Purpose
+Generates a FlowFile, adds a configurable attribute with the example extension,
+and logs its attributes:
 
-A minimal example flow demonstrating the NiFi Hub flow structure. It generates a FlowFile with a static message and logs its attributes.
+`GenerateFlowFile → ExampleProcessor → LogAttribute`
 
-## Components
+Install the standard NiFi processors and `com.snowflake.nifihub:nifi-example-nar:0.3.0`
+before importing this snapshot. The custom processor is implemented in the
+example extension bundle. Referenced standard processor bundle versions must be
+available on the target NiFi instance.
 
-- **GenerateFlowFile**: Generates a FlowFile every 5 seconds with the content "Hello, NiFi Hub!"
-- **LogAttribute**: Logs all attributes and the payload of each incoming FlowFile at INFO level
-
-## Required NARs
-
-- `org.apache.nifi:nifi-standard-nar:2.8.0` (included with standard NiFi installations)
-
-## Parameters
-
-This flow does not use any parameters.
-
-## Configuration
-
-No additional configuration is required. Import the flow into NiFi and start the process group.
-
-## Expected Behavior
-
-Once started, the flow produces a log entry every 5 seconds showing the FlowFile attributes and the "Hello, NiFi Hub!" content.
+The flow has no parameter context. Import the JSON into NiFi or configure the
+GitHub Flow Registry Client and deploy through an environment YAML. Structural
+tests run offline. Live tests use an existing dedicated NiFi instance, with
+`NIFI_URL`, NiFi credentials, and `DEPLOYED_PG_ID` set by the integration workflow.
+The test YAML lists the example NAR release to install before importing the flow.

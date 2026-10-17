@@ -14,7 +14,7 @@
 # limitations under the License.
 
 #!/usr/bin/env python3
-"""Deploy a flow from JSON to an ephemeral CI runtime with full CD-style setup.
+"""Deploy a flow from JSON to an existing NiFi test instance with full CD-style setup.
 
 Uploads the flow JSON, adds inherited parameter contexts from providers,
 applies parameters and assets, then starts the flow.
@@ -23,8 +23,8 @@ Usage:
     python scripts/ci/deploy_ci_flow.py \
         --flow-path flows/data-generator/postgres-cdc-demo.json \
         --config flows/data-generator/tests/test_postgres_cdc_demo.yaml \
-        --runtime-url https://of--account.snowflakecomputing.app/key/nifi-api \
-        --pat <token> \
+        --runtime-url https://localhost:8443 \
+        --token <token> \
         --output-file /tmp/pg_id.txt
 """
 import argparse
@@ -41,11 +41,15 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "cd"))
 
 import nipyapi
 import yaml
+from jsonschema import validate, FormatChecker
+from nifi_config import get_nifi_auth
 
 from manage_flows import configure_nifi, find_flow_pg_by_name, start_flow, get_root_pg_id
 from manage_parameters import reconcile_flow_parameters, add_inherited_parameter_contexts, resolve_value, apply_parameter_overrides
 from manage_assets import reconcile_flow_assets
-from manage_parameter_providers import reconcile_parameter_providers, fetch_auto_provisioned_provider
+from manage_parameter_providers import reconcile_parameter_providers
+from manage_controller_services import reconcile_controller_services
+from setup_registry_client import setup as setup_registry
 import manage_parameter_providers  # noqa: F401 — triggers monkey patch
 
 
@@ -132,17 +136,37 @@ def upload_nars(nar_urls):
             os.unlink(local_path)
 
 
-def upload_flow(flow_path):
+def _isolate_parameter_contexts(flow_def, group_name):
+    contexts = flow_def.get("parameterContexts", {})
+    names = {name: f"{group_name} - {name}" for name in contexts}
+    for name, context in contexts.items():
+        context["name"] = names[name]
+        if "inheritedParameterContexts" in context:
+            context["inheritedParameterContexts"] = [names.get(inherited, inherited) for inherited in context["inheritedParameterContexts"]]
+    if contexts:
+        flow_def["parameterContexts"] = {names[name]: context for name, context in contexts.items()}
+
+    def rename_references(group):
+        name = group.get("parameterContextName")
+        if name in names:
+            group["parameterContextName"] = names[name]
+        for child in group.get("processGroups", []):
+            rename_references(child)
+
+    rename_references(flow_def["flowContents"])
+
+
+def upload_flow(flow_path, group_name=None):
     with open(flow_path, "r") as f:
         flow_def = json.load(f)
-    group_name = flow_def.get("flowContents", {}).get("name", os.path.basename(flow_path))
+    group_name = group_name or f"CI_{os.path.basename(flow_path).removesuffix('.json')}_{uuid.uuid4().hex[:12]}"
+    _isolate_parameter_contexts(flow_def, group_name)
     print(f"[ci-deploy] Flow name: {group_name}", file=sys.stderr)
 
     root_pg_id = get_root_pg_id()
 
     filename = os.path.basename(flow_path)
-    with open(flow_path, "rb") as fh:
-        file_tuple = (filename, fh.read(), "application/json")
+    file_tuple = (filename, json.dumps(flow_def).encode("utf-8"), "application/json")
     result = nipyapi.nifi.ProcessGroupsApi().upload_process_group(
         id=root_pg_id,
         file=file_tuple,
@@ -157,40 +181,34 @@ def upload_flow(flow_path):
     return pg_id, group_name
 
 
-def deploy(flow_path, config_path, runtime_url, pat):
+def deploy(flow_path, config_path, runtime_url, pat=None, group_name=None, output_file=None):
     with open(config_path) as f:
         config = yaml.safe_load(f)
 
-    base = re.sub(r"/nifi-api/?$", "", re.sub(r"/nifi/?$", "", runtime_url.rstrip("/")))
-    api_base = base + "/nifi-api"
-
-    nifi_auth_cfg = config.get("nifi_auth")
-    nifi_auth = None
-    if nifi_auth_cfg and nifi_auth_cfg.get("type") == "username_password":
-        from manage_parameters import resolve_value
-        nifi_auth = {
-            "type": "username_password",
-            "username": resolve_value(nifi_auth_cfg["username"]),
-            "password": resolve_value(nifi_auth_cfg["password"]),
-            "verify_ssl": nifi_auth_cfg.get("verify_ssl", True),
-        }
-
-    configure_nifi(api_base, pat=pat, nifi_auth=nifi_auth)
+    with open(os.path.join(os.path.dirname(__file__), "ci-runtime-schema.json")) as handle:
+        validate(config, json.load(handle), format_checker=FormatChecker())
+    nifi_auth = get_nifi_auth()
+    configure_nifi(runtime_url, pat=pat, nifi_auth=nifi_auth)
+    api_base = nipyapi.config.nifi_config.host
 
     nar_urls = config.get("nars", [])
     upload_nars(nar_urls)
 
-    pg_id, group_name = upload_flow(flow_path)
+    for registry in config.get("flow_registries", []):
+        properties = {key: resolve_value(value) for key, value in registry.get("properties", {}).items()}
+        setup_registry(registry["name"], properties, api_base, pat, type_override=registry.get("type"), nifi_auth=nifi_auth)
+    if config.get("controller_services"):
+        reconcile_controller_services(config["controller_services"], api_base, pat, nifi_auth=nifi_auth)
+
+    pg_id, group_name = upload_flow(flow_path, group_name=group_name)
+    if output_file:
+        with open(output_file, "w") as handle:
+            handle.write(pg_id)
 
     providers = config.get("parameter_providers", [])
     provider_context_names = []
     if providers:
         provider_context_names = reconcile_parameter_providers(providers, api_base, pat, nifi_auth=nifi_auth)
-
-    sensitive_pattern = config.get("sensitive_param_pattern", ".*")
-    auto_names = fetch_auto_provisioned_provider(sensitive_pattern=sensitive_pattern)
-    if auto_names:
-        provider_context_names.extend(auto_names)
 
     if provider_context_names:
         pattern = config.get("provided_parameter_contexts")
@@ -223,24 +241,20 @@ def deploy(flow_path, config_path, runtime_url, pat):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Deploy a flow to CI runtime with full setup")
+    parser = argparse.ArgumentParser(description="Deploy a temporary test flow to an existing NiFi instance")
     parser.add_argument("--flow-path", required=True, help="Path to flow JSON")
     parser.add_argument("--config", required=True, help="Path to test YAML")
-    parser.add_argument("--runtime-url", required=True, help="Runtime NiFi API URL")
-    parser.add_argument("--pat", required=True, help="NiFi PAT")
+    parser.add_argument("--runtime-url", default=os.environ.get("NIFI_URL"), required=not os.environ.get("NIFI_URL"), help="NiFi URL")
+    parser.add_argument("--token", default=os.environ.get("NIFI_TOKEN", ""), help="NiFi bearer token")
     parser.add_argument("--output-file", help="File to write PG ID to")
     args = parser.parse_args()
 
     try:
-        pg_id = deploy(args.flow_path, args.config, args.runtime_url, args.pat)
-        if args.output_file:
-            with open(args.output_file, "w") as f:
-                f.write(pg_id)
+        pg_id = deploy(args.flow_path, args.config, args.runtime_url, args.token, output_file=args.output_file)
         print(pg_id)
     except Exception as exc:
-        print(f"[ci-deploy] Failed: {exc}", file=sys.stderr)
-        import traceback
-        traceback.print_exc()
+        from safe_exceptions import format_safe_exception
+        print(f"[ci-deploy] Failed: {format_safe_exception(exc)}", file=sys.stderr)
         sys.exit(1)
 
 

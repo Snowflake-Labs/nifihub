@@ -175,14 +175,14 @@ jobs:
             body += '### :rocket: Flow Deploy Available\n\n';
             body += 'This PR modifies flow definitions that have a CI test configuration. ';
             body += 'A maintainer (`admin` or `maintain` permission) can deploy and test the flow ';
-            body += 'on an ephemeral Snowflake runtime by commenting:\n\n';
+            body += 'on an existing Apache NiFi test instance by commenting:\n\n';
             body += '> **`deploy this flow`** or **`deploy the flow`**\n\n';
             body += 'This will:\n';
-            body += '1. Create a dedicated ephemeral runtime\n';
+            body += '1. Connect to the configured dedicated Apache NiFi test instance\n';
             body += '2. Deploy the changed flow(s)\n';
             body += '3. Run validation tests\n';
-            body += '4. Tear down the runtime and report results\n\n';
-            body += 'To keep the runtime alive for debugging, add `do not clean` to the comment.';
+            body += '4. Remove the temporary test process group and report results\n\n';
+            body += 'To keep the test process group for debugging, add `do not clean` to the comment.';
 
             await github.rest.issues.createComment({
               owner: context.repo.owner,
