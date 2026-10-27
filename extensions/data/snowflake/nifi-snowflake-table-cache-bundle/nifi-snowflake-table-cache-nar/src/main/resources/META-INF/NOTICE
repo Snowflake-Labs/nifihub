@@ -1,0 +1,61 @@
+Snowflake Table Cache - NiFi Hub
+
+This bundle includes unmodified org.rocksdb:rocksdbjni:11.1.1.
+RocksDB: Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved.
+Copyright (c) Meta Platforms, Inc. and affiliates.
+RocksDB is offered under Apache License 2.0 or GPLv2; this distribution selects
+Apache License 2.0. The full Apache license is in META-INF/LICENSE.
+
+RocksDB incorporates code from LevelDB:
+Copyright (c) 2011 The LevelDB Authors. All rights reserved.
+Full BSD terms: META-INF/licenses/leveldb.md.
+
+RocksDB's bundled xxHash and XXH3 preview code:
+Copyright (C) 2012-2021 Yann Collet (xxhash.h).
+Copyright (C) 2012-2020 Yann Collet (xxhash.cc).
+Copyright (C) 2012-2016, Yann Collet (xxph3.h).
+Full BSD terms: META-INF/licenses/rocks-xxhash.md,
+rocks-xxhash-c.md and rocks-xxph3.md.
+MurmurHash's upstream public-domain statement is in licenses/murmurhash.md.
+
+The JNI static compression build includes the following libraries. Their notices
+are reproduced even on platform variants that omit a particular library:
+
+zlib: (C) 1995-2022 Jean-loup Gailly and Mark Adler.
+Full terms: META-INF/licenses/zlib.md.
+
+bzip2/libbzip2: Copyright (C) 1996-2019 Julian R Seward. All rights reserved.
+Full terms: META-INF/licenses/bzip2.md.
+
+Snappy: Copyright 2011, Google Inc. All rights reserved.
+Additional source copyrights: Copyright 2005 and onwards Google Inc.;
+Copyright 2008 Google Inc.; Copyright 2011 Martin Gieseking.
+Full terms: META-INF/licenses/snappy.md and snappy-c.md.
+The upstream COPYING also describes benchmark data, which this NAR does not ship.
+
+LZ4 Library: Copyright (c) 2011-2020, Yann Collet. All rights reserved.
+Full BSD terms: META-INF/licenses/lz4.md.
+
+Zstandard: Copyright (c) Meta Platforms, Inc. and affiliates. All rights reserved.
+This distribution selects its BSD license: META-INF/licenses/zstd.md.
+Its adapted xxHash attribution is in META-INF/licenses/zstd-xxhash.md.
+Its libdivsufsort-lite code is Copyright (c) 2003-2008 Yuta Mori.
+Full MIT terms: META-INF/licenses/divsufsort.md.
+
+Architecture-specific RocksDB CRC code includes:
+Copyright (c) 2018, Arm Limited and affiliates. All rights reserved.
+Copyright (c) 2015 Anton Blanchard, IBM.
+Copyright (c) 2017 International Business Machines Corp. All rights reserved.
+These source headers offer the same Apache 2.0/GPLv2 choice as RocksDB.
+
+The PowerPC assembly source references GCC assembly definitions:
+Copyright (C) 2002-2020 Free Software Foundation, Inc.
+The upstream header is GPLv3-or-later WITH GCC Runtime Library Exception 3.1.
+Its notice, GPLv3 and exception are reproduced in META-INF/licenses/gcc-header.md,
+gcc-gpl3.md and gcc-exception.md. These terms apply to that material, not as a
+relicensing of RocksDB or this Java component.
+
+This notice supplements, and does not replace or alter, the individual licenses.
+Version-pinned source locations and license hashes are in
+META-INF/license-inventory.properties. Technical inventory and limitations are
+documented in THIRD_PARTY.md in the bundle source distribution.
