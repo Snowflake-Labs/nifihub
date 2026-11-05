@@ -18,6 +18,7 @@ import org.apache.nifi.serialization.record.RecordSchema;
 
 import java.util.HashMap;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 
@@ -27,13 +28,13 @@ import java.util.Set;
  *
  * <p>Full loads and incremental updates temporarily retain both old and new maps.
  *
- * <p>Not durable: contents and watermark are both rebuilt on restart. That pairing is deliberate —
- * a persisted watermark with an empty cache would skip changes it never applied.
+ * <p>Not durable: contents and checkpoint are both rebuilt on restart. That pairing is deliberate —
+ * a persisted checkpoint with an empty cache would skip changes it never applied.
  */
 public class HeapTableCacheStore implements TableCacheStore {
 
-    /** Contents, schema and watermark swapped together, so they can never disagree. */
-    private record Snapshot(Map<String, Record> contents, RecordSchema schema, String watermark) {
+    /** Contents, schema and checkpoint swapped together, so they can never disagree. */
+    private record Snapshot(Map<String, Record> contents, RecordSchema schema, CacheCheckpoint checkpoint) {
     }
 
     private volatile Snapshot snapshot = null;
@@ -45,17 +46,21 @@ public class HeapTableCacheStore implements TableCacheStore {
 
     @Override
     public void applyChanges(final RecordSchema schema, final Map<String, Record> upserts,
-                            final Set<String> deletes, final String watermark) {
+                            final Set<String> deletes, final CacheCheckpoint checkpoint) {
+        Objects.requireNonNull(checkpoint, "Checkpoint is required");
         final Snapshot current = snapshot;
         if (current == null) {
             throw new IllegalStateException("Cannot apply changes before an initial load");
+        }
+        if (!current.schema().getFieldNames().equals(schema.getFieldNames())) {
+            throw new IllegalStateException("Schema changed since the last full load");
         }
         // Copy-on-write. At heap-mode sizes this is cheap, and it makes the delta atomically
         // visible without any locking on the read path.
         final Map<String, Record> next = new HashMap<>(current.contents());
         next.keySet().removeAll(deletes);
         next.putAll(upserts);
-        snapshot = new Snapshot(next, schema, watermark);
+        snapshot = new Snapshot(next, schema, checkpoint);
     }
 
     @Override
@@ -79,9 +84,9 @@ public class HeapTableCacheStore implements TableCacheStore {
     }
 
     @Override
-    public String watermark() {
+    public CacheCheckpoint checkpoint() {
         final Snapshot current = snapshot;
-        return current == null ? null : current.watermark();
+        return current == null ? null : current.checkpoint();
     }
 
     @Override
@@ -119,11 +124,12 @@ public class HeapTableCacheStore implements TableCacheStore {
         }
 
         @Override
-        public void commit(final String watermark) {
+        public void commit(final CacheCheckpoint checkpoint) {
             if (staged == null) {
                 throw new IllegalStateException("Bulk load already completed");
             }
-            snapshot = new Snapshot(staged, schema, watermark);
+            Objects.requireNonNull(checkpoint, "Checkpoint is required");
+            snapshot = new Snapshot(staged, schema, checkpoint);
             staged = null;
         }
 

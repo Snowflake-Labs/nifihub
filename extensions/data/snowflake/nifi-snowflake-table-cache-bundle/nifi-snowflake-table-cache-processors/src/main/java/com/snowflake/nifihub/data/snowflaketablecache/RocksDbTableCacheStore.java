@@ -25,9 +25,12 @@ import org.rocksdb.RocksDB;
 import org.rocksdb.RocksDBException;
 import org.rocksdb.WriteBatch;
 import org.rocksdb.WriteOptions;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
+import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.channels.FileLock;
 import java.nio.channels.OverlappingFileLockException;
@@ -42,6 +45,7 @@ import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
@@ -73,10 +77,12 @@ import java.util.stream.Stream;
  */
 public class RocksDbTableCacheStore implements TableCacheStore {
 
+    private static final Logger LOGGER = LoggerFactory.getLogger(RocksDbTableCacheStore.class);
+
     private static final String GENERATION_PREFIX = "gen-";
     private static final byte[] SCHEMA_KEY = "\u0000__schema__".getBytes(StandardCharsets.UTF_8);
     private static final byte[] COUNT_KEY = "\u0000__count__".getBytes(StandardCharsets.UTF_8);
-    private static final byte[] WATERMARK_KEY = "\u0000__watermark__".getBytes(StandardCharsets.UTF_8);
+    private static final byte[] CHECKPOINT_KEY = "\u0000__checkpoint__".getBytes(StandardCharsets.UTF_8);
 
     static {
         RocksDB.loadLibrary();
@@ -90,7 +96,7 @@ public class RocksDbTableCacheStore implements TableCacheStore {
     private Generation current;
 
     public RocksDbTableCacheStore(final Path baseDirectory) throws IOException {
-        this(baseDirectory, RowCodec.encode(List.of("table-cache-v1", "standalone")));
+        this(baseDirectory, RowCodec.encode(List.of("table-cache-v2", "standalone")));
     }
 
     public RocksDbTableCacheStore(final Path baseDirectory, final byte[] identity) throws IOException {
@@ -132,7 +138,7 @@ public class RocksDbTableCacheStore implements TableCacheStore {
         }
         try {
             current = Generation.open(generationPath(newest), newest);
-        } catch (final RocksDBException e) {
+        } catch (final RocksDBException | RuntimeException e) {
             // Lock errors, corruption and incomplete generations must never trigger data deletion.
             throw new IOException("Cannot adopt cache generation; preserve it and use a fresh directory", e);
         }
@@ -140,13 +146,26 @@ public class RocksDbTableCacheStore implements TableCacheStore {
 
     @Override
     public BulkLoad beginBulkLoad(final RecordSchema schema) {
-        final long next = 1 + generationNumbers().stream().max(Comparator.naturalOrder()).orElse(0L);
-        return new RocksBulkLoad(next, schema);
+        lock.writeLock().lock();
+        try {
+            requireOpen();
+            final long next = 1 + generationNumbers().stream().max(Comparator.naturalOrder()).orElse(0L);
+            return new RocksBulkLoad(next, schema);
+        } finally {
+            lock.writeLock().unlock();
+        }
+    }
+
+    private void requireOpen() {
+        if (!ownershipLock.isValid()) {
+            throw new IllegalStateException("Cache store is closed");
+        }
     }
 
     @Override
     public void applyChanges(final RecordSchema schema, final Map<String, Record> upserts,
-                            final Set<String> deletes, final String watermark) {
+                            final Set<String> deletes, final CacheCheckpoint checkpoint) {
+        Objects.requireNonNull(checkpoint, "Checkpoint is required");
         lock.writeLock().lock();
         try {
             if (current == null) {
@@ -159,7 +178,7 @@ public class RocksDbTableCacheStore implements TableCacheStore {
                 throw new IllegalStateException("Schema changed since the last full load: stored "
                         + current.fieldNames + " but delta carries " + schema.getFieldNames());
             }
-            current.applyChanges(upserts, deletes, watermark);
+            current.applyChanges(upserts, deletes, checkpoint);
         } finally {
             lock.writeLock().unlock();
         }
@@ -196,10 +215,10 @@ public class RocksDbTableCacheStore implements TableCacheStore {
     }
 
     @Override
-    public String watermark() {
+    public CacheCheckpoint checkpoint() {
         lock.readLock().lock();
         try {
-            return current == null ? null : current.watermark;
+            return current == null ? null : current.checkpoint;
         } finally {
             lock.readLock().unlock();
         }
@@ -275,14 +294,14 @@ public class RocksDbTableCacheStore implements TableCacheStore {
         private final Set<String> pendingKeys = new HashSet<>();
         private long staged;
         private boolean committed;
+        private boolean closed;
 
         RocksBulkLoad(final long number, final RecordSchema schema) {
             this.number = number;
             this.path = generationPath(number);
             this.fieldNames = schema.getFieldNames();
             try {
-                deleteRecursively(path);
-                Files.createDirectories(path);
+                Files.createDirectory(path);
                 options = new Options()
                         .setCreateIfMissing(true)
                         .setCompressionType(CompressionType.ZSTD_COMPRESSION)
@@ -299,8 +318,8 @@ public class RocksDbTableCacheStore implements TableCacheStore {
 
         @Override
         public void put(final String key, final Record value) {
-            if (committed) {
-                throw new IllegalStateException("Bulk load already committed");
+            if (committed || db == null) {
+                throw new IllegalStateException("Bulk load already completed");
             }
             if (key == null || value == null) {
                 throw new IllegalArgumentException("Source keys and records must be non-null");
@@ -328,16 +347,18 @@ public class RocksDbTableCacheStore implements TableCacheStore {
         }
 
         @Override
-        public void commit(final String watermark) {
-            if (committed) {
-                throw new IllegalStateException("Bulk load already committed");
+        public void commit(final CacheCheckpoint checkpoint) {
+            if (committed || db == null) {
+                throw new IllegalStateException("Bulk load already completed");
             }
+            Objects.requireNonNull(checkpoint, "Checkpoint is required");
+            final Generation previous;
+            lock.writeLock().lock();
             try {
+                requireOpen();
                 batch.put(SCHEMA_KEY, RowCodec.encode(fieldNames));
                 batch.put(COUNT_KEY, Long.toString(staged).getBytes(StandardCharsets.UTF_8));
-                if (watermark != null) {
-                    batch.put(WATERMARK_KEY, watermark.getBytes(StandardCharsets.UTF_8));
-                }
+                batch.put(CHECKPOINT_KEY, encodeCheckpoint(checkpoint));
                 flush();
                 db.flushWal(true);
                 db.close();
@@ -347,31 +368,36 @@ public class RocksDbTableCacheStore implements TableCacheStore {
 
                 // Reopen and publish. Only now does anything become visible.
                 final Generation next = Generation.open(path, number);
-                final Generation previous;
-                lock.writeLock().lock();
-                try {
-                    previous = current;
-                    current = next;
-                } finally {
-                    lock.writeLock().unlock();
-                }
-                // Safe: the write lock guarantees no reader still holds this handle.
-                if (previous != null) {
-                    previous.close();
-                    deleteRecursively(previous.path);
-                }
+                previous = current;
+                current = next;
+                // Publication is final even if reclaiming the previous generation fails.
                 committed = true;
             } catch (final RocksDBException e) {
-                throw new IllegalStateException("Failed to commit RocksDB generation " + number, e);
+                throw new IllegalStateException("Failed to commit RocksDB generation %s".formatted(number), e);
+            } finally {
+                lock.writeLock().unlock();
+            }
+            // Safe: the write lock guarantees no reader still holds this handle.
+            if (previous != null) {
+                try {
+                    previous.close();
+                    deleteRecursively(previous.path);
+                } catch (final RuntimeException e) {
+                    LOGGER.warn("Cache committed but previous generation cleanup failed at {}", previous.path, e);
+                }
             }
         }
 
         @Override
         public void close() {
+            if (closed) {
+                return;
+            }
             closeQuietly();
             if (!committed) {
                 deleteRecursively(path);
             }
+            closed = true;
         }
 
         private void closeQuietly() {
@@ -406,18 +432,18 @@ public class RocksDbTableCacheStore implements TableCacheStore {
         private final List<String> fieldNames;
 
         private volatile long rowCount;
-        private volatile String watermark;
+        private volatile CacheCheckpoint checkpoint;
 
         private Generation(final Path path, final long number, final Options options,
                            final RocksDB db, final List<String> fieldNames, final long rowCount,
-                           final String watermark) {
+                           final CacheCheckpoint checkpoint) {
             this.path = path;
             this.number = number;
             this.options = options;
             this.db = db;
             this.fieldNames = fieldNames;
             this.rowCount = rowCount;
-            this.watermark = watermark;
+            this.checkpoint = checkpoint;
             final List<RecordField> fields = new ArrayList<>(fieldNames.size());
             for (final String name : fieldNames) {
                 fields.add(new RecordField(name, RecordFieldType.STRING.getDataType()));
@@ -434,14 +460,14 @@ public class RocksDbTableCacheStore implements TableCacheStore {
                 db = RocksDB.open(options, path.toString());
                 final byte[] schemaBytes = db.get(SCHEMA_KEY);
                 final byte[] countBytes = db.get(COUNT_KEY);
-                if (schemaBytes == null || countBytes == null) {
-                    throw new RocksDBException("Generation at " + path + " has no committed marker");
+                final byte[] checkpointBytes = db.get(CHECKPOINT_KEY);
+                if (schemaBytes == null || countBytes == null || checkpointBytes == null) {
+                    throw new RocksDBException("Generation at %s has no committed metadata".formatted(path));
                 }
-                final byte[] watermarkBytes = db.get(WATERMARK_KEY);
                 return new Generation(path, number, options, db,
                         RowCodec.decode(schemaBytes),
                         Long.parseLong(new String(countBytes, StandardCharsets.UTF_8)),
-                        watermarkBytes == null ? null : new String(watermarkBytes, StandardCharsets.UTF_8));
+                        decodeCheckpoint(checkpointBytes));
             } catch (final RocksDBException | RuntimeException e) {
                 if (db != null) {
                     db.close();
@@ -451,9 +477,9 @@ public class RocksDbTableCacheStore implements TableCacheStore {
             }
         }
 
-        /** One atomic WriteBatch: the delta, the row count, and the watermark together. */
+        /** One atomic WriteBatch: the delta, the row count, and the checkpoint together. */
         void applyChanges(final Map<String, Record> upserts, final Set<String> deletes,
-                          final String newWatermark) {
+                          final CacheCheckpoint newCheckpoint) {
             long delta = 0;
             try (WriteBatch batch = new WriteBatch();
                  WriteOptions writeOptions = new WriteOptions()) {
@@ -478,15 +504,11 @@ public class RocksDbTableCacheStore implements TableCacheStore {
 
                 final long newCount = rowCount + delta;
                 batch.put(COUNT_KEY, Long.toString(newCount).getBytes(StandardCharsets.UTF_8));
-                if (newWatermark != null) {
-                    batch.put(WATERMARK_KEY, newWatermark.getBytes(StandardCharsets.UTF_8));
-                } else {
-                    batch.delete(WATERMARK_KEY);
-                }
+                batch.put(CHECKPOINT_KEY, encodeCheckpoint(newCheckpoint));
 
                 db.write(writeOptions, batch);
                 rowCount = newCount;
-                watermark = newWatermark;
+                checkpoint = newCheckpoint;
             } catch (final RocksDBException e) {
                 throw new IllegalStateException("Failed to apply changes to generation " + number, e);
             }
@@ -510,9 +532,43 @@ public class RocksDbTableCacheStore implements TableCacheStore {
         }
 
         void close() {
-            db.close();
-            options.close();
+            try {
+                db.close();
+            } finally {
+                options.close();
+            }
         }
+    }
+
+    private static byte[] encodeCheckpoint(final CacheCheckpoint checkpoint) {
+        return RowCodec.encode(List.of(checkpoint.queryId(), checkpoint.sourceSignature()));
+    }
+
+    private static CacheCheckpoint decodeCheckpoint(final byte[] encoded) {
+        // Bound lengths before RowCodec allocates; reject truncated or noncanonical metadata.
+        final ByteBuffer buffer = ByteBuffer.wrap(encoded);
+        if (buffer.remaining() < Integer.BYTES || buffer.getInt() != 2) {
+            throw new IllegalArgumentException("Checkpoint must contain exactly two strings");
+        }
+        for (int index = 0; index < 2; index++) {
+            if (buffer.remaining() < Integer.BYTES) {
+                throw new IllegalArgumentException("Checkpoint string length is missing");
+            }
+            final int length = buffer.getInt();
+            if (length <= 0 || length > buffer.remaining()) {
+                throw new IllegalArgumentException("Checkpoint string length is invalid");
+            }
+            buffer.position(buffer.position() + length);
+        }
+        if (buffer.hasRemaining()) {
+            throw new IllegalArgumentException("Checkpoint has trailing bytes");
+        }
+        final List<String> values = RowCodec.decode(encoded);
+        final CacheCheckpoint checkpoint = new CacheCheckpoint(values.get(0), values.get(1));
+        if (!Arrays.equals(encoded, encodeCheckpoint(checkpoint))) {
+            throw new IllegalArgumentException("Checkpoint encoding is invalid");
+        }
+        return checkpoint;
     }
 
     private static byte[] dataKey(final String key) {

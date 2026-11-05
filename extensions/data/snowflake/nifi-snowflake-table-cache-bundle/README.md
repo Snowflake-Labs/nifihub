@@ -12,7 +12,7 @@ service. See the repository's support disclaimer and Apache 2.0 license.
 | Property | Meaning |
 |---|---|
 | Snowflake Connection Service | Existing `DBCPService` with access to the reference table |
-| Source Table | Reference table or view; use a fully qualified identifier |
+| Source Table | Fully qualified native table; views, temporary, external, Iceberg, dynamic and hybrid tables are not supported |
 | Key Columns | Comma-separated lookup columns; supply each as a LookupRecord coordinate |
 | Value Columns | Columns to return, or `*`; all returned values are strings |
 | Storage Mode | Heap (default) or Embedded (RocksDB) |
@@ -23,7 +23,20 @@ service. See the repository's support disclaimer and Apache 2.0 license.
 Use an existing connection service whose runtime identity has only the required
 database/schema usage, reference-table SELECT, and warehouse access. Change
 tracking must be configured by an authorized table owner. The cache does not
-create streams, tasks, source tables or grants.
+create streams, tasks, source tables, stored procedures or grants. Each refresh
+submits an anonymous SQL procedure through the existing JDBC connection. That
+call performs multiple child queries; it is not one transaction or one snapshot.
+Borrowed connections must use auto-commit and have no caller-owned transaction;
+the service rejects auto-commit-disabled connections rather than committing or
+rolling back another component's work. Use a pool that resets session state.
+
+Use Snowflake identifier syntax in table and column properties: unquoted names
+are uppercase, while double-quoted names preserve case and punctuation. For
+example, `MY_DB.PUBLIC.REFERENCE_DATA` and key columns `ITEM_ID,"Region Code"`.
+Lookup coordinates use the resolved names (`ITEM_ID` and `Region Code`), without
+the surrounding quotes. SQL expressions and arbitrary source queries are not
+accepted. Value Columns `*` includes all source columns; explicit projections
+also include the configured key columns.
 
 Enable the connection service before the cache. In `LookupRecord`, configure
 record reader/writer services, choose this lookup service, map a key column such
@@ -40,18 +53,28 @@ against an unchanged source row. Composite keys use length-prefixed encoding.
 ## Refresh and failure semantics
 
 - Lookups fail before the first successful load, rather than reporting a miss.
-- After hydration, refresh failures retain the previous cache **without an age
-  limit**. Warm starts can serve old data before their first scheduled refresh.
-  This is not fail-closed authorization or guaranteed real-time revocation.
-- Full reloads replace the cache. Incremental reads advance a node-local watermark
-  alongside its data. SQL failures on the incremental path attempt a full reload.
+- Persistent starts validate and refresh the existing cache before serving it;
+  they can resume incrementally when the source and checkpoint remain usable.
+- After validation, transient refresh failures retain the previous cache
+  **without an age limit**. Detected source discontinuity blocks lookups until a
+  full reload succeeds. This is not guaranteed real-time revocation: source checks
+  are optimistic and do not lock DDL or detect every policy/session change.
+- Full reloads replace the cache. Each node stores the full SELECT's exact child
+  query ID, or the explicit endpoint of an incremental read, with its rows,
+  schema and source signature. The outer anonymous CALL ID is not the checkpoint.
+  Missing historical statements/time travel and source-signature changes attempt
+  an aligned full reload. Other SQL/protocol failures surface without silently
+  treating a failed incremental refresh as a successful full load.
 - Incremental reads retain both update halves, remove the old key when a key
   changes, and let inserts win over deletes for the same key regardless of row
-  order. Reads have an explicit end watermark. Local tests cover row application;
-  the changed Snowflake query still requires live verification.
+  order. Reads have an explicit end checkpoint. A complete control row and the
+  expected number of data rows must arrive before any cache change is published;
+  an empty table or delta still carries a checkpoint.
 - Initial-load failures are retried only when the refresh interval is positive.
 - Every value is a string, including numeric and semi-structured values. Convert
   downstream when native types are required.
+- Nodes refresh independently and can serve different valid point-in-time
+  snapshots. There is no primary-only reader, shared cursor or cache replication.
 
 ## Storage and operating limits
 
@@ -68,11 +91,15 @@ operator. Keep source credentials out of paths and logs.
 Embedded mode locks its directory and checks a versioned identity containing the
 connection-service ID, source expression, key/value columns and incremental mode.
 Mismatches fail enablement; existing generations are not deleted on open errors.
-This does not detect a changed account, role, database, or session configuration
-inside the same DBCP service, nor source replacement under the same table name.
-Use a fresh directory for those changes. Fully qualify source names and keep the
-connection context stable. This is a configuration guard, not a source identity
-or authorization guarantee.
+The query-ID checkpoint format is `table-cache-v2`; use a fresh directory for
+older caches. No migration or timestamp-checkpoint compatibility is provided.
+
+The source signature checks table creation/DDL metadata, retention, account,
+user and primary role before and after the data query. Incremental mode requires
+at least one day of retention. The guard does not cover every masking/row-access
+policy, secondary-role or session-setting change. Keep the connection evaluation
+context stable. A signature is not an authorization guarantee, and historical
+query IDs remain subject to Snowflake's statement lookup and data-retention limits.
 
 Disable waits for an in-flight refresh before closing native storage. Configure
 connection/query timeouts in the supplied DBCP service: a driver that ignores
@@ -96,7 +123,9 @@ From the repository root, with Java 21:
   -f extensions/data/snowflake/nifi-snowflake-table-cache-bundle/pom.xml
 ```
 
-Normal builds use H2 and temporary RocksDB directories and do not need an account.
+Normal builds use deterministic JDBC response fixtures and temporary RocksDB
+directories and do not need an account. Fixtures test response handling, not
+Snowflake syntax or change-tracking semantics.
 Live tests are skipped unless `SNOWFLAKE_IT_CONNECTION` explicitly selects a test
 connection. They create and drop unique fixture tables, so use a dedicated test
 database/schema and explicitly scoped warehouse/role, not production.

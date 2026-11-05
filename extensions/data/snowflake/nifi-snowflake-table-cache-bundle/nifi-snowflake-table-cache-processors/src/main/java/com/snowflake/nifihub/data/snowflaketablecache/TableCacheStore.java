@@ -34,7 +34,7 @@ import java.util.Set;
  *   <li>{@link #applyChanges} — apply a delta. Used for incremental refresh.</li>
  * </ul>
  *
- * <p>Both write paths also carry the <b>watermark</b>, so it is stored atomically with the data it
+ * <p>Both write paths also carry the <b>checkpoint</b>, so it is stored atomically with the data it
  * describes. Crash and filesystem durability still depend on the backend and runtime.
  */
 public interface TableCacheStore extends Closeable {
@@ -48,15 +48,15 @@ public interface TableCacheStore extends Closeable {
     BulkLoad beginBulkLoad(RecordSchema schema);
 
     /**
-     * Atomically apply a delta and advance the watermark.
+     * Atomically apply a delta and advance the checkpoint.
      *
-     * @param schema    schema of the upserted records
-     * @param upserts   keys to insert or replace
-     * @param deletes   keys to remove; an upsert for the same key takes precedence
-     * @param watermark new watermark, stored with the change
+     * @param schema     schema of the upserted records
+     * @param upserts    keys to insert or replace
+     * @param deletes    keys to remove; an upsert for the same key takes precedence
+     * @param checkpoint non-null checkpoint, stored with the change
      */
     void applyChanges(RecordSchema schema, Map<String, Record> upserts, Set<String> deletes,
-                      String watermark);
+                      CacheCheckpoint checkpoint);
 
     /** Look up a single composite key. Empty if absent. */
     Optional<Record> get(String key);
@@ -67,8 +67,8 @@ public interface TableCacheStore extends Closeable {
     /** False until the first successful write. */
     boolean isHydrated();
 
-    /** Watermark stored by the last successful write, or null if there has never been one. */
-    String watermark();
+    /** Checkpoint stored by the last successful write, or null if there has never been one. */
+    CacheCheckpoint checkpoint();
 
     /**
      * Schema the current contents were loaded with, or null if not hydrated. An incremental delta
@@ -87,8 +87,8 @@ public interface TableCacheStore extends Closeable {
 
         void put(String key, Record value);
 
-        /** Atomically replace the store's visible contents with everything put so far. */
-        void commit(String watermark);
+        /** Atomically replace the store's visible contents and store the non-null checkpoint. */
+        void commit(CacheCheckpoint checkpoint);
 
         @Override
         void close();

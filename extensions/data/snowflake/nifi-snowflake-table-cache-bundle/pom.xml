@@ -34,7 +34,6 @@
     <properties>
         <revision>0.1.0-SNAPSHOT</revision>
         <rocksdb.version>11.1.1</rocksdb.version>
-        <h2.version>2.5.252</h2.version>
         <snowflake.jdbc.version>4.4.0</snowflake.jdbc.version>
         <tomlj.version>2.2.0</tomlj.version>
     </properties>

@@ -15,12 +15,7 @@ package com.snowflake.nifihub.data.snowflaketablecache;
 
 import org.apache.nifi.lookup.LookupFailureException;
 import org.apache.nifi.reporting.InitializationException;
-import org.apache.nifi.serialization.SimpleRecordSchema;
-import org.apache.nifi.serialization.record.MapRecord;
 import org.apache.nifi.serialization.record.Record;
-import org.apache.nifi.serialization.record.RecordField;
-import org.apache.nifi.serialization.record.RecordFieldType;
-import org.apache.nifi.serialization.record.RecordSchema;
 import org.apache.nifi.util.TestRunner;
 import org.apache.nifi.util.TestRunners;
 import org.junit.jupiter.api.AfterEach;
@@ -28,19 +23,15 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.sql.Connection;
-import java.sql.PreparedStatement;
-import java.sql.ResultSet;
-import java.sql.Statement;
-import java.util.Arrays;
-import java.util.HashMap;
+import java.sql.SQLException;
 import java.util.List;
 import java.util.Map;
-import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
@@ -48,41 +39,40 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
-import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.BooleanSupplier;
+import java.util.stream.Stream;
 
+import static com.snowflake.nifihub.data.snowflaketablecache.RefreshResponseConnectionService.control;
+import static com.snowflake.nifihub.data.snowflaketablecache.RefreshResponseConnectionService.data;
+import static com.snowflake.nifihub.data.snowflaketablecache.RefreshResponseConnectionService.response;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
- * Tests for the one component this bundle ships.
- *
- * <p>Core behaviours run against <b>both</b> storage modes, because a backend that is correct on
- * heap and subtly wrong on disk is exactly the failure this component cannot afford. Everything
- * uses in-memory H2, so no Snowflake connection is required.
+ * Exercises service lifecycle and cache semantics against both real storage backends. The JDBC
+ * fixture supplies deterministic CONTROL/DATA responses; it does not execute Snowflake SQL.
  */
 class TestSnowflakeTableCacheLookupService {
-
-    private static final AtomicInteger DB_COUNTER = new AtomicInteger();
+    private static final String FIRST_ID = "00000000-0000-0000-0000-000000000001";
+    private static final String SECOND_ID = "00000000-0000-0000-0000-000000000002";
+    private static final String THIRD_ID = "00000000-0000-0000-0000-000000000003";
+    private static final String SIGNATURE = "validated-source";
+    private static final List<String> FIELDS = List.of("ITEM_ID", "LABEL", "REGION");
 
     @TempDir
     Path storageDirectory;
 
     private TestRunner runner;
     private SnowflakeTableCacheLookupService service;
-    private H2ConnectionService connectionService;
+    private RefreshResponseConnectionService connectionService;
 
     @BeforeEach
-    void setUp() throws Exception {
-        connectionService = new H2ConnectionService("tablecache" + DB_COUNTER.incrementAndGet());
-        connectionService.execute(
-                "CREATE TABLE REFERENCE_DATA (ITEM_ID VARCHAR(32) PRIMARY KEY, LABEL VARCHAR(256), REGION VARCHAR(16))",
-                "INSERT INTO REFERENCE_DATA VALUES ('ITEM_ID001', 'b2b', 'NA')",
-                "INSERT INTO REFERENCE_DATA VALUES ('ITEM_ID002', 'b2b,advertiser', 'NA')",
-                "INSERT INTO REFERENCE_DATA VALUES ('ITEM_ID003', 'advertiser', 'EU')");
-
+    void setUp() {
+        connectionService = new RefreshResponseConnectionService();
         runner = TestRunners.newTestRunner(NoOpProcessor.class);
         service = new SnowflakeTableCacheLookupService();
     }
@@ -90,188 +80,544 @@ class TestSnowflakeTableCacheLookupService {
     @AfterEach
     void stopServices() {
         service.onDisabled();
+        assertTrue(connectionService.resourcesClosed(), "all refresh JDBC resources must be closed");
     }
 
-    @Test
-    void embeddedRejectsChangedSourceInsteadOfServingPreviousData() throws Exception {
-        enableService("EMBEDDED_KV", "ITEM_ID", "*");
-        runner.disableControllerService(service);
-        connectionService.execute("CREATE TABLE OTHER_DATA AS SELECT * FROM REFERENCE_DATA");
-        runner.setProperty(service, SnowflakeTableCacheLookupService.SOURCE_TABLE, "OTHER_DATA");
-        assertThrows(AssertionError.class, () -> runner.enableControllerService(service));
-        assertThrows(LookupFailureException.class, () -> service.lookup(Map.of("ITEM_ID", "ITEM_ID001")));
+    static Stream<Arguments> backendsAndRefreshModes() {
+        return Stream.of("HEAP", "EMBEDDED_KV").flatMap(mode -> Stream.of(false, true).map(delta -> Arguments.of(mode, delta)));
+    }
+
+    @ParameterizedTest
+    @MethodSource("backendsAndRefreshModes")
+    void loadsOnEnableAndImplementsLookupRecordContract(final String mode, final boolean incremental) throws Exception {
+        initialLoad(mode, incremental);
+        assertTrue(service.isHydrated());
+        assertEquals(3L, service.size());
+        assertEquals("b2b,advertiser", lookup("ITEM_ID002").getAsString("LABEL"));
+        assertEquals("NA", lookup("ITEM_ID002").getAsString("REGION"));
+        assertTrue(service.lookup(Map.of("ITEM_ID", "absent")).isEmpty());
+        assertThrows(LookupFailureException.class, () -> service.lookup(Map.of()));
+        assertEquals(Set.of("ITEM_ID"), service.getRequiredKeys());
+        assertEquals(Record.class, service.getValueType());
+        assertEquals(new CacheCheckpoint(FIRST_ID, SIGNATURE), service.checkpointForTest());
+        final RefreshResponseConnectionService.Call call = connectionService.calls().getFirst();
+        assertFalse(call.incremental(), "first load has no checkpoint to resume");
+        assertNull(call.parameters().get(1));
+        assertNull(call.parameters().get(2));
+        assertEquals("PUBLIC", call.parameters().get(3));
+        assertEquals("REF", call.parameters().get(4));
     }
 
     @ParameterizedTest
     @ValueSource(strings = {"HEAP", "EMBEDDED_KV"})
-    void compositeKeysWithSeparatorBytesRemainDistinct(final String mode) throws Exception {
-        connectionService.execute("CREATE TABLE KEYS_TEST (K1 VARCHAR, K2 VARCHAR, LABEL VARCHAR)");
-        try (final Connection connection = connectionService.getConnection();
-                final PreparedStatement statement = connection.prepareStatement("INSERT INTO KEYS_TEST VALUES (?, ?, ?)")) {
-            statement.setString(1, "a\u0000b");
-            statement.setString(2, "c");
-            statement.setString(3, "first");
-            statement.executeUpdate();
-            statement.setString(1, "a");
-            statement.setString(2, "b\u0000c");
-            statement.setString(3, "second");
-            statement.executeUpdate();
-        }
-        enableService(mode, "K1,K2", "LABEL", "0 sec", "KEYS_TEST");
-        assertEquals("first", service.lookup(Map.of("K1", "a\u0000b", "K2", "c")).orElseThrow().getAsString("LABEL"));
-        assertEquals("second", service.lookup(Map.of("K1", "a", "K2", "b\u0000c")).orElseThrow().getAsString("LABEL"));
-    }
-
-    @ParameterizedTest
-    @ValueSource(strings = {"HEAP", "EMBEDDED_KV"})
-    void duplicateKeysFailLoadRatherThanChooseAnArbitraryRow(final String mode) throws Exception {
-        connectionService.execute("CREATE TABLE DUPLICATE_KEYS (K VARCHAR, V VARCHAR)",
-                "INSERT INTO DUPLICATE_KEYS VALUES ('a','first'),('a','second')");
-        enableService(mode, "K", "V", "0 sec", "DUPLICATE_KEYS");
-        assertFalse(service.isHydrated());
-        assertThrows(LookupFailureException.class, () -> service.lookup(Map.of("K", "a")));
-    }
-
-    @ParameterizedTest
-    @ValueSource(strings = {"HEAP", "EMBEDDED_KV"})
-    void nullCompositeKeyFailsLoad(final String mode) throws Exception {
-        connectionService.execute("CREATE TABLE NULL_KEYS (K1 VARCHAR, K2 VARCHAR, V VARCHAR)",
-                "INSERT INTO NULL_KEYS VALUES ('a',NULL,'not-addressable')");
-        enableService(mode, "K1,K2", "V", "0 sec", "NULL_KEYS");
-        assertFalse(service.isHydrated());
-    }
-
-    @Test
-    void secondStoreCannotDeleteAnOpenStoresData() throws Exception {
-        final RecordSchema recordSchema = schema("K", "V");
-        try (RocksDbTableCacheStore first = new RocksDbTableCacheStore(storageDirectory)) {
-            try (TableCacheStore.BulkLoad load = first.beginBulkLoad(recordSchema)) {
-                load.put("first", record(recordSchema, "first", "value"));
-                load.commit("watermark");
-            }
-            assertThrows(java.io.IOException.class, () -> {
-                try (RocksDbTableCacheStore ignored = new RocksDbTableCacheStore(storageDirectory)) {
-                    assertFalse(ignored.isHydrated());
-                }
-            });
-        }
-        try (RocksDbTableCacheStore reopened = new RocksDbTableCacheStore(storageDirectory)) {
-            assertEquals("value", reopened.get("first").orElseThrow().getAsString("V"));
-        }
+    void fullRefreshReplacesContentsIncludingRevokedKeys(final String mode) throws Exception {
+        initialLoad(mode, false);
+        connectionService.enqueue(full(SECOND_ID, SIGNATURE, data("INSERT", "ITEM_ID001", "changed", "NA"), data("INSERT", "ITEM_ID004", "new", "JP")));
+        final RefreshResult result = service.refresh();
+        assertFalse(result.incremental());
+        assertEquals(2L, service.size());
+        assertEquals("changed", lookup("ITEM_ID001").getAsString("LABEL"));
+        assertEquals("new", lookup("ITEM_ID004").getAsString("LABEL"));
+        assertTrue(service.lookup(Map.of("ITEM_ID", "ITEM_ID002")).isEmpty());
+        assertTrue(service.lookup(Map.of("ITEM_ID", "ITEM_ID003")).isEmpty());
+        assertEquals(new CacheCheckpoint(SECOND_ID, SIGNATURE), service.checkpointForTest());
+        assertNull(connectionService.calls().getLast().parameters().get(1));
+        assertEquals(SIGNATURE, connectionService.calls().getLast().parameters().get(2));
     }
 
     @ParameterizedTest
     @ValueSource(strings = {"HEAP", "EMBEDDED_KV"})
     void changeRowsHandleKeyChangesAndEitherUpdateOrder(final String mode) throws Exception {
-        enableService(mode, "ITEM_ID", "*");
-        connectionService.execute("CREATE TABLE DELTA (ITEM_ID VARCHAR, LABEL VARCHAR, REGION VARCHAR, __TABLE_CACHE_IS_DELETE BOOLEAN)",
-                "INSERT INTO DELTA VALUES ('ITEM_ID900','new','EU',FALSE),('ITEM_ID001','old','NA',TRUE),"
-                        + "('ITEM_ID002','updated','EU',FALSE),('ITEM_ID002','old','NA',TRUE),"
-                        + "('ITEM_ID003','old','NA',TRUE),('ITEM_ID003','updated','EU',FALSE)");
-        try (final Connection connection = connectionService.getConnection();
-             final Statement statement = connection.createStatement();
-             final ResultSet rows = statement.executeQuery("SELECT * FROM DELTA")) {
-            service.applyChangeRows(service.storeForTest(), rows, "new-watermark", System.currentTimeMillis());
-        }
+        initialLoad(mode, true);
+        connectionService.enqueue(response(FIELDS,
+                data("INSERT", "ITEM_ID900", "new", "EU"),
+                data("DELETE", "ITEM_ID001", "old", "NA"),
+                data("INSERT", "ITEM_ID002", "updated", "EU"),
+                control(3, SECOND_ID, SIGNATURE, "INCREMENTAL", 6L),
+                data("DELETE", "ITEM_ID002", "old", "NA"),
+                data("DELETE", "ITEM_ID003", "old", "NA"),
+                data("INSERT", "ITEM_ID003", "updated", "EU")));
+        final RefreshResult result = service.refresh();
+        assertTrue(result.incremental());
+        assertEquals(3L, result.rowsUpserted());
+        assertEquals(1L, result.rowsDeleted());
         assertEquals(3L, service.size());
         assertTrue(service.lookup(Map.of("ITEM_ID", "ITEM_ID001")).isEmpty());
-        assertEquals("new", service.lookup(Map.of("ITEM_ID", "ITEM_ID900")).orElseThrow().getAsString("LABEL"));
-        assertEquals("updated", service.lookup(Map.of("ITEM_ID", "ITEM_ID002")).orElseThrow().getAsString("LABEL"));
-        assertEquals("updated", service.lookup(Map.of("ITEM_ID", "ITEM_ID003")).orElseThrow().getAsString("LABEL"));
-    }
-
-    @Test
-    void metadataLikeUserKeysDoNotOverwriteStoreMetadata() throws Exception {
-        final RecordSchema recordSchema = schema("K", "V");
-        try (RocksDbTableCacheStore cache = new RocksDbTableCacheStore(storageDirectory)) {
-            try (TableCacheStore.BulkLoad load = cache.beginBulkLoad(recordSchema)) {
-                load.put("\u0000__schema__", record(recordSchema, "\u0000__schema__", "value"));
-                load.commit("watermark");
-            }
-        }
-        try (RocksDbTableCacheStore cache = new RocksDbTableCacheStore(storageDirectory)) {
-            assertEquals(1L, cache.size());
-            assertEquals("value", cache.get("\u0000__schema__").orElseThrow().getAsString("V"));
-        }
-    }
-
-    @Test
-    void mismatchedIdentityDoesNotLeakDirectoryLock() throws Exception {
-        try (RocksDbTableCacheStore cache = new RocksDbTableCacheStore(storageDirectory, new byte[]{1})) {
-            assertFalse(cache.isHydrated());
-        }
-        assertThrows(java.io.IOException.class, () -> new RocksDbTableCacheStore(storageDirectory, new byte[]{2}));
-        try (RocksDbTableCacheStore cache = new RocksDbTableCacheStore(storageDirectory, new byte[]{1})) {
-            assertFalse(cache.isHydrated());
-        }
-    }
-
-    @Test
-    void failedGenerationOpenPreservesFilesAndReleasesLock() throws Exception {
-        try (RocksDbTableCacheStore cache = new RocksDbTableCacheStore(storageDirectory)) {
-            assertFalse(cache.isHydrated());
-        }
-        final Path incomplete = Files.createDirectory(storageDirectory.resolve("gen-1"));
-        final Path evidence = Files.writeString(incomplete.resolve("evidence"), "preserve me");
-        assertThrows(java.io.IOException.class, () -> new RocksDbTableCacheStore(storageDirectory));
-        assertEquals("preserve me", Files.readString(evidence));
-        Files.move(incomplete, storageDirectory.resolve("preserved"));
-        try (RocksDbTableCacheStore cache = new RocksDbTableCacheStore(storageDirectory)) {
-            assertFalse(cache.isHydrated());
-        }
+        assertEquals("new", lookup("ITEM_ID900").getAsString("LABEL"));
+        assertEquals("updated", lookup("ITEM_ID002").getAsString("LABEL"));
+        assertEquals("updated", lookup("ITEM_ID003").getAsString("LABEL"));
+        assertEquals(new CacheCheckpoint(SECOND_ID, SIGNATURE), service.checkpointForTest());
+        assertEquals(FIRST_ID, connectionService.calls().getLast().parameters().get(1));
+        assertEquals(SIGNATURE, connectionService.calls().getLast().parameters().get(2));
     }
 
     @ParameterizedTest
     @ValueSource(strings = {"HEAP", "EMBEDDED_KV"})
-    void invalidRefreshRetainsPreviousDataAndWatermark(final String mode) throws Exception {
-        enableService(mode, "ITEM_ID", "*");
-        final String watermark = service.watermarkForTest();
-        connectionService.execute("ALTER TABLE REFERENCE_DATA DROP PRIMARY KEY",
-                "INSERT INTO REFERENCE_DATA VALUES ('ITEM_ID001','duplicate','NA')");
+    void quotedSourceKeysAndValuesPreserveExactNames(final String mode) throws Exception {
+        final List<String> fields = List.of("key,One", "k\"Two", "Value.With.Dot");
+        connectionService.enqueue(response(fields, control(3, FIRST_ID, SIGNATURE, "FULL", 1L), data("INSERT", "a", "b", "value")));
+        enableService(mode, "\"key,One\",\"k\"\"Two\"", "\"Value.With.Dot\"", "0 sec", "\"Db.Name\".\"s,chema\".\"ta\"\"ble\"", true);
+        assertEquals(List.of("key,One", "k\"Two"), List.copyOf(service.getRequiredKeys()));
+        final Record record = service.lookup(Map.of("key,One", "a", "k\"Two", "b")).orElseThrow();
+        assertEquals("value", record.getAsString("Value.With.Dot"));
+        assertEquals(fields, record.getSchema().getFieldNames());
+        assertThrows(LookupFailureException.class, () -> service.lookup(Map.of("KEY,ONE", "a", "k\"Two", "b")));
+        final RefreshResponseConnectionService.Call call = connectionService.calls().getFirst();
+        assertEquals("s,chema", call.parameters().get(3));
+        assertEquals("ta\"ble", call.parameters().get(4));
+        assertTrue(call.sql().contains("\"key,One\", \"k\"\"Two\", \"Value.With.Dot\""));
+        assertTrue(call.sql().contains("FROM \"Db.Name\".\"s,chema\".\"ta\"\"ble\""));
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"HEAP", "EMBEDDED_KV"})
+    void compositeKeysWithSeparatorBytesRemainDistinct(final String mode) throws Exception {
+        final List<String> fields = List.of("K1", "K2", "LABEL");
+        connectionService.enqueue(response(fields, control(3, FIRST_ID, SIGNATURE, "FULL", 2L),
+                data("INSERT", "a\u0000b", "c", "first"), data("INSERT", "a", "b\u0000c", "second")));
+        enableService(mode, "k1,k2", "label", "0 sec", "db.public.ref", false);
+        assertEquals("first", service.lookup(Map.of("K1", "a\u0000b", "K2", "c")).orElseThrow().getAsString("LABEL"));
+        assertEquals("second", service.lookup(Map.of("K1", "a", "K2", "b\u0000c")).orElseThrow().getAsString("LABEL"));
+        assertThrows(LookupFailureException.class, () -> service.lookup(Map.of("K1", "a")));
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"HEAP", "EMBEDDED_KV"})
+    void explicitProjectionIncludesKeysAndOmitsUnrequestedColumns(final String mode) throws Exception {
+        connectionService.enqueue(response(List.of("ITEM_ID", "LABEL"), control(2, FIRST_ID, SIGNATURE, "FULL", 1L), data("INSERT", "1", "value")));
+        enableService(mode, "item_id", "label,item_id", "0 sec", "DB.PUBLIC.REF", false);
+        assertEquals(List.of("ITEM_ID", "LABEL"), lookup("1").getSchema().getFieldNames());
+        assertTrue(connectionService.calls().getFirst().sql().contains("\"ITEM_ID\", \"LABEL\" FROM"));
+        assertFalse(connectionService.calls().getFirst().sql().contains("\"REGION\""));
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"HEAP", "EMBEDDED_KV"})
+    void duplicateKeysFailInitialLoadRatherThanChooseAnArbitraryRow(final String mode) throws Exception {
+        connectionService.enqueue(full(FIRST_ID, SIGNATURE, data("INSERT", "duplicate", "one", "NA"), data("INSERT", "duplicate", "two", "EU")));
+        enableService(mode, "ITEM_ID", "*", "0 sec", "DB.PUBLIC.REF", true);
+        assertFalse(service.isHydrated());
+        assertEquals(0L, service.size());
+        assertNull(service.checkpointForTest());
+        assertThrows(LookupFailureException.class, () -> lookup("duplicate"));
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"HEAP", "EMBEDDED_KV"})
+    void nullCompositeKeyFailsLoadButNullValuesAreAllowed(final String mode) throws Exception {
+        connectionService.enqueue(full(FIRST_ID, SIGNATURE, data("INSERT", "a", "not-addressable", null)));
+        enableService(mode, "ITEM_ID,REGION", "*", "0 sec", "DB.PUBLIC.REF", true);
+        assertFalse(service.isHydrated());
+        assertNull(service.checkpointForTest());
+        connectionService.enqueue(full(SECOND_ID, SIGNATURE, data("INSERT", "a", null, "EU")));
+        service.refresh();
+        assertNull(service.lookup(Map.of("ITEM_ID", "a", "REGION", "EU")).orElseThrow().getAsString("LABEL"));
+    }
+
+    @ParameterizedTest
+    @MethodSource("backendsAndRefreshModes")
+    void transientSqlFailureRetainsValidatedContentsAndDoesNotReload(final String mode, final boolean incremental) throws Exception {
+        initialLoad(mode, incremental);
+        connectionService.enqueueFailure(new SQLException("Temporary connection failure", "08006"));
         assertThrows(TableCacheException.class, () -> service.refresh());
+        assertEquals(2, connectionService.calls().size(), "unrecognized errors must not silently fall back to a full load");
+        assertTrue(service.isHydrated());
         assertEquals(3L, service.size());
-        assertEquals(watermark, service.watermarkForTest());
-        assertEquals("b2b", service.lookup(Map.of("ITEM_ID", "ITEM_ID001")).orElseThrow().getAsString("LABEL"));
+        assertEquals(new CacheCheckpoint(FIRST_ID, SIGNATURE), service.checkpointForTest());
+        assertEquals("b2b", lookup("ITEM_ID001").getAsString("LABEL"));
+    }
+
+    @ParameterizedTest
+    @MethodSource("backendsAndRefreshModes")
+    void invalidResponseRetainsValidatedContentsAndCheckpoint(final String mode, final boolean incremental) throws Exception {
+        initialLoad(mode, incremental);
+        connectionService.enqueue(response(FIELDS,
+                control(3, SECOND_ID, SIGNATURE, incremental ? "INCREMENTAL" : "FULL", 2L), data("INSERT", "ITEM_ID900", "not-committed", "NA")));
+        assertThrows(TableCacheException.class, () -> service.refresh());
+        assertEquals(2, connectionService.calls().size());
+        assertTrue(service.isHydrated());
+        assertEquals(3L, service.size());
+        assertEquals(new CacheCheckpoint(FIRST_ID, SIGNATURE), service.checkpointForTest());
+        assertTrue(service.lookup(Map.of("ITEM_ID", "ITEM_ID900")).isEmpty());
+    }
+
+    static Stream<Arguments> sourceErrors() {
+        return Stream.of("HEAP", "EMBEDDED_KV").flatMap(mode -> Stream.of("positiveChanged", "negativeChanged", "positiveInvalid", "negativeInvalid",
+                "changedMarker", "invalidMarker", "chained").map(error -> Arguments.of(mode, error)));
+    }
+
+    @ParameterizedTest
+    @MethodSource("sourceErrors")
+    void sourceErrorsInvalidateServingAndAttemptOnlyOneFullReload(final String mode, final String error) throws Exception {
+        initialLoad(mode, true);
+        connectionService.enqueueFailure(sourceFailure(error));
+        connectionService.enqueueFailure(new SQLException("Reload temporarily unavailable", "08006"));
+        assertThrows(TableCacheException.class, () -> service.refresh());
+        assertEquals(3, connectionService.calls().size());
+        assertTrue(connectionService.calls().get(1).incremental());
+        assertFalse(connectionService.calls().get(2).incremental());
+        assertNull(connectionService.calls().get(2).parameters().get(1));
+        assertNull(connectionService.calls().get(2).parameters().get(2));
+        assertFalse(service.isHydrated());
+        assertTrue(service.storeForTest().isHydrated(), "physical rows remain intact but must not be served");
+        assertEquals(3L, service.size());
+        assertEquals(new CacheCheckpoint(FIRST_ID, SIGNATURE), service.checkpointForTest());
+        assertThrows(LookupFailureException.class, () -> lookup("ITEM_ID001"));
+        connectionService.enqueue(full(SECOND_ID, "replacement-source", data("INSERT", "replacement", "validated", "EU")));
+        assertFalse(service.refresh().incremental(), "retry after invalidation must not resume the old checkpoint");
+        assertTrue(service.isHydrated());
+        assertFalse(connectionService.calls().getLast().incremental());
+        assertNull(connectionService.calls().getLast().parameters().get(1));
+        assertNull(connectionService.calls().getLast().parameters().get(2));
+        assertEquals("validated", lookup("replacement").getAsString("LABEL"));
+        assertTrue(service.lookup(Map.of("ITEM_ID", "ITEM_ID001")).isEmpty());
+        assertEquals(new CacheCheckpoint(SECOND_ID, "replacement-source"), service.checkpointForTest());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"HEAP", "EMBEDDED_KV"})
+    void sourceReplacementCanRecoverInTheSameRefresh(final String mode) throws Exception {
+        initialLoad(mode, true);
+        connectionService.enqueueFailure(sourceFailure("changedMarker"));
+        connectionService.enqueue(full(SECOND_ID, "replacement", data("INSERT", "new", "replacement-value", "EU")));
+        assertFalse(service.refresh().incremental());
+        assertTrue(service.isHydrated());
+        assertEquals(1L, service.size());
+        assertEquals("replacement-value", lookup("new").getAsString("LABEL"));
+        assertEquals(new CacheCheckpoint(SECOND_ID, "replacement"), service.checkpointForTest());
+    }
+
+    @ParameterizedTest
+    @MethodSource("sourceErrors")
+    void fullRefreshSourceFailureKeepsRowsButGatesLookupsAcrossFailedReload(final String mode, final String error) throws Exception {
+        initialLoad(mode, false);
+        connectionService.enqueueFailure(sourceFailure(error));
+        connectionService.enqueueFailure(new SQLException("Deferred reload temporarily unavailable", "08006"));
+        assertThrows(TableCacheException.class, () -> service.refresh());
+        assertEquals(3, connectionService.calls().size(), "source change attempts one immediate full reload");
+        assertEquals(0, connectionService.remainingSteps());
+        assertNull(connectionService.calls().getLast().parameters().get(1));
+        assertNull(connectionService.calls().getLast().parameters().get(2));
+        assertFalse(service.isHydrated());
+        assertEquals(new CacheCheckpoint(FIRST_ID, SIGNATURE), service.checkpointForTest());
+        assertEquals(3L, service.size());
+        assertEquals("b2b", service.storeForTest().get("ITEM_ID001").orElseThrow().getAsString("LABEL"));
+        assertThrows(LookupFailureException.class, () -> lookup("ITEM_ID001"));
+
+        connectionService.enqueueFailure(new SQLException("Reload still unavailable", "08006"));
+        assertThrows(TableCacheException.class, () -> service.refresh());
+        assertEquals(4, connectionService.calls().size());
+        assertFalse(connectionService.calls().getLast().incremental());
+        assertNull(connectionService.calls().getLast().parameters().get(1));
+        assertNull(connectionService.calls().getLast().parameters().get(2));
+        assertFalse(service.isHydrated());
+        assertTrue(service.storeForTest().isHydrated());
+        assertEquals(new CacheCheckpoint(FIRST_ID, SIGNATURE), service.checkpointForTest());
+        assertEquals(3L, service.size());
+        assertEquals("b2b", service.storeForTest().get("ITEM_ID001").orElseThrow().getAsString("LABEL"));
+        assertThrows(LookupFailureException.class, () -> lookup("ITEM_ID001"));
+
+        connectionService.enqueue(full(SECOND_ID, "replacement", data("INSERT", "new", "validated", "EU")));
+        assertFalse(service.refresh().incremental());
+        assertNull(connectionService.calls().getLast().parameters().get(1));
+        assertNull(connectionService.calls().getLast().parameters().get(2));
+        assertTrue(service.isHydrated());
+        assertEquals(new CacheCheckpoint(SECOND_ID, "replacement"), service.checkpointForTest());
+        assertEquals(1L, service.size());
+        assertTrue(service.lookup(Map.of("ITEM_ID", "ITEM_ID001")).isEmpty());
+        assertEquals("validated", lookup("new").getAsString("LABEL"));
+        connectionService.enqueue(full(THIRD_ID, "replacement", data("INSERT", "new", "revalidated", "EU")));
+        service.refresh();
+        assertNull(connectionService.calls().getLast().parameters().get(1));
+        assertEquals("replacement", connectionService.calls().getLast().parameters().get(2));
+        assertEquals(new CacheCheckpoint(THIRD_ID, "replacement"), service.checkpointForTest());
+    }
+
+    static Stream<Arguments> staleHistoryErrors() {
+        return Stream.of("HEAP", "EMBEDDED_KV").flatMap(mode -> Stream.of("Time travel data is not available", "Statement not found", "Statement does not exist")
+                .map(message -> Arguments.of(mode, message)));
+    }
+
+    @ParameterizedTest
+    @MethodSource("staleHistoryErrors")
+    void unusableHistoryFallsBackToFullAndReplacesCheckpoint(final String mode, final String message) throws Exception {
+        initialLoad(mode, true);
+        connectionService.enqueueFailure(new SQLException(message));
+        connectionService.enqueue(full(SECOND_ID, SIGNATURE, data("INSERT", "new", "reloaded", "NA")));
+        assertFalse(service.refresh().incremental());
+        assertEquals(3, connectionService.calls().size());
+        assertFalse(connectionService.calls().getLast().incremental());
+        assertNull(connectionService.calls().getLast().parameters().get(1));
+        assertNull(connectionService.calls().getLast().parameters().get(2));
+        assertEquals(1L, service.size());
+        assertEquals("reloaded", lookup("new").getAsString("LABEL"));
+        assertEquals(new CacheCheckpoint(SECOND_ID, SIGNATURE), service.checkpointForTest());
     }
 
     @Test
-    void disableWaitsForInFlightRefreshBeforeClosingStorage() throws Exception {
+    void failedHistoryFallbackRetainsDataUnlessFallbackDetectsChangedSource() throws Exception {
+        initialLoad("HEAP", true);
+        connectionService.enqueueFailure(new SQLException("Statement not found"));
+        connectionService.enqueueFailure(new SQLException("Network unavailable", "08006"));
+        assertThrows(TableCacheException.class, () -> service.refresh());
+        assertTrue(service.isHydrated());
+        assertEquals(new CacheCheckpoint(FIRST_ID, SIGNATURE), service.checkpointForTest());
+        connectionService.enqueueFailure(new SQLException("Time travel data is not available"));
+        connectionService.enqueueFailure(sourceFailure("invalidMarker"));
+        assertThrows(TableCacheException.class, () -> service.refresh());
+        assertFalse(service.isHydrated());
+        assertEquals(5, connectionService.calls().size());
+        assertThrows(LookupFailureException.class, () -> lookup("ITEM_ID001"));
+    }
+
+    @ParameterizedTest
+    @MethodSource("backendsAndRefreshModes")
+    void initialFailureEnablesButLookupsFailClosedUntilSuccessfulRetry(final String mode, final boolean incremental) throws Exception {
+        connectionService.enqueueFailure(new SQLException("Unavailable", "08006"));
+        enableService(mode, "ITEM_ID", "*", "0 sec", "DB.PUBLIC.REF", incremental);
+        assertFalse(service.isHydrated());
+        assertEquals(0L, service.size());
+        assertThrows(LookupFailureException.class, () -> lookup("absent"));
+        connectionService.enqueue(full(SECOND_ID, SIGNATURE, data("INSERT", "new", "ready", "NA")));
+        assertFalse(service.refresh().incremental());
+        assertEquals("ready", lookup("new").getAsString("LABEL"));
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void persistentRestartMustValidateBeforeServingEvenWhenRowsExist(final boolean incremental) throws Exception {
+        initialLoad("EMBEDDED_KV", incremental);
+        runner.disableControllerService(service);
+        connectionService.enqueueFailure(new SQLException("Restart validation unavailable", "08006"));
+        runner.enableControllerService(service);
+        assertEquals(2, connectionService.calls().size(), "restart must read the source even with persisted rows");
+        assertEquals(incremental, connectionService.calls().getLast().incremental());
+        assertEquals(incremental ? FIRST_ID : null, connectionService.calls().getLast().parameters().get(1));
+        assertEquals(SIGNATURE, connectionService.calls().getLast().parameters().get(2));
+        assertFalse(service.isHydrated());
+        assertTrue(service.storeForTest().isHydrated());
+        assertEquals(3L, service.size());
+        assertEquals(new CacheCheckpoint(FIRST_ID, SIGNATURE), service.checkpointForTest());
+        assertThrows(LookupFailureException.class, () -> lookup("ITEM_ID001"));
+        if (incremental) {
+            assertEquals(FIRST_ID, connectionService.calls().getLast().parameters().get(1));
+            connectionService.enqueue(response(FIELDS, control(3, SECOND_ID, SIGNATURE, "INCREMENTAL", 0L)));
+        } else {
+            connectionService.enqueue(full(SECOND_ID, SIGNATURE, data("INSERT", "ITEM_ID001", "revalidated", "NA")));
+        }
+        assertEquals(incremental, service.refresh().incremental());
+        assertTrue(service.isHydrated());
+        assertNotNull(lookup("ITEM_ID001"));
+        assertEquals(new CacheCheckpoint(SECOND_ID, SIGNATURE), service.checkpointForTest());
+    }
+
+    @Test
+    void restartWithChangedSourceReplacesRatherThanServesPersistedRows() throws Exception {
+        initialLoad("EMBEDDED_KV", true);
+        runner.disableControllerService(service);
+        connectionService.enqueueFailure(sourceFailure("changedMarker"));
+        connectionService.enqueue(full(SECOND_ID, "replacement", data("INSERT", "new", "validated", "NA")));
+        runner.enableControllerService(service);
+        assertTrue(service.isHydrated());
+        assertEquals(1L, service.size());
+        assertTrue(service.lookup(Map.of("ITEM_ID", "ITEM_ID001")).isEmpty());
+        assertEquals("validated", lookup("new").getAsString("LABEL"));
+        assertEquals(new CacheCheckpoint(SECOND_ID, "replacement"), service.checkpointForTest());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"source", "keys", "values", "incremental", "connection"})
+    void embeddedRejectsConfigurationIdentityMismatchAndCanReopenOriginal(final String changed) throws Exception {
+        initialLoad("EMBEDDED_KV", true);
+        runner.disableControllerService(service);
+        switch (changed) {
+            case "source" -> runner.setProperty(service, SnowflakeTableCacheLookupService.SOURCE_TABLE, "DB.PUBLIC.OTHER");
+            case "keys" -> runner.setProperty(service, SnowflakeTableCacheLookupService.KEY_COLUMNS, "ITEM_ID,REGION");
+            case "values" -> runner.setProperty(service, SnowflakeTableCacheLookupService.VALUE_COLUMNS, "LABEL");
+            case "incremental" -> runner.setProperty(service, SnowflakeTableCacheLookupService.INCREMENTAL_REFRESH, "false");
+            case "connection" -> {
+                final RefreshResponseConnectionService other = new RefreshResponseConnectionService();
+                runner.addControllerService("other", other);
+                runner.enableControllerService(other);
+                runner.setProperty(service, SnowflakeTableCacheLookupService.SNOWFLAKE_CONNECTION_SERVICE, "other");
+            }
+            default -> throw new IllegalArgumentException(changed);
+        }
+        assertThrows(AssertionError.class, () -> runner.enableControllerService(service));
+        assertFalse(service.isHydrated());
+        assertThrows(LookupFailureException.class, () -> lookup("ITEM_ID001"));
+        assertEquals(1, connectionService.calls().size(), "identity mismatch must fail before querying the source");
+        runner.setProperty(service, SnowflakeTableCacheLookupService.SOURCE_TABLE, "DB.PUBLIC.REF");
+        runner.setProperty(service, SnowflakeTableCacheLookupService.KEY_COLUMNS, "ITEM_ID");
+        runner.setProperty(service, SnowflakeTableCacheLookupService.VALUE_COLUMNS, "*");
+        runner.setProperty(service, SnowflakeTableCacheLookupService.INCREMENTAL_REFRESH, "true");
+        runner.setProperty(service, SnowflakeTableCacheLookupService.SNOWFLAKE_CONNECTION_SERVICE, "fixture");
+        connectionService.enqueue(response(FIELDS, control(3, SECOND_ID, SIGNATURE, "INCREMENTAL", 0L)));
+        runner.enableControllerService(service);
+        assertTrue(service.isHydrated());
+        assertEquals("b2b", lookup("ITEM_ID001").getAsString("LABEL"));
+    }
+
+    @Test
+    void scheduledRefreshSurvivesFailureAndRecoversWithoutAProcessor() throws Exception {
+        connectionService.enqueueFailure(new SQLException("Initial load unavailable", "08006"));
+        connectionService.enqueueFailure(new SQLException("Still unavailable", "08006"));
+        connectionService.enqueue(full(SECOND_ID, SIGNATURE, data("INSERT", "new", "scheduled", "NA")));
+        enableService("HEAP", "ITEM_ID", "*", "25 millis", "DB.PUBLIC.REF", true);
+        await(service::isHydrated);
+        assertEquals("scheduled", lookup("new").getAsString("LABEL"));
+        assertEquals(new CacheCheckpoint(SECOND_ID, SIGNATURE), service.checkpointForTest());
+        runner.disableControllerService(service);
+        assertTrue(connectionService.calls().size() >= 3);
+        assertFalse(connectionService.calls().get(2).incremental());
+        assertEquals(0, connectionService.remainingSteps(), "the scheduled retry must consume the successful response");
+        final int callsAtDisable = connectionService.calls().size();
+        Thread.sleep(100);
+        assertEquals(callsAtDisable, connectionService.calls().size(), "disable must terminate the refresh schedule");
+    }
+
+    @Test
+    void scheduledRefreshPicksUpAChangeAfterSuccessfulStartup() throws Exception {
+        connectionService.enqueue(full(FIRST_ID, SIGNATURE, data("INSERT", "old", "old", "NA")));
+        connectionService.enqueue(response(FIELDS, control(3, SECOND_ID, SIGNATURE, "INCREMENTAL", 2L),
+                data("DELETE", "old", "old", "NA"), data("INSERT", "new", "scheduled", "EU")));
+        enableService("HEAP", "ITEM_ID", "*", "25 millis", "DB.PUBLIC.REF", true);
+        await(() -> new CacheCheckpoint(SECOND_ID, SIGNATURE).equals(service.checkpointForTest()));
+        assertEquals("scheduled", lookup("new").getAsString("LABEL"));
+        assertTrue(service.lookup(Map.of("ITEM_ID", "old")).isEmpty());
+        assertTrue(connectionService.calls().get(1).incremental());
+    }
+
+    @Test
+    void zeroIntervalNeverSchedulesAndDisableStopsFurtherRefreshes() throws Exception {
+        initialLoad("HEAP", true);
+        connectionService.enqueue(full(SECOND_ID, SIGNATURE, data("INSERT", "new", "not-scheduled", "NA")));
+        Thread.sleep(150);
+        assertEquals(1, connectionService.calls().size());
+        assertEquals(1, connectionService.remainingSteps());
+        assertEquals(3L, service.size());
+        runner.disableControllerService(service);
+        assertFalse(service.isHydrated());
+        assertThrows(TableCacheException.class, () -> service.refresh());
+        assertThrows(LookupFailureException.class, () -> lookup("ITEM_ID001"));
+        assertEquals(1, connectionService.calls().size());
+    }
+
+    @ParameterizedTest
+    @MethodSource("backendsAndRefreshModes")
+    void concurrentReadersSeeOldDataUntilRefreshCommits(final String mode, final boolean incremental) throws Exception {
+        initialLoad(mode, incremental);
         final CountDownLatch entered = new CountDownLatch(1);
         final CountDownLatch release = new CountDownLatch(1);
-        connectionService = new H2ConnectionService("tablecache" + DB_COUNTER.get()) {
-            private int connections;
-
-            @Override
-            public Connection getConnection() {
-                if (++connections > 1) {
-                    entered.countDown();
-                    try {
-                        if (!release.await(10, TimeUnit.SECONDS)) {
-                            throw new IllegalStateException("Test did not release JDBC connection");
-                        }
-                    } catch (final InterruptedException e) {
-                        Thread.currentThread().interrupt();
-                        throw new IllegalStateException(e);
-                    }
-                }
-                return super.getConnection();
-            }
-        };
-        enableService("EMBEDDED_KV", "ITEM_ID", "*");
+        connectionService.enqueueBlocked(response(FIELDS, control(3, SECOND_ID, SIGNATURE, incremental ? "INCREMENTAL" : "FULL", 1L),
+                data("INSERT", "ITEM_ID001", "new", "EU")), entered, release);
         try (final ExecutorService executor = Executors.newFixedThreadPool(2)) {
             final Future<RefreshResult> refresh = executor.submit(() -> service.refresh());
-            assertTrue(entered.await(5, TimeUnit.SECONDS));
-            final Future<?> disable = executor.submit(() -> service.onDisabled());
             try {
-                assertThrows(TimeoutException.class, () -> disable.get(100, TimeUnit.MILLISECONDS));
+                assertTrue(entered.await(5, TimeUnit.SECONDS));
+                final Future<?> reader = executor.submit(() -> {
+                    for (int index = 0; index < 100; index++) {
+                        assertEquals("b2b", lookup("ITEM_ID001").getAsString("LABEL"));
+                        assertEquals(new CacheCheckpoint(FIRST_ID, SIGNATURE), service.checkpointForTest());
+                    }
+                    return null;
+                });
+                reader.get(5, TimeUnit.SECONDS);
             } finally {
                 release.countDown();
             }
             refresh.get(5, TimeUnit.SECONDS);
-            disable.get(5, TimeUnit.SECONDS);
-            assertFalse(service.isHydrated());
+            assertEquals("new", lookup("ITEM_ID001").getAsString("LABEL"));
+            assertEquals(new CacheCheckpoint(SECOND_ID, SIGNATURE), service.checkpointForTest());
         } finally {
             release.countDown();
+        }
+    }
+
+    @Test
+    void concurrentRefreshesSerializeAndSecondUsesCommittedCheckpoint() throws Exception {
+        initialLoad("EMBEDDED_KV", true);
+        final CountDownLatch entered = new CountDownLatch(1);
+        final CountDownLatch release = new CountDownLatch(1);
+        final CountDownLatch secondStarted = new CountDownLatch(1);
+        connectionService.enqueueBlocked(response(FIELDS, control(3, SECOND_ID, SIGNATURE, "INCREMENTAL", 0L)), entered, release);
+        connectionService.enqueue(response(FIELDS, control(3, THIRD_ID, SIGNATURE, "INCREMENTAL", 0L)));
+        try (final ExecutorService executor = Executors.newFixedThreadPool(2)) {
+            final Future<RefreshResult> first = executor.submit(() -> service.refresh());
+            try {
+                assertTrue(entered.await(5, TimeUnit.SECONDS));
+                final Future<RefreshResult> second = executor.submit(() -> {
+                    secondStarted.countDown();
+                    return service.refresh();
+                });
+                assertTrue(secondStarted.await(5, TimeUnit.SECONDS));
+                assertThrows(TimeoutException.class, () -> second.get(100, TimeUnit.MILLISECONDS));
+                assertEquals(2, connectionService.calls().size());
+                release.countDown();
+                first.get(5, TimeUnit.SECONDS);
+                second.get(5, TimeUnit.SECONDS);
+            } finally {
+                release.countDown();
+            }
+        }
+        assertEquals(1, connectionService.maximumExecutions());
+        assertEquals(SECOND_ID, connectionService.calls().getLast().parameters().get(1));
+        assertEquals(new CacheCheckpoint(THIRD_ID, SIGNATURE), service.checkpointForTest());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"HEAP", "EMBEDDED_KV"})
+    void disableWaitsForRefreshAndNeverReopensServingGate(final String mode) throws Exception {
+        initialLoad(mode, true);
+        final CountDownLatch entered = new CountDownLatch(1);
+        final CountDownLatch release = new CountDownLatch(1);
+        final CountDownLatch disableStarted = new CountDownLatch(1);
+        connectionService.enqueueBlocked(response(FIELDS, control(3, SECOND_ID, SIGNATURE, "INCREMENTAL", 0L)), entered, release);
+        try (final ExecutorService executor = Executors.newFixedThreadPool(2)) {
+            final Future<RefreshResult> refresh = executor.submit(() -> service.refresh());
+            try {
+                assertTrue(entered.await(5, TimeUnit.SECONDS));
+                final Future<?> disable = executor.submit(() -> {
+                    disableStarted.countDown();
+                    service.onDisabled();
+                });
+                assertTrue(disableStarted.await(5, TimeUnit.SECONDS));
+                await(() -> !service.isHydrated());
+                assertThrows(TimeoutException.class, () -> disable.get(100, TimeUnit.MILLISECONDS));
+                assertNotNull(service.storeForTest(), "disable must not close storage while refresh still owns it");
+                assertThrows(LookupFailureException.class, () -> lookup("ITEM_ID001"));
+                release.countDown();
+                refresh.get(5, TimeUnit.SECONDS);
+                disable.get(5, TimeUnit.SECONDS);
+                assertNull(service.storeForTest());
+                assertFalse(service.isHydrated());
+                assertThrows(TableCacheException.class, () -> service.refresh());
+            } finally {
+                release.countDown();
+            }
+        }
+    }
+
+    @Test
+    void sourceInvalidationClosesGateWhileReplacementLoadIsInFlight() throws Exception {
+        initialLoad("HEAP", true);
+        final CountDownLatch entered = new CountDownLatch(1);
+        final CountDownLatch release = new CountDownLatch(1);
+        connectionService.enqueueFailure(sourceFailure("changedMarker"));
+        connectionService.enqueueBlocked(full(SECOND_ID, "replacement", data("INSERT", "new", "validated", "EU")), entered, release);
+        try (final ExecutorService executor = Executors.newSingleThreadExecutor()) {
+            final Future<RefreshResult> refresh = executor.submit(() -> service.refresh());
+            try {
+                assertTrue(entered.await(5, TimeUnit.SECONDS));
+                assertFalse(service.isHydrated());
+                assertEquals(3L, service.size());
+                assertThrows(LookupFailureException.class, () -> lookup("ITEM_ID001"));
+            } finally {
+                release.countDown();
+            }
+            refresh.get(5, TimeUnit.SECONDS);
+            assertTrue(service.isHydrated());
+            assertEquals("validated", lookup("new").getAsString("LABEL"));
         }
     }
 
@@ -287,397 +633,63 @@ class TestSnowflakeTableCacheLookupService {
         assertFalse(error.getMessage().contains("synthetic-invalid-input"));
     }
 
-    private void enableService(final String mode, final String keyColumns,
-                               final String valueColumns, final String refreshInterval,
-                               final String sourceTable) throws InitializationException {
-        enableService(mode, keyColumns, valueColumns, refreshInterval, sourceTable, false);
+    private void initialLoad(final String mode, final boolean incremental) throws InitializationException {
+        connectionService.enqueue(full(FIRST_ID, SIGNATURE,
+                data("INSERT", "ITEM_ID001", "b2b", "NA"), data("INSERT", "ITEM_ID002", "b2b,advertiser", "NA"), data("INSERT", "ITEM_ID003", "advertiser", "EU")));
+        enableService(mode, "ITEM_ID", "*", "0 sec", "DB.PUBLIC.REF", incremental);
     }
 
-    private void enableService(final String mode, final String keyColumns,
-                               final String valueColumns, final String refreshInterval,
-                               final String sourceTable, final boolean incrementalRefresh)
-            throws InitializationException {
-        runner.addControllerService("h2", connectionService);
+    private void enableService(final String mode, final String keys, final String values, final String interval,
+                               final String source, final boolean incremental) throws InitializationException {
+        runner.addControllerService("fixture", connectionService);
         runner.enableControllerService(connectionService);
-
         runner.addControllerService("cache", service);
-        runner.setProperty(service, SnowflakeTableCacheLookupService.SNOWFLAKE_CONNECTION_SERVICE, "h2");
-        runner.setProperty(service, SnowflakeTableCacheLookupService.SOURCE_TABLE, sourceTable);
-        runner.setProperty(service, SnowflakeTableCacheLookupService.KEY_COLUMNS, keyColumns);
-        runner.setProperty(service, SnowflakeTableCacheLookupService.VALUE_COLUMNS, valueColumns);
-        runner.setProperty(service, SnowflakeTableCacheLookupService.REFRESH_INTERVAL, refreshInterval);
-        runner.setProperty(service, SnowflakeTableCacheLookupService.INCREMENTAL_REFRESH,
-                Boolean.toString(incrementalRefresh));
+        runner.setProperty(service, SnowflakeTableCacheLookupService.SNOWFLAKE_CONNECTION_SERVICE, "fixture");
+        runner.setProperty(service, SnowflakeTableCacheLookupService.SOURCE_TABLE, source);
+        runner.setProperty(service, SnowflakeTableCacheLookupService.KEY_COLUMNS, keys);
+        runner.setProperty(service, SnowflakeTableCacheLookupService.VALUE_COLUMNS, values);
+        runner.setProperty(service, SnowflakeTableCacheLookupService.REFRESH_INTERVAL, interval);
+        runner.setProperty(service, SnowflakeTableCacheLookupService.INCREMENTAL_REFRESH, Boolean.toString(incremental));
         runner.setProperty(service, SnowflakeTableCacheLookupService.STORAGE_MODE, mode);
         if (!"HEAP".equals(mode)) {
-            runner.setProperty(service, SnowflakeTableCacheLookupService.STORAGE_DIRECTORY,
-                    storageDirectory.toString());
+            runner.setProperty(service, SnowflakeTableCacheLookupService.STORAGE_DIRECTORY, storageDirectory.toString());
         }
         runner.enableControllerService(service);
     }
 
-    private void enableService(final String mode, final String keyColumns, final String valueColumns)
-            throws InitializationException {
-        enableService(mode, keyColumns, valueColumns, "0 sec", "REFERENCE_DATA");
+    private Record lookup(final String key) throws LookupFailureException {
+        return service.lookup(Map.of("ITEM_ID", key)).orElseThrow();
     }
 
-    // ---------- behaviours that must hold for every backend ----------
-
-    @ParameterizedTest
-    @ValueSource(strings = {"HEAP", "EMBEDDED_KV"})
-    void loadsOnEnableAndServesLookups(final String mode) throws Exception {
-        enableService(mode, "ITEM_ID", "*");
-
-        assertTrue(service.isHydrated());
-        assertEquals(3L, service.size());
-
-        final Optional<Record> hit = service.lookup(Map.of("ITEM_ID", "ITEM_ID002"));
-        assertTrue(hit.isPresent());
-        assertEquals("b2b,advertiser", hit.get().getAsString("LABEL"));
-        assertEquals("NA", hit.get().getAsString("REGION"));
+    private static RefreshResponseConnectionService.Response full(final String queryId, final String signature, final Object[]... dataRows) {
+        final Object[][] rows = new Object[dataRows.length + 1][];
+        rows[0] = control(3, queryId, signature, "FULL", (long) dataRows.length);
+        System.arraycopy(dataRows, 0, rows, 1, dataRows.length);
+        return response(FIELDS, rows);
     }
 
-    @ParameterizedTest
-    @ValueSource(strings = {"HEAP", "EMBEDDED_KV"})
-    void missReturnsEmptyRatherThanFailing(final String mode) throws Exception {
-        enableService(mode, "ITEM_ID", "*");
-        assertTrue(service.lookup(Map.of("ITEM_ID", "NOT_A_ITEM_ID")).isEmpty());
-    }
-
-    @ParameterizedTest
-    @ValueSource(strings = {"HEAP", "EMBEDDED_KV"})
-    void refreshReplacesContentsIncludingDeletes(final String mode) throws Exception {
-        enableService(mode, "ITEM_ID", "*");
-        assertEquals(3L, service.size());
-
-        connectionService.execute(
-                "UPDATE REFERENCE_DATA SET LABEL = 'b2b,advertiser,fleet' WHERE ITEM_ID = 'ITEM_ID001'",
-                "DELETE FROM REFERENCE_DATA WHERE ITEM_ID = 'ITEM_ID003'",
-                "INSERT INTO REFERENCE_DATA VALUES ('ITEM_ID004', 'fleet', 'JP')");
-
-        service.refresh();
-
-        assertEquals(3L, service.size());
-        assertEquals("b2b,advertiser,fleet",
-                service.lookup(Map.of("ITEM_ID", "ITEM_ID001")).orElseThrow().getAsString("LABEL"));
-        // A refresh must REPLACE, not merge. If a revoked key lingered here, an entitlement
-        // revocation would silently never take effect.
-        assertTrue(service.lookup(Map.of("ITEM_ID", "ITEM_ID003")).isEmpty());
-        assertTrue(service.lookup(Map.of("ITEM_ID", "ITEM_ID004")).isPresent());
-    }
-
-    @ParameterizedTest
-    @ValueSource(strings = {"HEAP", "EMBEDDED_KV"})
-    void explicitValueColumnsProjectOnlyWhatIsAsked(final String mode) throws Exception {
-        enableService(mode, "ITEM_ID", "LABEL");
-
-        final Record record = service.lookup(Map.of("ITEM_ID", "ITEM_ID001")).orElseThrow();
-        assertEquals("b2b", record.getAsString("LABEL"));
-        assertFalse(record.getSchema().getFieldNames().contains("REGION"));
-    }
-
-    @ParameterizedTest
-    @ValueSource(strings = {"HEAP", "EMBEDDED_KV"})
-    void compositeKeyRequiresEveryCoordinate(final String mode) throws Exception {
-        enableService(mode, "ITEM_ID,REGION", "*");
-
-        assertEquals(List.of("ITEM_ID", "REGION"), List.copyOf(service.getRequiredKeys()));
-        assertTrue(service.lookup(Map.of("ITEM_ID", "ITEM_ID003", "REGION", "EU")).isPresent());
-        assertTrue(service.lookup(Map.of("ITEM_ID", "ITEM_ID003", "REGION", "NA")).isEmpty());
-        assertThrows(LookupFailureException.class, () -> service.lookup(Map.of("ITEM_ID", "ITEM_ID003")));
-    }
-
-    @ParameterizedTest
-    @ValueSource(strings = {"HEAP", "EMBEDDED_KV"})
-    void refreshFailureRetainsPreviousContents(final String mode) throws Exception {
-        enableService(mode, "ITEM_ID", "*");
-        assertEquals(3L, service.size());
-
-        connectionService.execute("DROP TABLE REFERENCE_DATA");
-
-        assertThrows(TableCacheException.class, () -> service.refresh());
-        assertTrue(service.isHydrated());
-        assertEquals(3L, service.size());
-        assertTrue(service.lookup(Map.of("ITEM_ID", "ITEM_ID001")).isPresent());
-    }
-
-    // ---------- enable-time behaviour ----------
-
-    @Test
-    void enablesEvenWhenTheInitialLoadFailsAndFailsLookupsClosed() throws Exception {
-        // A controller service that refuses to enable stops the whole flow and needs manual
-        // intervention, so a bad source must not be fatal at enable time.
-        enableService("HEAP", "ITEM_ID", "*", "0 sec", "NO_SUCH_TABLE");
-
-        assertFalse(service.isHydrated());
-        // Critical: an unloaded cache must NOT answer "no such key" — for an entitlement dataset
-        // that is a wrong answer, not a missing one.
-        assertThrows(LookupFailureException.class, () -> service.lookup(Map.of("ITEM_ID", "ITEM_ID001")));
-    }
-
-    @Test
-    void requiredKeysDrivesLookupRecordContract() throws Exception {
-        enableService("HEAP", "ITEM_ID", "*");
-        assertEquals(Set.of("ITEM_ID"), service.getRequiredKeys());
-        assertEquals(Record.class, service.getValueType());
-    }
-
-    // ---------- the scheduled refresh, which replaces the companion processor ----------
-
-    @Test
-    void scheduledRefreshPicksUpChangesWithoutAnyProcessor() throws Exception {
-        enableService("HEAP", "ITEM_ID", "*", "100 millis", "REFERENCE_DATA");
-        assertEquals(3L, service.size());
-
-        connectionService.execute("INSERT INTO REFERENCE_DATA VALUES ('ITEM_ID004', 'fleet', 'JP')");
-
-        // The service polls itself; nothing else drives it.
-        final long deadline = System.currentTimeMillis() + 10_000;
-        while (service.size() != 4L && System.currentTimeMillis() < deadline) {
-            Thread.sleep(25);
-        }
-
-        assertEquals(4L, service.size());
-        assertTrue(service.lookup(Map.of("ITEM_ID", "ITEM_ID004")).isPresent());
-    }
-
-    @Test
-    void scheduledRefreshSurvivesAFailedAttempt() throws Exception {
-        enableService("HEAP", "ITEM_ID", "*", "100 millis", "REFERENCE_DATA");
-        assertEquals(3L, service.size());
-
-        // Break the source, let at least one scheduled attempt fail, then repair it. The schedule
-        // must still be alive: an exception escaping the task would cancel it permanently.
-        connectionService.execute("DROP TABLE REFERENCE_DATA");
-        Thread.sleep(400);
-        assertTrue(service.isHydrated());
-        assertEquals(3L, service.size());
-
-        connectionService.execute(
-                "CREATE TABLE REFERENCE_DATA (ITEM_ID VARCHAR(32) PRIMARY KEY, LABEL VARCHAR(256), REGION VARCHAR(16))",
-                "INSERT INTO REFERENCE_DATA VALUES ('ITEM_ID009', 'b2b', 'NA')");
-
-        final long deadline = System.currentTimeMillis() + 10_000;
-        while (service.size() != 1L && System.currentTimeMillis() < deadline) {
-            Thread.sleep(25);
-        }
-
-        assertEquals(1L, service.size());
-        assertTrue(service.lookup(Map.of("ITEM_ID", "ITEM_ID009")).isPresent());
-    }
-
-    @Test
-    void zeroIntervalLoadsOnceAndNeverRefreshes() throws Exception {
-        enableService("HEAP", "ITEM_ID", "*", "0 sec", "REFERENCE_DATA");
-        assertEquals(3L, service.size());
-
-        connectionService.execute("INSERT INTO REFERENCE_DATA VALUES ('ITEM_ID004', 'fleet', 'JP')");
-        Thread.sleep(300);
-
-        assertEquals(3L, service.size(), "Refresh Interval of 0 must not schedule a reload");
-    }
-
-    // ---------- durability, the reason the embedded backend exists ----------
-
-    @Test
-    void embeddedStoreSurvivesRestartWithoutReadingTheSource() throws Exception {
-        enableService("EMBEDDED_KV", "ITEM_ID", "*");
-        assertEquals(3L, service.size());
-
-        runner.disableControllerService(service);
-
-        // Remove the source entirely. If re-enabling still serves data it can only have come from
-        // disk, which is what makes a restarted node warm instead of re-reading the table.
-        connectionService.execute("DROP TABLE REFERENCE_DATA");
-
-        runner.enableControllerService(service);
-
-        assertTrue(service.isHydrated());
-        assertEquals(3L, service.size());
-        assertEquals("b2b,advertiser",
-                service.lookup(Map.of("ITEM_ID", "ITEM_ID002")).orElseThrow().getAsString("LABEL"));
-    }
-
-    // ---------- incremental refresh ----------
-    //
-    // The CHANGES clause is Snowflake-only, so H2 cannot exercise the incremental read itself; that
-    // path needs a live integration test for this artifact. Local coverage includes row application,
-    // store-level apply and the fallback: an
-    // incremental attempt that fails must degrade to a correct full reload rather than to a wrong
-    // cache.
-
-    @ParameterizedTest
-    @ValueSource(strings = {"HEAP", "EMBEDDED_KV"})
-    void incrementalAttemptFallsBackToFullReloadWhenChangesIsUnsupported(final String mode)
-            throws Exception {
-        enableService(mode, "ITEM_ID", "*", "0 sec", "REFERENCE_DATA", true);
-        assertEquals(3L, service.size());
-        assertNotNull(service.watermarkForTest(), "a full load must record a watermark");
-
-        connectionService.execute(
-                "INSERT INTO REFERENCE_DATA VALUES ('ITEM_ID004','fleet','JP')",
-                "DELETE FROM REFERENCE_DATA WHERE ITEM_ID = 'ITEM_ID003'");
-
-        // H2 rejects the CHANGES clause, so this exercises the fallback for real.
-        final RefreshResult result = service.refresh();
-
-        assertFalse(result.incremental(), "should have fallen back to a full reload");
-        assertEquals(3L, service.size());
-        assertTrue(service.lookup(Map.of("ITEM_ID", "ITEM_ID004")).isPresent());
-        assertTrue(service.lookup(Map.of("ITEM_ID", "ITEM_ID003")).isEmpty());
-    }
-
-    @ParameterizedTest
-    @ValueSource(strings = {"HEAP", "EMBEDDED_KV"})
-    void storeAppliesADeltaAtomicallyAndAdvancesTheWatermark(final String mode) throws Exception {
-        enableService(mode, "ITEM_ID", "*", "0 sec", "REFERENCE_DATA", false);
-        final TableCacheStore store = service.storeForTest();
-        final RecordSchema recordSchema = store.schema();
-
-        // Exactly the shape refreshIncremental() produces: a new ITEM_ID, plus a revocation.
-        final Map<String, Record> upserts = new HashMap<>();
-        final Map<String, Object> newRow = new HashMap<>();
-        newRow.put("ITEM_ID", "ITEM_ID900");
-        newRow.put("LABEL", "b2b");
-        newRow.put("REGION", "NA");
-        upserts.put("ITEM_ID900", new MapRecord(recordSchema, newRow));
-
-        store.applyChanges(recordSchema, upserts, Set.of("ITEM_ID003"), "2026-02-02 02:02:02.000 -0700");
-
-        assertEquals(3L, store.size());
-        assertEquals("b2b", store.get("ITEM_ID900").orElseThrow().getAsString("LABEL"));
-        assertTrue(store.get("ITEM_ID003").isEmpty(), "a delete in the delta must remove the key");
-        assertEquals("2026-02-02 02:02:02.000 -0700", store.watermark());
-    }
-
-    @Test
-    void embeddedStoreKeepsWatermarkAcrossRestart() throws Exception {
-        enableService("EMBEDDED_KV", "ITEM_ID", "*", "0 sec", "REFERENCE_DATA", true);
-        final String before = service.watermarkForTest();
-        assertNotNull(before);
-
-        runner.disableControllerService(service);
-        runner.enableControllerService(service);
-
-        // Watermark and contents are written together, so a restart can never resume from a point
-        // that does not match the data it holds.
-        assertEquals(before, service.watermarkForTest());
-        assertEquals(3L, service.size());
-    }
-
-    // ---------- store-level invariants ----------
-
-    private static RecordSchema schema(final String... fieldNames) {
-        return new SimpleRecordSchema(Arrays.stream(fieldNames)
-                .map(n -> new RecordField(n, RecordFieldType.STRING.getDataType()))
-                .toList());
-    }
-
-    private static Record record(final RecordSchema recordSchema, final String... values) {
-        final Map<String, Object> map = new HashMap<>();
-        final List<String> names = recordSchema.getFieldNames();
-        for (int i = 0; i < names.size() && i < values.length; i++) {
-            map.put(names.get(i), values[i]);
-        }
-        return new MapRecord(recordSchema, map);
-    }
-
-    @Test
-    void heapStoreBulkLoadIsInvisibleUntilCommitted() {
-        final RecordSchema recordSchema = schema("K", "V");
-        final HeapTableCacheStore store = new HeapTableCacheStore();
-        assertFalse(store.isHydrated());
-
-        try (TableCacheStore.BulkLoad load = store.beginBulkLoad(recordSchema)) {
-            load.put("k1", record(recordSchema, "k1", "v1"));
-            assertFalse(store.isHydrated());
-            assertEquals(0L, store.size());
-            load.commit("2026-01-01 00:00:00.000 -0700");
-        }
-
-        assertTrue(store.isHydrated());
-        assertEquals(1L, store.size());
-    }
-
-    @Test
-    void abandonedBulkLoadDiscardsStagedEntries() {
-        final RecordSchema recordSchema = schema("K", "V");
-        final HeapTableCacheStore store = new HeapTableCacheStore();
-        try (TableCacheStore.BulkLoad load = store.beginBulkLoad(recordSchema)) {
-            load.put("k1", record(recordSchema, "k1", "v1"));
-            // fall out of scope without commit
-        }
-        assertFalse(store.isHydrated());
-        assertEquals(0L, store.size());
-    }
-
-    @Test
-    void rocksStoreBulkLoadIsInvisibleUntilCommitted() throws Exception {
-        final RecordSchema recordSchema = schema("K", "V");
-        try (RocksDbTableCacheStore store = new RocksDbTableCacheStore(storageDirectory)) {
-            assertFalse(store.isHydrated());
-
-            try (TableCacheStore.BulkLoad load = store.beginBulkLoad(recordSchema)) {
-                load.put("k1", record(recordSchema, "k1", "v1"));
-                // The generation is written but not published, so readers still see nothing.
-                assertFalse(store.isHydrated());
-                assertEquals(0L, store.size());
-                load.commit("2026-01-01 00:00:00.000 -0700");
+    private static SQLException sourceFailure(final String kind) {
+        return switch (kind) {
+            case "positiveChanged" -> new SQLException("Source continuity failure", "P0001", 20001);
+            case "negativeChanged" -> new SQLException("Source continuity failure", "P0001", -20001);
+            case "positiveInvalid" -> new SQLException("Invalid source", "P0001", 20002);
+            case "negativeInvalid" -> new SQLException("Invalid source", "P0001", -20002);
+            case "changedMarker" -> new SQLException("TABLE_CACHE_SOURCE_CHANGED");
+            case "invalidMarker" -> new SQLException("TABLE_CACHE_INVALID_SOURCE");
+            case "chained" -> {
+                final SQLException outer = new SQLException("Driver wrapper");
+                outer.setNextException(new SQLException("TABLE_CACHE_SOURCE_CHANGED"));
+                yield outer;
             }
-
-            assertTrue(store.isHydrated());
-            assertEquals(1L, store.size());
-            assertEquals("v1", store.get("k1").orElseThrow().getAsString("V"));
-            assertTrue(store.get("nope").isEmpty());
-            assertTrue(store.diskBytes() > 0);
-        }
+            default -> throw new IllegalArgumentException(kind);
+        };
     }
 
-    @Test
-    void rocksStoreAbandonedLoadLeavesPreviousGenerationLive() throws Exception {
-        final RecordSchema recordSchema = schema("K", "V");
-        try (RocksDbTableCacheStore store = new RocksDbTableCacheStore(storageDirectory)) {
-            try (TableCacheStore.BulkLoad first = store.beginBulkLoad(recordSchema)) {
-                first.put("k1", record(recordSchema, "k1", "v1"));
-                first.commit("2026-01-01 00:00:00.000 -0700");
-            }
-
-            try (TableCacheStore.BulkLoad abandoned = store.beginBulkLoad(recordSchema)) {
-                abandoned.put("k2", record(recordSchema, "k2", "v2"));
-                // no commit
-            }
-
-            assertEquals(1L, store.size());
-            assertTrue(store.get("k1").isPresent());
-            assertTrue(store.get("k2").isEmpty());
+    private static void await(final BooleanSupplier condition) throws InterruptedException {
+        final long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+        while (!condition.getAsBoolean() && System.nanoTime() < deadline) {
+            Thread.sleep(10);
         }
-    }
-
-    @Test
-    void rocksStoreAdoptsExistingGenerationOnReopen() throws Exception {
-        final RecordSchema recordSchema = schema("K", "V");
-        try (RocksDbTableCacheStore store = new RocksDbTableCacheStore(storageDirectory)) {
-            try (TableCacheStore.BulkLoad load = store.beginBulkLoad(recordSchema)) {
-                load.put("k1", record(recordSchema, "k1", "v1"));
-                load.commit("2026-01-01 00:00:00.000 -0700");
-            }
-        }
-
-        try (RocksDbTableCacheStore reopened = new RocksDbTableCacheStore(storageDirectory)) {
-            assertTrue(reopened.isHydrated());
-            assertEquals(1L, reopened.size());
-            assertEquals("v1", reopened.get("k1").orElseThrow().getAsString("V"));
-            reopened.applyChanges(recordSchema, Map.of(), Set.of(), null);
-        }
-        try (RocksDbTableCacheStore reopened = new RocksDbTableCacheStore(storageDirectory)) {
-            assertEquals(null, reopened.watermark());
-        }
-    }
-
-    @Test
-    void rowCodecRoundTripsNullsAndSeparatorBytes() {
-        // A delimiter-based encoding would corrupt the third value here.
-        final List<String> values = Arrays.asList("plain", null, "has\u0000separator", "");
-        assertEquals(values, RowCodec.decode(RowCodec.encode(values)));
+        assertTrue(condition.getAsBoolean(), "condition did not become true before the deadline");
     }
 }

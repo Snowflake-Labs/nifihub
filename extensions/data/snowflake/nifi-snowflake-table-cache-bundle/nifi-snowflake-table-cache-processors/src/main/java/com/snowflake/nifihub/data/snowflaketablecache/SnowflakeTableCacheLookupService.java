@@ -26,34 +26,23 @@ import org.apache.nifi.expression.ExpressionLanguageScope;
 import org.apache.nifi.lookup.LookupFailureException;
 import org.apache.nifi.lookup.RecordLookupService;
 import org.apache.nifi.processor.util.StandardValidators;
-import org.apache.nifi.serialization.SimpleRecordSchema;
-import org.apache.nifi.serialization.record.MapRecord;
 import org.apache.nifi.serialization.record.Record;
-import org.apache.nifi.serialization.record.RecordField;
-import org.apache.nifi.serialization.record.RecordFieldType;
-import org.apache.nifi.serialization.record.RecordSchema;
 
 import java.io.IOException;
 import java.nio.file.Paths;
-import java.sql.Connection;
-import java.sql.ResultSet;
-import java.sql.ResultSetMetaData;
 import java.sql.SQLException;
-import java.sql.Statement;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.Base64;
 import java.util.Collections;
-import java.util.HashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
-import java.util.stream.Collectors;
 
 /**
  * A locally-materialized cache of a Snowflake table, exposed as a {@link RecordLookupService}.
@@ -85,8 +74,9 @@ public class SnowflakeTableCacheLookupService extends AbstractControllerService
 
     static final PropertyDescriptor SOURCE_TABLE = new PropertyDescriptor.Builder()
             .name("Source Table")
-            .description("Table or view to materialize, for example MY_DB.MY_SCHEMA.REFERENCE_DATA. "
-                    + "A view is fine and is often the right place to put filtering.")
+            .description("Fully qualified native table to materialize, for example MY_DB.MY_SCHEMA.REFERENCE_DATA. "
+                    + "Views, temporary, external, Iceberg, dynamic and hybrid tables are not supported. "
+                    + "Double-quote identifiers that require case preservation or contain punctuation.")
             .addValidator(StandardValidators.NON_BLANK_VALIDATOR)
             .expressionLanguageSupported(ExpressionLanguageScope.ENVIRONMENT)
             .required(true)
@@ -96,7 +86,7 @@ public class SnowflakeTableCacheLookupService extends AbstractControllerService
             .name("Key Columns")
             .description("Comma-separated lookup key column(s). These become the required "
                     + "coordinate keys of the lookup service, so a LookupRecord Record Path must "
-                    + "supply a value for each. Multiple columns form a composite key.")
+                    + "supply a value for each. Unquoted names are uppercase; double-quote mixed-case names. Multiple columns form a composite key.")
             .addValidator(StandardValidators.NON_BLANK_VALIDATOR)
             .required(true)
             .build();
@@ -113,7 +103,7 @@ public class SnowflakeTableCacheLookupService extends AbstractControllerService
     static final PropertyDescriptor REFRESH_INTERVAL = new PropertyDescriptor.Builder()
             .name("Refresh Interval")
             .description("Delay between refreshes, measured after completion. Set to 0 to disable scheduled refresh. "
-                    + "Refresh failures retain the previous data with no age limit. Incremental Refresh controls "
+                    + "Transient refresh failures retain validated data with no age limit. Source changes block lookups until reload. Incremental Refresh controls "
                     + "whether refreshes read changes or the full table.")
             .addValidator(StandardValidators.TIME_PERIOD_VALIDATOR)
             .defaultValue("1 hour")
@@ -125,7 +115,7 @@ public class SnowflakeTableCacheLookupService extends AbstractControllerService
             .description("Refresh by reading only what changed since the last refresh, using "
                     + "Snowflake's CHANGES clause. Requires change tracking on the source: "
                     + "ALTER TABLE <table> SET CHANGE_TRACKING = TRUE. Inserts, updates and deletes "
-                    + "are all applied. Every node keeps its own watermark. If a watermark falls outside the table's time travel "
+                    + "are all applied. Every node keeps its own query-ID checkpoint. If a checkpoint falls outside the table's time travel "
                     + "retention - for example after a node has been down a long time - the next "
                     + "refresh automatically falls back to a full reload.")
             .allowableValues("true", "false")
@@ -159,16 +149,6 @@ public class SnowflakeTableCacheLookupService extends AbstractControllerService
             .required(true)
             .build();
 
-    /** Alias for the computed delete marker on an incremental read. */
-    private static final String DELETE_FLAG = "__TABLE_CACHE_IS_DELETE";
-
-    /**
-     * A watermark is only ever a timestamp Snowflake itself produced, but it is interpolated into
-     * SQL, so it is validated against this shape before use rather than trusted.
-     */
-    private static final java.util.regex.Pattern WATERMARK_PATTERN =
-            java.util.regex.Pattern.compile("^[0-9]{4}-[0-9]{2}-[0-9]{2}[ T][0-9:.]{1,15}(\\s?[+-][0-9:]{2,5})?$");
-
     private static final List<PropertyDescriptor> PROPERTIES = List.of(
             SNOWFLAKE_CONNECTION_SERVICE, SOURCE_TABLE, KEY_COLUMNS, VALUE_COLUMNS,
             REFRESH_INTERVAL, INCREMENTAL_REFRESH, STORAGE_MODE, STORAGE_DIRECTORY);
@@ -182,6 +162,9 @@ public class SnowflakeTableCacheLookupService extends AbstractControllerService
     private volatile TableCacheStore store;
     private volatile ScheduledExecutorService refreshExecutor;
     private volatile boolean stopping;
+    private volatile boolean serving;
+    private boolean reloadRequired;
+    private AnonymousTableRefresh reader;
 
     @Override
     protected List<PropertyDescriptor> getSupportedPropertyDescriptors() {
@@ -191,37 +174,29 @@ public class SnowflakeTableCacheLookupService extends AbstractControllerService
     @OnEnabled
     public synchronized void onEnabled(final ConfigurationContext context) throws TableCacheException {
         stopping = false;
+        serving = false;
+        reloadRequired = false;
         dbcpService = context.getProperty(SNOWFLAKE_CONNECTION_SERVICE).asControllerService(DBCPService.class);
         sourceTable = context.getProperty(SOURCE_TABLE).evaluateAttributeExpressions().getValue().trim();
-        keyColumns = splitColumns(context.getProperty(KEY_COLUMNS).getValue());
+        keyColumns = SnowflakeIdentifier.parse(context.getProperty(KEY_COLUMNS).getValue(), ',');
         final String rawValueColumns = context.getProperty(VALUE_COLUMNS).getValue().trim();
         selectAll = "*".equals(rawValueColumns);
-        valueColumns = selectAll ? List.of() : splitColumns(rawValueColumns);
+        valueColumns = selectAll ? List.of() : SnowflakeIdentifier.parse(rawValueColumns, ',');
         incremental = context.getProperty(INCREMENTAL_REFRESH).asBoolean();
+        reader = new AnonymousTableRefresh(sourceTable, keyColumns, valueColumns, selectAll, incremental);
         store = createStore(context);
 
         final long intervalMillis = context.getProperty(REFRESH_INTERVAL)
                 .asTimePeriod(TimeUnit.MILLISECONDS);
 
-        if (store.isHydrated()) {
-            // Embedded mode adopted an existing database, so a restarted node is already warm and
-            // reads nothing. This is the point of on-disk storage.
-            getLogger().info("Adopted existing cache of {} with {} rows from {}",
-                    sourceTable, store.size(), store.describe());
-        } else {
-            try {
-                final RefreshResult result = refresh();
-                getLogger().info("Loaded {} with {} rows in {} ms into {}",
-                        sourceTable, result.rowsUpserted(), result.durationMillis(), result.storeDescription());
-            } catch (final TableCacheException e) {
-                // Enable anyway rather than refusing to start. A controller service that fails to
-                // enable stops the whole flow and needs manual intervention, so a transient source
-                // outage during a node restart must not be fatal. Lookups fail closed until a
-                // refresh succeeds, which is the safe answer, and the error raises a bulletin.
-                getLogger().error("Initial load of {} failed; lookups will fail until a refresh "
-                                + "succeeds{}", sourceTable,
-                        intervalMillis > 0 ? "" : " (Refresh Interval is 0, so none is scheduled)", e);
-            }
+        try {
+            // A persistent cache may resume incrementally, but is not served before source validation.
+            final RefreshResult result = refresh();
+            getLogger().info("Loaded {} with {} rows in {} ms into {}",
+                    sourceTable, result.rowsUpserted(), result.durationMillis(), result.storeDescription());
+        } catch (final TableCacheException e) {
+            getLogger().error("Initial validation of {} failed; lookups will fail until a refresh succeeds{}", sourceTable,
+                    intervalMillis > 0 ? "" : " (Refresh Interval is 0, so none is scheduled)", e);
         }
 
         if (intervalMillis > 0) {
@@ -247,8 +222,8 @@ public class SnowflakeTableCacheLookupService extends AbstractControllerService
                 // Must not propagate: an exception escaping here cancels the schedule, which would
                 // leave the cache frozen forever with no further attempts. Log a bulletin and retry
                 // on the next tick. Previous contents remain visible in the meantime.
-                getLogger().error("Failed to refresh cache for {}; previous contents retained",
-                        sourceTable, t);
+                getLogger().error("Failed to refresh cache for {}; previous contents retained, lookup availability: {}",
+                        sourceTable, serving, t);
             }
         }, intervalMillis, intervalMillis, TimeUnit.MILLISECONDS);
     }
@@ -261,7 +236,7 @@ public class SnowflakeTableCacheLookupService extends AbstractControllerService
         final String directory = context.getProperty(STORAGE_DIRECTORY)
                 .evaluateAttributeExpressions().getValue().trim();
         try {
-            final List<String> identity = new ArrayList<>(List.of("table-cache-v1", dbcpService.getIdentifier(), sourceTable));
+            final List<String> identity = new ArrayList<>(List.of("table-cache-v2", dbcpService.getIdentifier(), sourceTable));
             identity.add(Base64.getEncoder().encodeToString(RowCodec.encode(keyColumns)));
             identity.add(selectAll ? "*" : Base64.getEncoder().encodeToString(RowCodec.encode(valueColumns)));
             identity.add(Boolean.toString(incremental));
@@ -275,6 +250,7 @@ public class SnowflakeTableCacheLookupService extends AbstractControllerService
     @OnDisabled
     public void onDisabled() {
         stopping = true;
+        serving = false;
         final ScheduledExecutorService executor = refreshExecutor;
         refreshExecutor = null;
         if (executor != null) {
@@ -303,8 +279,8 @@ public class SnowflakeTableCacheLookupService extends AbstractControllerService
     // ---------- refresh ----------
 
     /**
-     * Refresh the cache. Incremental when enabled and a usable watermark exists, otherwise a full
-     * reload. On failure the previous contents remain visible.
+     * Refresh the cache. Transient errors preserve serving eligibility; detected source discontinuity
+     * requires a full reload before any more lookups. Checkpoint and rows are published together.
      *
      * <p>Synchronized so a scheduled refresh and any other caller serialize. Two concurrent loads
      * would both claim the same generation number and collide.
@@ -315,125 +291,53 @@ public class SnowflakeTableCacheLookupService extends AbstractControllerService
             throw new TableCacheException("Service is not enabled");
         }
 
-        final String watermark = target.watermark();
-        if (incremental && target.isHydrated() && watermark != null) {
+        final boolean delta = incremental && target.isHydrated() && !reloadRequired;
+        final boolean recovering = reloadRequired;
+        try {
+            RefreshResult result;
             try {
-                return refreshIncremental(target, watermark);
-            } catch (final SQLException e) {
-                // Most likely the watermark has aged out of the table's time travel retention, which
-                // Snowflake reports as "Time travel data is not available". Falling back on any
-                // failure is deliberate: a full reload is always correct, so self-healing beats
-                // trying to classify the error and getting the classification wrong.
-                getLogger().warn("Incremental refresh of {} failed, falling back to a full reload: {}",
-                        sourceTable, e.getMessage());
-            }
-        }
-        return refreshFull(target);
-    }
-
-    private RefreshResult refreshFull(final TableCacheStore target) throws TableCacheException {
-        final long started = System.currentTimeMillis();
-        final String sql = "SELECT " + projection() + " FROM " + sourceTable;
-        long rows = 0;
-
-        try (Connection connection = dbcpService.getConnection()) {
-            // Capture the watermark BEFORE reading. Anything committed during the load is then
-            // re-read by the next incremental pass, which is harmless because applies are
-            // idempotent. Taking it afterwards could skip a change and never notice.
-            final String watermark = serverTimestamp(connection);
-
-            try (Statement statement = connection.createStatement();
-                 ResultSet resultSet = statement.executeQuery(sql)) {
-
-                final RecordSchema schema = schemaFor(resultSet.getMetaData());
-                final List<String> fieldNames = schema.getFieldNames();
-
-                try (TableCacheStore.BulkLoad load = target.beginBulkLoad(schema)) {
-                    while (resultSet.next()) {
-                        load.put(compositeKey(resultSet), readRecord(resultSet, schema, fieldNames));
-                        rows++;
-                    }
-                    load.commit(watermark);
+                result = reloadRequired ? reader.reload(dbcpService, target) : reader.refresh(dbcpService, target, delta);
+            } catch (final SQLException exception) {
+                final boolean changed = sourceChanged(exception);
+                if (changed) {
+                    serving = false;
+                    reloadRequired = true;
                 }
+                if (recovering || !(changed || delta && historyUnavailable(exception))) {
+                    throw exception;
+                }
+                getLogger().warn("Source continuity requires a full reload for {}", sourceTable);
+                result = reader.reload(dbcpService, target);
             }
-        } catch (final SQLException | RuntimeException e) {
-            throw new TableCacheException("Failed to load cache from " + sourceTable
-                    + " using query [" + sql + "]", e);
-        }
-
-        return new RefreshResult(rows, 0L, System.currentTimeMillis() - started, false,
-                target.describe());
-    }
-
-    private RefreshResult refreshIncremental(final TableCacheStore target, final String watermark)
-            throws SQLException, TableCacheException {
-        if (!WATERMARK_PATTERN.matcher(watermark).matches()) {
-            throw new TableCacheException("Stored watermark is not a recognisable timestamp: " + watermark);
-        }
-        final RecordSchema schema = target.schema();
-        if (schema == null) {
-            throw new TableCacheException("Cache has no schema; a full load is required first");
-        }
-        final List<String> fieldNames = schema.getFieldNames();
-        final long started = System.currentTimeMillis();
-
-        // Project exactly the fields already stored, so the delta's schema matches the load's. On-disk
-        // encoding is positional, so a differing column set would silently shift values.
-        // Keep update DELETE halves: a lookup key can itself change. INSERT wins for same-key pairs.
-        final String sql = "SELECT " + String.join(", ", fieldNames)
-                + ", METADATA$ACTION = 'DELETE' AS " + DELETE_FLAG
-                + " FROM " + sourceTable
-                + " CHANGES(INFORMATION => DEFAULT) AT(TIMESTAMP => '" + watermark + "'::TIMESTAMP_TZ)";
-
-        try (Connection connection = dbcpService.getConnection()) {
-            final String nextWatermark = serverTimestamp(connection);
-            if (!WATERMARK_PATTERN.matcher(nextWatermark).matches()) {
-                throw new TableCacheException("Server returned an unrecognisable timestamp");
+            reloadRequired = false;
+            serving = !stopping;
+            return result;
+        } catch (final SQLException exception) {
+            if (sourceChanged(exception)) {
+                serving = false;
+                reloadRequired = true;
             }
-
-            try (Statement statement = connection.createStatement();
-                 ResultSet resultSet = statement.executeQuery(sql
-                         + " END(TIMESTAMP => '" + nextWatermark + "'::TIMESTAMP_TZ)")) {
-                return applyChangeRows(target, resultSet, nextWatermark, started);
-            }
+            throw new TableCacheException("Failed to refresh cache from %s".formatted(sourceTable), exception);
+        } catch (final RuntimeException exception) {
+            throw new TableCacheException("Failed to refresh cache from %s".formatted(sourceTable), exception);
         }
     }
 
-    RefreshResult applyChangeRows(final TableCacheStore target, final ResultSet resultSet,
-                                  final String nextWatermark, final long started) throws SQLException {
-        final RecordSchema schema = target.schema();
-        final Map<String, Record> upserts = new HashMap<>();
-        final Set<String> deletes = new LinkedHashSet<>();
-        while (resultSet.next()) {
-            final String key = compositeKey(resultSet);
-            if (resultSet.getBoolean(DELETE_FLAG)) {
-                deletes.add(key);
-            } else if (upserts.putIfAbsent(key, readRecord(resultSet, schema, schema.getFieldNames())) != null) {
-                throw new SQLException("Change rows contain duplicate lookup keys");
+    private static boolean sourceChanged(final SQLException exception) {
+        for (SQLException current = exception; current != null; current = current.getNextException()) {
+            final String message = String.valueOf(current.getMessage());
+            if (Math.abs(current.getErrorCode()) == 20001 || Math.abs(current.getErrorCode()) == 20002
+                    || message.contains("TABLE_CACHE_SOURCE_CHANGED") || message.contains("TABLE_CACHE_INVALID_SOURCE")) {
+                return true;
             }
         }
-        deletes.removeAll(upserts.keySet());
-        target.applyChanges(schema, upserts, deletes, nextWatermark);
-        return new RefreshResult(upserts.size(), deletes.size(),
-                System.currentTimeMillis() - started, true, target.describe());
+        return false;
     }
 
-    /** Both watermarks come from Snowflake, so client clock skew never enters the calculation. */
-    private static String serverTimestamp(final Connection connection) throws SQLException {
-        try (Statement statement = connection.createStatement();
-             ResultSet resultSet = statement.executeQuery("SELECT CURRENT_TIMESTAMP()")) {
-            resultSet.next();
-            return resultSet.getString(1);
-        }
-    }
-
-    private Record readRecord(final ResultSet resultSet, final RecordSchema schema,
-                              final List<String> fieldNames) throws SQLException {
-        final Map<String, Object> values = new HashMap<>(fieldNames.size());
-        for (final String fieldName : fieldNames) {
-            values.put(fieldName, resultSet.getString(fieldName));
-        }
-        return new MapRecord(schema, values);
+    private static boolean historyUnavailable(final SQLException exception) {
+        final String message = String.valueOf(exception.getMessage()).toLowerCase(Locale.ROOT);
+        return message.contains("time travel data is not available")
+                || message.contains("statement") && (message.contains("not found") || message.contains("does not exist"));
     }
 
     /** Entries currently visible to lookups. */
@@ -445,13 +349,13 @@ public class SnowflakeTableCacheLookupService extends AbstractControllerService
     /** False until the first successful load. Lookups fail closed while false. */
     boolean isHydrated() {
         final TableCacheStore current = store;
-        return current != null && current.isHydrated();
+        return !stopping && serving && current != null && current.isHydrated();
     }
 
-    /** Visible for testing: the watermark the next incremental refresh would resume from. */
-    String watermarkForTest() {
+    /** Visible for testing: the source boundary the next refresh resumes from. */
+    CacheCheckpoint checkpointForTest() {
         final TableCacheStore current = store;
-        return current == null ? null : current.watermark();
+        return current == null ? null : current.checkpoint();
     }
 
     /** Visible for testing: the backing store. */
@@ -469,8 +373,8 @@ public class SnowflakeTableCacheLookupService extends AbstractControllerService
         }
         // Fail closed. An empty Optional would mean "no such key", which for an entitlement
         // dataset is a materially different answer from "the cache is not loaded yet".
-        if (!current.isHydrated()) {
-            throw new LookupFailureException("Cache for " + sourceTable + " is not loaded yet");
+        if (stopping || !serving || !current.isHydrated()) {
+            throw new LookupFailureException("Cache for %s is not validated yet".formatted(sourceTable));
         }
 
         final List<String> parts = new ArrayList<>(keyColumns.size());
@@ -496,51 +400,7 @@ public class SnowflakeTableCacheLookupService extends AbstractControllerService
 
     // ---------- internals ----------
 
-    private String projection() {
-        if (selectAll) {
-            return "*";
-        }
-        final Set<String> columns = new LinkedHashSet<>(keyColumns);
-        columns.addAll(valueColumns);
-        return String.join(", ", columns);
-    }
-
-    private String compositeKey(final ResultSet resultSet) throws SQLException {
-        final List<String> parts = new ArrayList<>(keyColumns.size());
-        for (final String column : keyColumns) {
-            final String value = resultSet.getString(column);
-            if (value == null) {
-                throw new SQLException("Source keys must be non-null");
-            }
-            parts.add(value);
-        }
-        return encodeKey(parts);
-    }
-
     private static String encodeKey(final List<String> parts) {
         return parts.size() == 1 ? parts.getFirst() : Base64.getEncoder().encodeToString(RowCodec.encode(parts));
-    }
-
-    /**
-     * Every column is read as a string. Deliberate: it avoids a JDBC-to-record type mapping layer,
-     * and string values are sufficient for the routing and entitlement cases this is aimed at.
-     */
-    private RecordSchema schemaFor(final ResultSetMetaData metaData) throws SQLException {
-        final List<RecordField> fields = new ArrayList<>();
-        final Set<String> seen = new LinkedHashSet<>();
-        for (int i = 1; i <= metaData.getColumnCount(); i++) {
-            final String label = metaData.getColumnLabel(i);
-            if (seen.add(label)) {
-                fields.add(new RecordField(label, RecordFieldType.STRING.getDataType()));
-            }
-        }
-        return new SimpleRecordSchema(fields);
-    }
-
-    private static List<String> splitColumns(final String raw) {
-        return Arrays.stream(raw.split(","))
-                .map(String::trim)
-                .filter(s -> !s.isEmpty())
-                .collect(Collectors.toList());
     }
 }
