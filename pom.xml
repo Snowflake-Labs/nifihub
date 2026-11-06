@@ -66,7 +66,7 @@
         <mockito.version>5.24.0</mockito.version>
 
         <!-- Quality tools -->
-        <pmd.version>7.28.0</pmd.version>
+        <pmd.version>7.29.0</pmd.version>
         <checkstyle.version>14.3.0</checkstyle.version>
         <jacoco.version>0.8.16</jacoco.version>
         <surefire.version>3.6.1</surefire.version>
