@@ -1,249 +1,139 @@
 # Snowflake Table Cache
 
-A self-refreshing `RecordLookupService` for `LookupRecord`. It materializes a
-Snowflake reference table locally, avoiding one network query for every lookup.
-It is a controller service, not a processor. Each node maintains its own cache.
+A self-refreshing controller service for `LookupRecord`. It keeps a Snowflake
+reference table or view in a local cache instead of querying the database for each
+lookup. `SnowflakeTableCacheLookupService` implements `RecordLookupService`; it is
+not a processor. Each NiFi node maintains its own cache and refresh schedule.
+
+**Incremental refresh is off by default.** Successful refreshes publish complete
+data with its checkpoint. Nodes may serve different snapshots, and transient
+refresh failures can leave previously validated data available **without an age limit**.
 
 Community contribution provided AS IS, not a Snowflake-supported product or
 service. See the repository's support disclaimer and Apache 2.0 license.
 
-## Configure
+## Supported sources
 
-| Property | Meaning |
-|---|---|
-| Snowflake Connection Service | Existing `DBCPService` with access to the reference table |
-| Source Table | Fully qualified table or view; see the source modes below |
-| Key Columns | Comma-separated lookup columns; supply each as a LookupRecord coordinate |
-| Value Columns | Columns to return, or `*`; returned values are strings or null |
-| Storage Mode | Heap (default) or Embedded (RocksDB) |
-| Storage Directory | Dedicated writable directory per Embedded service and node |
-| Refresh Interval | Delay after each refresh completes; default one hour; zero disables scheduled refresh |
-| Incremental Refresh | Allow `CHANGES` on eligible tables; false forces full reloads; full-only sources always reload |
-
-### Source modes
-
-| Source | When Incremental Refresh is true |
+| Source | With Incremental Refresh=true |
 |---|---|
 | Standard permanent or transient table | Initial full load, then bounded changes |
-| Native dynamic table with resolved INCREMENTAL mode | Initial full load, then bounded changes to its materialized output |
+| Native dynamic table with resolved INCREMENTAL mode | Initial full load, then bounded changes to materialized output |
 | Snowflake-managed Iceberg v2/v3 table | Initial full load, then bounded changes |
-| View | Full reload every time; no change tracking required |
+| View | Full reload every time |
 | Hybrid table | Full reload every time |
 | Native dynamic table with resolved FULL mode | Full reload every time |
 
-Incremental Refresh=false forces full reloads for all supported sources. Each
-refresh checks source metadata and reports the actual FULL/INCREMENTAL mode in
-the refresh log. Missing change tracking, privileges or history are not evidence
-that an otherwise incremental table is a full-only source.
+`Incremental Refresh=false` forces full reloads for every supported source.
+Capabilities are checked on every refresh; logs report the actual FULL/INCREMENTAL
+mode. Missing change tracking or privileges does not silently select full-only mode.
 
 Temporary tables, external tables, materialized views, dynamic Iceberg tables,
 externally managed Iceberg tables and other dynamic-table refresh modes are not
-qualified by this bundle. Do not infer support solely from a change-tracking flag.
-Managed Iceberg qualification covers Snowflake writes, not external writers.
+qualified. Managed Iceberg qualification covers Snowflake writes, not external writers.
 
-View queries may include joins and aggregates, provided their result has unique,
-non-null lookup keys. The service re-evaluates the entire view on every refresh;
-unchanged DDL never skips a query. View dependency changes are reflected in the
-next successful full result, without reconstructing a delta. Views over external
-systems remain subject to their source's consistency and availability semantics.
-For dynamic tables the cache reads the latest published output; it neither
-triggers a dynamic-table refresh nor removes its own freshness lag.
+Views can contain joins, aggregates and nested views if their results satisfy the
+key requirements below. The entire view is re-evaluated on each refresh; unchanged
+DDL never skips a read. Views over external systems retain those systems' consistency
+and availability limits. Dynamic tables expose their latest published output; this
+service does not trigger their refreshes or remove their upstream freshness lag.
 
-Use Snowflake identifier syntax in table and column properties: unquoted names
-are uppercase, while double-quoted names preserve case and punctuation. For
-example, `MY_DB.PUBLIC.REFERENCE_DATA` and key columns `ITEM_ID,"Region Code"`.
-Lookup coordinates use the resolved names (`ITEM_ID` and `Region Code`), without
-the surrounding quotes. SQL expressions and arbitrary source queries are not
-accepted. Value Columns `*` includes all source columns; explicit projections
-also include the configured key columns.
+## Prerequisites
 
-1. Enable the database connection pool (`DBCPService`) before the cache.
-2. In `LookupRecord`, configure record reader/writer services and choose this lookup service.
-3. Map a key column such as `ITEM_ID` to `/item_id` and write the returned record at `/reference`.
+- An enabled database connection pool (`DBCPService`) with database/schema usage,
+  source SELECT, warehouse access and source metadata visibility. Dynamic-table
+  inspection needs a visible `refresh_mode` in SHOW DYNAMIC TABLES; additional
+  MONITOR privileges may be needed. Qualify the least-privilege role on your runtime.
+- Borrowed connections with auto-commit, no active caller-owned transaction, and
+  `QUOTED_IDENTIFIERS_IGNORE_CASE=FALSE`. Use a pool that resets session state and
+  keep the connection's evaluation context stable. Incompatible settings are rejected,
+  not changed; the service does not commit or roll back another component's work.
+- For incremental reads: owner-configured change tracking and at least one day of
+  retained history. Full-only reads need neither change tracking nor Time Travel.
+- Unique, non-null source keys, including every composite-key part. Enforce uniqueness
+  upstream: a delta cannot detect a duplicate against an unchanged cached source row.
+- Capacity for the source and refresh staging; Embedded additionally needs a dedicated
+  writable directory per service and node. See [operating limits](#operating-limits).
 
-For example, a reference row `ITEM_ID=example-1, LABEL=blue` enriches
-`{"item_id":"example-1"}` with a reference record containing string values.
-An unknown key is unmatched, not a lookup failure.
+The service creates no streams, tasks, source tables, permanent procedures or grants.
 
-Keys must be unique and non-null in the source, including every composite-key
-part. Full loads reject duplicates or nulls without publishing a partial cache.
-Keep uniqueness enforced upstream: an incremental delta cannot detect a duplicate
-against an unchanged source row. Composite keys use length-prefixed encoding.
+## Configure and use
 
-## Security and connection requirements
+Install the generated `nifi-snowflake-table-cache-nar` on a runtime with the matching
+`nifi-standard-services-api-nar`. See [build and qualification](CONTRIBUTING.md).
 
-Restrict controller-service configuration to trusted NiFi administrators. Table
-and column properties select identifiers, not arbitrary SQL; identifiers are
-parsed and double-quoted, and query/checkpoint values are bound or escaped.
-Lookup coordinates are local cache keys and never enter SQL. Do not strip
-punctuation from valid quoted identifiers. Use explicit Value Columns when the
-cache should not include every source column.
+| Property | Default | Configuration |
+|---|---|---|
+| Snowflake Connection Service | None | Existing `DBCPService` |
+| Source Table | None | Fully qualified table or view, e.g. `MY_DB.PUBLIC.REFERENCE_DATA` |
+| Key Columns | None | Comma-separated lookup columns |
+| Value Columns | `*` | Columns to return; explicit projections also include key columns |
+| Storage Mode | Heap | Heap or Embedded (RocksDB) |
+| Storage Directory | None | Required for Embedded; dedicated writable path |
+| Refresh Interval | `1 hour` | Delay after refresh completion; `0` disables scheduled refresh and retries |
+| Incremental Refresh | `false` | Permit changes on eligible sources; full-only sources still reload |
 
-Use an existing connection service whose runtime identity has only the required
-database/schema usage, source SELECT, warehouse access and source metadata visibility.
-Dynamic-table capability inspection requires a visible `refresh_mode` in
-SHOW DYNAMIC TABLES; additional MONITOR privileges may be needed. Qualify those
-privileges on the intended runtime; live source tests use a lab role. Change
-tracking must be configured by an authorized table owner. The cache does not
-create streams, tasks, source tables, permanent stored procedures or grants.
+Table and column properties use Snowflake identifier syntax, not SQL expressions
+or arbitrary queries. Unquoted names resolve uppercase; double quotes preserve case
+and punctuation. For key columns `ITEM_ID,"Region Code"`, supply coordinates named
+`ITEM_ID` and `Region Code`, without surrounding quotes. All returned values are strings
+or null; convert numeric and semi-structured strings downstream when native types are needed.
 
-Each refresh reads session/source metadata and submits an anonymous SQL procedure
-through the same Java Database Connectivity (JDBC) connection. That call performs
-multiple child queries; it is not one transaction or one snapshot. Borrowed
-connections must use auto-commit, have no caller-owned transaction, and use
-`QUOTED_IDENTIFIERS_IGNORE_CASE=FALSE`. The service rejects incompatible settings
-without changing them, committing or rolling back another component's work.
-Case folding can otherwise make metadata validation and a quoted SELECT refer to
-different objects. Use a pool that resets session state and keep its evaluation
-context stable.
+1. Enable the connection service, configure the cache properties, then enable the cache.
+2. In `LookupRecord`, configure record reader/writer services and select this lookup service.
+3. Map each key column to a RecordPath, e.g. `ITEM_ID` to `/item_id`, and write the returned record at `/reference`.
 
-The cache uses the connection service's identity, not each lookup caller's
-identity. Restrict access to flows that consume it accordingly. Lookups return
-detached records and schemas, so consumer mutation cannot change the cached copy.
-This isolation does not provide per-record authorization or real-time revocation;
-see the stale-data behavior below.
+A source row `ITEM_ID=example-1, LABEL=blue` enriches `{"item_id":"example-1"}`
+with a reference record containing string values. An unknown key value is unmatched.
+A missing/null required coordinate or an unavailable cache is a lookup failure, not a miss.
 
-## Refresh and failure semantics
+## Refresh and failure behavior
 
-- Lookups fail before the first successful load, rather than reporting a miss.
-- Persistent starts validate and refresh the existing cache before serving it;
-  they can resume incrementally when the source and checkpoint remain usable.
-- After validation, transient refresh failures retain the previous cache
-  **without an age limit**. Detected source discontinuity blocks lookups until a
-  full reload succeeds. This is not guaranteed real-time revocation: source checks
-  are optimistic and do not lock DDL or detect every policy/session change.
-- Full reloads replace the cache. For incremental-capable sources with incremental
-  mode enabled, each node stores the full SELECT's exact child query ID, or the
-  explicit endpoint of an incremental read, with its rows, schema and source
-  signature. The outer anonymous CALL ID is not the checkpoint.
-  Full-only reads return one query directly without RESULT_SCAN; their stored
-  marker ID is diagnostic only, not a resumable snapshot boundary. This avoids
-  dependence on persisted hybrid-table query results. The complete response still
-  includes a control row for an empty source and a checked data-row count.
-  Missing historical statements/time travel and source-signature changes attempt
-  an aligned full reload. Other SQL/protocol failures surface without silently
-  treating a failed incremental refresh as a successful full load.
-- Incremental reads retain both update halves, remove the old key when a key
-  changes, and let inserts win over deletes for the same key regardless of row
-  order. Reads have an explicit end checkpoint. A complete control row and the
-  expected number of data rows must arrive before any cache change is published;
-  an empty table or delta still carries a checkpoint.
-- Initial-load failures are retried only when the refresh interval is positive.
-- Non-null values are strings, including numeric and semi-structured values. Convert
-  downstream when native types are required.
-- Nodes refresh independently and can serve different valid point-in-time
-  snapshots. There is no primary-only reader, shared cursor or cache replication.
-
-## Storage and operating limits
-
-Heap needs room for both the old and new maps during refresh. RocksDB uses disk,
-native memory and the operating-system page cache. Incremental changes are first
-collected in JVM heap; Embedded is not a bounded-memory guarantee for large deltas.
-Full reloads temporarily keep old and new on-disk generations.
-Full-only responses use a window count, which can require warehouse buffering;
-full-scan cost grows with source size. This path has correctness tests, not a
-large-table performance qualification.
-
-Use a dedicated persistent directory, never a directory belonging to NiFi state,
-another service, or a different reference source. Do not assume a writable path
-is persistent. Backup/recovery, permissions and capacity belong to the runtime
-operator. Restrict the directory and its parents to trusted operating-system users;
-cache files contain source values and are not encrypted by this service. Local
-filesystem tampering is outside the cache's trust boundary. Keep source credentials
-out of paths and logs. Component errors omit lookup keys, but JDBC/native exception
-causes may include database diagnostics; protect runtime logs too.
-
-Embedded mode locks its directory and checks a versioned identity containing the
-connection-service ID, source expression, key/value columns and incremental mode.
-Mismatches fail enablement; existing generations are not deleted on open errors.
-The query-ID checkpoint format is `table-cache-v2`; use a fresh directory for
-older caches. No migration or timestamp-checkpoint compatibility is provided.
-
-The source signature checks object type, creation/DDL metadata, retention, account,
-user and primary role before and after the data query. The anonymous procedure
-also verifies the signature observed during capability selection. Only effective
-incremental mode requires at least one day of retention. Full-only sources need
-no Time Travel or change tracking. The guard does not cover every masking/row-access
-policy, secondary-role or session-setting change. Keep the connection evaluation
-context stable. A signature is not an authorization guarantee, and historical
-query IDs remain subject to Snowflake's statement lookup and data-retention limits.
-
-Disable waits for an in-flight refresh before closing native storage. Configure
-connection/query timeouts in the supplied DBCP service: a driver that ignores
-interrupts can delay disablement. Incremental changes are not synchronously fsynced
-on every refresh; abrupt crash/power-loss durability is not claimed.
-
-A predecessor build was exercised on one managed Medium Openflow node using
-`/nifi/configuration_resources`, including incremental refresh and adoption by a
-new JVM after graceful suspend/resume on the same host. That observation is not
-a platform storage guarantee or qualification of this newly packaged artifact.
-This bundle still requires testing on the exact intended runtime. Crash recovery,
-host replacement, multi-node behavior, Small runtimes and performance at scale are
-not established by that smoke test.
-
-## Build and test
-
-From the repository root, with Java 21:
-
-```bash
-./mvnw clean verify -Pcontrib-check,report-code-coverage \
-  -f extensions/data/snowflake/nifi-snowflake-table-cache-bundle/pom.xml
-```
-
-Normal builds use deterministic JDBC response fixtures and temporary RocksDB
-directories and do not need an account. Fixtures test response handling, not
-Snowflake syntax or change-tracking semantics.
-
-| Test layer | Contract |
+| Condition | Behavior |
 |---|---|
-| Identifier and codec tests | Identifier grammar/escaping; bounded persistence decoding |
-| Store tests (Heap and RocksDB) | Atomic publication, detached records/schema, corruption and restart behavior |
-| Reader fixtures | Metadata/session validation, complete responses and JDBC closure before publication |
-| Controller-service tests | LookupRecord integration, serving/recovery gates and refresh concurrency |
-| Live JDBC tests | Production-generated SQL, native values, child checkpoints and supported-source behavior |
+| Before the first successful load | Lookups fail; a positive refresh interval enables retries |
+| Persistent restart | Validate and refresh before serving; eligible sources can resume incrementally when the source/checkpoint remain usable |
+| Successful refresh | Full loads replace contents; deltas apply inserts, updates and deletes; data and checkpoint publish together |
+| Null or duplicate keys in a full result; incomplete or invalid response | Reject the refresh without publishing partial contents |
+| Transient refresh failure after validation | Keep serving the previous cache, with no age limit |
+| Detected source discontinuity | Block lookups and attempt a full reload; resume serving only after success |
+| Unusable incremental history or statement checkpoint | Attempt a full reload; failure preserves prior validated data unless discontinuity is detected |
+| Other SQL/protocol failure | Surface the failure; do not reinterpret it as full-only capability |
 
-Live tests are skipped unless `SNOWFLAKE_IT_CONNECTION` explicitly selects a test
-connection. They create and drop unique fixture tables, so use a dedicated test
-database/schema and explicitly scoped warehouse/role, not production.
-The test helper reads the named `~/.snowflake/config.toml` connection with a TOML
-parser; `SNOWFLAKE_IT_*` settings can override it using an approved secret provider.
-It never needs credentials committed in this repository. JDBC is test-only;
-the deployed service obtains connections from the supplied DBCP service.
+Source checks run at refresh time. They are optimistic checks, not DDL locks,
+comprehensive policy-change detection or real-time authorization revocation.
+See [refresh alignment and source signatures](DESIGN.md) for the exact guarantees.
 
-For a named test connection already configured with authentication, replace the
-example scope names below, then run `verify`. These settings contain no secrets:
+## Security
 
-```bash
-SNOWFLAKE_IT_CONNECTION='test-connection' \
-SNOWFLAKE_IT_DATABASE='DEDICATED_PERMANENT_TEST_DATABASE' \
-SNOWFLAKE_IT_SCHEMA=PUBLIC SNOWFLAKE_IT_WAREHOUSE='TEST_WAREHOUSE' \
-SNOWFLAKE_TYPES_IT=true \
-./mvnw verify -f extensions/data/snowflake/nifi-snowflake-table-cache-bundle/pom.xml
-```
+Restrict controller-service configuration to trusted NiFi administrators. Identifiers
+are parsed/quoted and query/checkpoint values are bound or escaped; lookup coordinates
+stay local and never enter SQL. Choose explicit Value Columns to limit cached data.
 
-`SourceTypesProtocolIT` additionally requires `SNOWFLAKE_TYPES_IT=true` and a
-dedicated permanent database/schema (hybrid tables cannot live in a transient
-database). It creates unique view, hybrid, dynamic-table and managed Iceberg fixtures,
-uses the configured warehouse for controlled dynamic-table refreshes, and drops its fixtures.
-It does not create external volumes or catalog integrations. An explicitly
-selected capability that is unavailable fails the test rather than being skipped.
+The cache uses the connection service's identity, not each lookup caller's identity.
+Restrict access to consuming flows accordingly; this is not per-caller authorization.
+Returned records and schemas are detached, so consumer mutation cannot alter the cache.
 
-## Install and release boundary
+Restrict the storage directory and its parents to trusted operating-system users.
+Cache files contain source values and are not encrypted by this service. Hostile local
+filesystem modification is outside its trust boundary. Keep credentials out of paths
+and logs. Component errors omit lookup keys, but JDBC/native exception causes may
+contain database diagnostics; protect logs as well.
 
-Install the generated `nifi-snowflake-table-cache-nar` on a runtime with the
-matching `nifi-standard-services-api-nar`. Check controller-service discovery,
-JNI load, cold and warm lookups, and incremental refresh on the installed artifact.
-Record its checksum and runtime version when qualifying it.
+## Operating limits
 
-The class and bundle coordinates differ from predecessor private builds. Use a
-new service and a fresh dedicated directory; old flow exports do not automatically
-resolve to this bundle. No on-disk migration or compatibility alias is provided.
-
-The NAR includes reviewed RocksDB/native dependency notices and full license texts.
-See [THIRD_PARTY.md](THIRD_PARTY.md) for the inventory, pinned sources and remaining
-source-rights/build-provenance approvals. Account-free `verify` checks the actual
-packaged texts and JNI checksum. Passing RAT and packaging tests is not legal or
-organizational redistribution approval.
-
-Keep the version at `0.1.0-SNAPSHOT` during contribution. A public PR is source
-disclosure; a release version merged to main can trigger automatic NAR publication.
+- Nodes refresh independently: no primary-only reader, shared cursor or replication.
+  Source reads multiply with node count; there is no bound on cross-node staleness.
+- Heap needs room for old and new maps. RocksDB uses disk, native memory and the
+  operating-system page cache; full reloads temporarily retain two generations.
+  Deltas are staged in JVM heap even in Embedded mode. Full scans and the full-only
+  window count can require substantial warehouse work/buffering. Size against your workload.
+- Use dedicated persistent storage, never NiFi state or another service/source's
+  directory. A writable path is not necessarily persistent. Operators own capacity,
+  permissions and backup/recovery. Identity mismatches fail enablement without deleting
+  existing generations. Use a fresh directory for older caches; no migration is provided.
+- Disable waits for an in-flight refresh. Set connection/query timeouts in DBCP;
+  drivers that ignore interrupts can delay shutdown. Incremental writes are not
+  synchronously fsynced on every refresh; hard-crash/power-loss durability is not claimed.
+- This implementation has correctness tests, not qualification on your exact runtime
+  or at representative scale. See [qualification and release](CONTRIBUTING.md#qualify-the-artifact-and-release)
+  and [third-party provenance](THIRD_PARTY.md) before deployment or publication.
