@@ -273,7 +273,8 @@ class SnowflakeTableCacheLookupServiceIT {
                 return (Connection) Proxy.newProxyInstance(Connection.class.getClassLoader(), new Class<?>[]{Connection.class}, (proxy, method, arguments) -> {
                     try {
                         final Object result = method.invoke(connection, arguments);
-                        if (method.getName().equals("prepareStatement") && intercept.compareAndSet(true, false)) {
+                        if (method.getName().equals("prepareStatement") && ((String) arguments[0]).startsWith("WITH refresh_cache")
+                                && intercept.compareAndSet(true, false)) {
                             final PreparedStatement statement = (PreparedStatement) result;
                             return Proxy.newProxyInstance(PreparedStatement.class.getClassLoader(), new Class<?>[]{PreparedStatement.class},
                                     (statementProxy, statementMethod, statementArguments) -> {

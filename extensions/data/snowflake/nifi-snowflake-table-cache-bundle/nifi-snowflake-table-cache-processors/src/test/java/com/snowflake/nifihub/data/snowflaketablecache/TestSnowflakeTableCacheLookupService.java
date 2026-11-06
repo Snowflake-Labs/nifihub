@@ -106,6 +106,9 @@ class TestSnowflakeTableCacheLookupService {
         assertNull(call.parameters().get(2));
         assertEquals("PUBLIC", call.parameters().get(3));
         assertEquals("REF", call.parameters().get(4));
+        assertEquals(SIGNATURE, call.parameters().get(5));
+        assertEquals(Map.of(1, "PUBLIC", 2, "REF"), connectionService.metadataCalls().getFirst().parameters());
+        assertEquals(1, connectionService.connectionCount());
     }
 
     @ParameterizedTest
@@ -281,6 +284,10 @@ class TestSnowflakeTableCacheLookupService {
         connectionService.enqueueFailure(sourceFailure("changedMarker"));
         connectionService.enqueue(full(SECOND_ID, "replacement", data("INSERT", "new", "replacement-value", "EU")));
         assertFalse(service.refresh().incremental());
+        assertEquals(3, connectionService.calls().size(), "queued SQL failure must be consumed before the replacement reload");
+        assertEquals(SIGNATURE, connectionService.calls().get(1).parameters().get(5));
+        assertEquals("replacement", connectionService.calls().getLast().parameters().get(5));
+        assertEquals(0, connectionService.remainingSteps());
         assertTrue(service.isHydrated());
         assertEquals(1L, service.size());
         assertEquals("replacement-value", lookup("new").getAsString("LABEL"));
@@ -409,6 +416,173 @@ class TestSnowflakeTableCacheLookupService {
         assertTrue(service.isHydrated());
         assertNotNull(lookup("ITEM_ID001"));
         assertEquals(new CacheCheckpoint(SECOND_ID, SIGNATURE), service.checkpointForTest());
+    }
+
+    static Stream<Arguments> fullOnlySourcesAndBackends() {
+        return Stream.of("HEAP", "EMBEDDED_KV").flatMap(mode -> Stream.of("view", "hybrid", "dynamicFull").map(type -> Arguments.of(mode, type)));
+    }
+
+    @ParameterizedTest
+    @MethodSource("fullOnlySourcesAndBackends")
+    void fullOnlySourcesReplaceRowsDespiteIncrementalConfiguration(final String mode, final String type) throws Exception {
+        connectionService.sourceType(type);
+        initialLoad(mode, true);
+        connectionService.enqueue(full(SECOND_ID, SIGNATURE, data("INSERT", "new", "replacement", "EU")));
+        assertFalse(service.refresh().incremental());
+        assertTrue(service.isHydrated());
+        assertEquals(1L, service.size());
+        assertEquals("replacement", lookup("new").getAsString("LABEL"));
+        assertTrue(service.lookup(Map.of("ITEM_ID", "ITEM_ID001")).isEmpty());
+        assertEquals(new CacheCheckpoint(SECOND_ID, SIGNATURE), service.checkpointForTest());
+        assertEquals(2, connectionService.calls().size());
+        assertFalse(connectionService.calls().getLast().incremental());
+        assertNull(connectionService.calls().getLast().parameters().get(1));
+        assertEquals(SIGNATURE, connectionService.calls().getLast().parameters().get(2));
+        assertEquals(SIGNATURE, connectionService.calls().getLast().parameters().get(5));
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"view", "hybrid", "dynamicFull"})
+    void persistentFullOnlyRestartRevalidatesWithoutResumingChanges(final String type) throws Exception {
+        connectionService.sourceType(type);
+        initialLoad("EMBEDDED_KV", true);
+        runner.disableControllerService(service);
+        connectionService.enqueueFailure(new SQLException("Restart unavailable", "08006"));
+        runner.enableControllerService(service);
+        assertFalse(service.isHydrated());
+        assertTrue(service.storeForTest().isHydrated());
+        assertEquals(new CacheCheckpoint(FIRST_ID, SIGNATURE), service.checkpointForTest());
+        assertEquals(3L, service.size());
+        assertThrows(LookupFailureException.class, () -> lookup("ITEM_ID001"));
+        assertFalse(connectionService.calls().getLast().incremental());
+        assertNull(connectionService.calls().getLast().parameters().get(1));
+        assertEquals(SIGNATURE, connectionService.calls().getLast().parameters().get(2));
+        connectionService.enqueue(full(SECOND_ID, SIGNATURE, data("INSERT", "new", "revalidated", "NA")));
+        assertFalse(service.refresh().incremental());
+        assertTrue(service.isHydrated());
+        assertEquals(1L, service.size());
+        assertTrue(service.lookup(Map.of("ITEM_ID", "ITEM_ID001")).isEmpty());
+        assertEquals("revalidated", lookup("new").getAsString("LABEL"));
+        assertEquals(new CacheCheckpoint(SECOND_ID, SIGNATURE), service.checkpointForTest());
+        assertEquals(3, connectionService.calls().size());
+        assertTrue(connectionService.calls().stream().noneMatch(RefreshResponseConnectionService.Call::incremental));
+    }
+
+    @ParameterizedTest
+    @MethodSource("fullOnlySourcesAndBackends")
+    void incrementalProtocolRowsAreRejectedWhenMetadataForcesFull(final String mode, final String type) throws Exception {
+        connectionService.sourceType(type);
+        initialLoad(mode, true);
+        connectionService.enqueue(response(FIELDS, control(3, SECOND_ID, SIGNATURE, "INCREMENTAL", 1L), data("INSERT", "new", "uncommitted", "NA")));
+        assertThrows(TableCacheException.class, () -> service.refresh());
+        assertTrue(service.isHydrated());
+        assertEquals(3L, service.size());
+        assertEquals(new CacheCheckpoint(FIRST_ID, SIGNATURE), service.checkpointForTest());
+        assertEquals("b2b", lookup("ITEM_ID001").getAsString("LABEL"));
+        assertTrue(service.lookup(Map.of("ITEM_ID", "new")).isEmpty());
+        assertEquals(2, connectionService.calls().size(), "protocol errors must not cause a second refresh");
+        assertFalse(connectionService.calls().getLast().incremental());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"managedIceberg", "dynamicIncremental"})
+    void qualifiedIncrementalSourcesResumePersistentCheckpoints(final String type) throws Exception {
+        connectionService.sourceType(type);
+        initialLoad("EMBEDDED_KV", true);
+        runner.disableControllerService(service);
+        connectionService.enqueue(response(FIELDS, control(3, SECOND_ID, SIGNATURE, "INCREMENTAL", 1L), data("DELETE", "ITEM_ID001", "b2b", "NA")));
+        runner.enableControllerService(service);
+        assertTrue(service.isHydrated());
+        assertEquals(2L, service.size());
+        assertTrue(service.lookup(Map.of("ITEM_ID", "ITEM_ID001")).isEmpty());
+        assertEquals(new CacheCheckpoint(SECOND_ID, SIGNATURE), service.checkpointForTest());
+        assertTrue(connectionService.calls().getLast().incremental());
+        assertEquals(FIRST_ID, connectionService.calls().getLast().parameters().get(1));
+        assertEquals(SIGNATURE, connectionService.calls().getLast().parameters().get(5));
+        assertEquals(2, connectionService.connectionCount());
+        assertEquals("managedIceberg".equals(type) ? 6 : 4, connectionService.metadataCalls().size());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"missing", "ambiguous", "invalid", "temporary", "external", "externalIceberg", "dynamicIceberg", "dynamicAuto", "noRetention"})
+    void invalidPreflightGatesLookupsAndLeavesPublishedRowsUntouched(final String type) throws Exception {
+        initialLoad("HEAP", true);
+        connectionService.sourceType(type);
+        assertThrows(TableCacheException.class, () -> service.refresh());
+        assertFalse(service.isHydrated());
+        assertTrue(service.storeForTest().isHydrated());
+        assertEquals(3L, service.size());
+        assertEquals(new CacheCheckpoint(FIRST_ID, SIGNATURE), service.checkpointForTest());
+        assertEquals("b2b", service.storeForTest().get("ITEM_ID001").orElseThrow().getAsString("LABEL"));
+        assertThrows(LookupFailureException.class, () -> lookup("ITEM_ID001"));
+        assertEquals(1, connectionService.calls().size(), "invalid metadata prevents anonymous reads, including reload");
+        assertEquals(3, connectionService.connectionCount(), "source invalidation attempts exactly one reload");
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void unavailablePreflightDoesNotInvalidateOrRetryPublishedCache(final boolean showFailure) throws Exception {
+        connectionService.sourceType(showFailure ? "managedIceberg" : "standard");
+        initialLoad("HEAP", true);
+        final SQLException failure = new SQLException("Preflight unavailable", "08006");
+        if (showFailure) {
+            connectionService.capabilityFailure(failure);
+        } else {
+            connectionService.metadataFailure(failure);
+        }
+        assertThrows(TableCacheException.class, () -> service.refresh());
+        assertTrue(service.isHydrated());
+        assertEquals(new CacheCheckpoint(FIRST_ID, SIGNATURE), service.checkpointForTest());
+        assertEquals("b2b", lookup("ITEM_ID001").getAsString("LABEL"));
+        assertEquals(1, connectionService.calls().size());
+        assertEquals(2, connectionService.connectionCount());
+    }
+
+    static Stream<Arguments> changedSignatureFailures() {
+        return Stream.of("HEAP", "EMBEDDED_KV").flatMap(mode -> Stream.of(false, true).flatMap(incremental ->
+                Stream.of("dynamicIncremental", "managedIceberg").map(type -> Arguments.of(mode, incremental, type))));
+    }
+
+    @ParameterizedTest
+    @MethodSource("changedSignatureFailures")
+    void changedSignatureClosesServingGateBeforeFailedCapabilityReload(final String mode, final boolean incremental, final String type) throws Exception {
+        connectionService.sourceType(type);
+        initialLoad(mode, incremental);
+        final int metadataBefore = connectionService.metadataCalls().size();
+        connectionService.metadataRows(new Object[]{"BASE TABLE", "NO", "managedIceberg".equals(type) ? "YES" : "NO",
+                "dynamicIncremental".equals(type) ? "YES" : "NO", "NO", 1L, "replacement-source"});
+        final SQLException unavailable = new SQLException("Capability metadata unavailable", "08006");
+        connectionService.capabilityFailure(unavailable);
+        connectionService.enqueue(full(SECOND_ID, "replacement-source", data("INSERT", "new", "validated", "EU")));
+
+        final TableCacheException failure = assertThrows(TableCacheException.class, () -> service.refresh());
+        assertEquals(unavailable, failure.getCause(), "one full reload must reach and fail capability validation");
+        final List<RefreshResponseConnectionService.Call> metadata = connectionService.metadataCalls().subList(metadataBefore, connectionService.metadataCalls().size());
+        assertEquals(3, metadata.size());
+        assertTrue(metadata.get(0).sql().startsWith("SELECT TABLE_TYPE,"));
+        assertTrue(metadata.get(1).sql().startsWith("SELECT TABLE_TYPE,"), "changed signature must skip SHOW before the reload preflight");
+        assertTrue(metadata.get(2).sql().startsWith("SHOW "));
+        assertEquals(3, connectionService.connectionCount(), "only the original load, rejected preflight and one reload may connect");
+        assertEquals(1, connectionService.calls().size(), "neither rejected preflight nor failed SHOW may read rows");
+        assertEquals(1, connectionService.remainingSteps());
+        assertFalse(service.isHydrated());
+        assertTrue(service.storeForTest().isHydrated());
+        assertEquals(3L, service.size());
+        assertEquals(new CacheCheckpoint(FIRST_ID, SIGNATURE), service.checkpointForTest());
+        assertEquals("b2b", service.storeForTest().get("ITEM_ID001").orElseThrow().getAsString("LABEL"));
+        assertThrows(LookupFailureException.class, () -> lookup("ITEM_ID001"));
+
+        connectionService.capabilityFailure(null);
+        assertFalse(service.refresh().incremental(), "recovery must discard the old checkpoint");
+        assertTrue(service.isHydrated());
+        assertEquals(0, connectionService.remainingSteps());
+        assertEquals(1L, service.size());
+        assertTrue(service.lookup(Map.of("ITEM_ID", "ITEM_ID001")).isEmpty());
+        assertEquals("validated", lookup("new").getAsString("LABEL"));
+        assertEquals(new CacheCheckpoint(SECOND_ID, "replacement-source"), service.checkpointForTest());
+        assertNull(connectionService.calls().getLast().parameters().get(1));
+        assertNull(connectionService.calls().getLast().parameters().get(2));
+        assertEquals("replacement-source", connectionService.calls().getLast().parameters().get(5));
     }
 
     @Test

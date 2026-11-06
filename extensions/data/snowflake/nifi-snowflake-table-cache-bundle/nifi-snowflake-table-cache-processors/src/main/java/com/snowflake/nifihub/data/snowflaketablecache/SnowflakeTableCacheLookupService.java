@@ -74,8 +74,9 @@ public class SnowflakeTableCacheLookupService extends AbstractControllerService
 
     static final PropertyDescriptor SOURCE_TABLE = new PropertyDescriptor.Builder()
             .name("Source Table")
-            .description("Fully qualified native table to materialize, for example MY_DB.MY_SCHEMA.REFERENCE_DATA. "
-                    + "Views, temporary, external, Iceberg, dynamic and hybrid tables are not supported. "
+            .description("Fully qualified table or view to materialize, for example MY_DB.MY_SCHEMA.REFERENCE_DATA. "
+                    + "Supports standard and hybrid tables, views, native dynamic tables in FULL/INCREMENTAL mode, and Snowflake-managed Iceberg v2/v3 tables. "
+                    + "Temporary, external, externally managed Iceberg, dynamic Iceberg and materialized views are not qualified. "
                     + "Double-quote identifiers that require case preservation or contain punctuation.")
             .addValidator(StandardValidators.NON_BLANK_VALIDATOR)
             .expressionLanguageSupported(ExpressionLanguageScope.ENVIRONMENT)
@@ -112,9 +113,9 @@ public class SnowflakeTableCacheLookupService extends AbstractControllerService
 
     static final PropertyDescriptor INCREMENTAL_REFRESH = new PropertyDescriptor.Builder()
             .name("Incremental Refresh")
-            .description("Refresh by reading only what changed since the last refresh, using "
-                    + "Snowflake's CHANGES clause. Requires change tracking on the source: "
-                    + "ALTER TABLE <table> SET CHANGE_TRACKING = TRUE. Inserts, updates and deletes "
+            .description("Allow incremental reads on qualified tables using Snowflake's CHANGES clause. "
+                    + "Views, hybrid tables and FULL-refresh dynamic tables always receive full reloads, even when true. "
+                    + "False forces full reloads for every source. Incremental reads require owner-configured change tracking and retained history. Inserts, updates and deletes "
                     + "are all applied. Every node keeps its own query-ID checkpoint. If a checkpoint falls outside the table's time travel "
                     + "retention - for example after a node has been down a long time - the next "
                     + "refresh automatically falls back to a full reload.")
@@ -192,8 +193,8 @@ public class SnowflakeTableCacheLookupService extends AbstractControllerService
         try {
             // A persistent cache may resume incrementally, but is not served before source validation.
             final RefreshResult result = refresh();
-            getLogger().info("Loaded {} with {} rows in {} ms into {}",
-                    sourceTable, result.rowsUpserted(), result.durationMillis(), result.storeDescription());
+            getLogger().info("Loaded {} ({}) with {} rows in {} ms into {}",
+                    sourceTable, result.mode(), result.rowsUpserted(), result.durationMillis(), result.storeDescription());
         } catch (final TableCacheException e) {
             getLogger().error("Initial validation of {} failed; lookups will fail until a refresh succeeds{}", sourceTable,
                     intervalMillis > 0 ? "" : " (Refresh Interval is 0, so none is scheduled)", e);
@@ -352,7 +353,7 @@ public class SnowflakeTableCacheLookupService extends AbstractControllerService
         return !stopping && serving && current != null && current.isHydrated();
     }
 
-    /** Visible for testing: the source boundary the next refresh resumes from. */
+    /** Visible for testing: the refresh marker, resumable only for effective incremental sources. */
     CacheCheckpoint checkpointForTest() {
         final TableCacheStore current = store;
         return current == null ? null : current.checkpoint();

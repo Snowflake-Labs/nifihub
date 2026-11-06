@@ -15,7 +15,7 @@ package com.snowflake.nifihub.data.snowflaketablecache;
 
 import java.util.regex.Pattern;
 
-/** The source scope and exact query boundary represented by the committed cache contents. */
+/** Source scope and query marker committed with cache contents. Only incremental-enabled sources use a resumable boundary. */
 public record CacheCheckpoint(String queryId, String sourceSignature) {
 
     private static final Pattern QUERY_ID_PATTERN = Pattern.compile("[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}");

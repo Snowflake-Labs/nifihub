@@ -37,7 +37,7 @@ import java.util.Set;
 import java.util.UUID;
 import java.util.stream.Collectors;
 
-/** Reads a bounded source snapshot and its checkpoint through ordinary JDBC columns. */
+/** Reads complete source results and matched refresh metadata through ordinary JDBC columns. */
 final class AnonymousTableRefresh {
     private static final int PREFIX_COLUMNS = 6;
     private final List<String> source;
@@ -69,18 +69,21 @@ final class AnonymousTableRefresh {
     private RefreshResult execute(final DBCPService connections, final TableCacheStore store,
                                   final boolean delta, final CacheCheckpoint previous) throws SQLException {
         final long started = System.currentTimeMillis();
-        final List<String> fields = delta ? store.schema().getFieldNames() : fullProjection();
         final String prefix = "TC%s".formatted(UUID.randomUUID().toString().replace("-", "").toUpperCase(Locale.ROOT));
-        try (PendingRefresh pending = new PendingRefresh(store, delta, started)) {
+        try (PendingRefresh pending = new PendingRefresh(store, started)) {
             try (Connection connection = connections.getConnection()) {
                 if (!connection.getAutoCommit()) {
                     throw new SQLException("Cache refresh requires an auto-commit connection with no caller-owned transaction");
                 }
-                try (PreparedStatement statement = connection.prepareStatement(sql(fields, delta, prefix))) {
-                    statement.setString(1, previous == null || !delta ? null : previous.queryId());
+                final SourceMetadata metadata = SourceMetadata.read(connection, source, incrementalEnabled, previous);
+                pending.delta = delta && metadata.incremental();
+                final List<String> fields = pending.delta ? store.schema().getFieldNames() : fullProjection();
+                try (PreparedStatement statement = connection.prepareStatement(sql(fields, pending.delta, prefix, !metadata.incremental()))) {
+                    statement.setString(1, previous == null || !pending.delta ? null : previous.queryId());
                     statement.setString(2, previous == null ? null : previous.sourceSignature());
                     statement.setString(3, source.get(1));
                     statement.setString(4, source.get(2));
+                    statement.setString(5, metadata.signature());
                     try (ResultSet rows = statement.executeQuery()) {
                         pending.read(rows);
                     }
@@ -92,6 +95,10 @@ final class AnonymousTableRefresh {
     }
 
     String sql(final List<String> fields, final boolean delta, final String prefix) {
+        return sql(fields, delta, prefix, false);
+    }
+
+    String sql(final List<String> fields, final boolean delta, final String prefix, final boolean fullOnly) {
         if (!prefix.matches("[A-Za-z][A-Za-z0-9]*")) {
             throw new IllegalArgumentException("Invalid internal response prefix");
         }
@@ -102,17 +109,13 @@ final class AnonymousTableRefresh {
                 delta ? "METADATA$ACTION" : "'INSERT'::VARCHAR", SnowflakeIdentifier.quote(prefix), projection, qualified,
                 delta ? " CHANGES(INFORMATION => DEFAULT) AT(STATEMENT => ?) END(STATEMENT => ?)" : "");
         final String signatureSql = """
-                SELECT COUNT(*), MAX(IFF(TABLE_TYPE = 'BASE TABLE' AND IS_TEMPORARY = 'NO'
-                    AND IS_ICEBERG = 'NO' AND IS_DYNAMIC = 'NO' AND IS_HYBRID = 'NO'
-                    AND CREATED IS NOT NULL AND LAST_DDL IS NOT NULL%s,
-                    SHA2(TO_JSON(ARRAY_CONSTRUCT(
-                    CURRENT_ACCOUNT(), CURRENT_USER(), CURRENT_ROLE(),
-                    TO_CHAR(CONVERT_TIMEZONE('UTC', CREATED), 'YYYY-MM-DD HH24:MI:SS.FF9'),
-                    TO_CHAR(CONVERT_TIMEZONE('UTC', LAST_DDL), 'YYYY-MM-DD HH24:MI:SS.FF9'), RETENTION_TIME)), 256), NULL))
+                SELECT COUNT(*), MAX(IFF(TABLE_TYPE IN ('BASE TABLE', 'VIEW') AND IS_TEMPORARY = 'NO'
+                    AND CREATED IS NOT NULL AND LAST_DDL IS NOT NULL,
+                    %s, NULL))
                 INTO :source_count, :signature_value
                 FROM %s.TABLES
                 WHERE TABLE_SCHEMA = :source_schema AND TABLE_NAME = :source_name;
-                """.formatted(incrementalEnabled ? " AND RETENTION_TIME >= 1" : "", informationSchema);
+                """.formatted(SourceMetadata.SIGNATURE, informationSchema);
         // The prefix is chosen per request and checked against actual source columns before reading.
         // Payload aliases therefore cannot be confused with control columns after RESULT_SCAN.
         final String responseSql = """
@@ -123,6 +126,17 @@ final class AnonymousTableRefresh {
                 SELECT 'DATA', NULL::VARCHAR, NULL::VARCHAR, NULL::VARCHAR, NULL::NUMBER, d.*
                 FROM TABLE(RESULT_SCAN(?)) d
                 """.formatted(prefix, prefix, prefix, prefix, prefix);
+        // A full-only source needs no resumable offset. Return one query directly: hybrid query
+        // results are not always available to RESULT_SCAN. The marker is diagnostic, not a snapshot ID.
+        final String fullOnlySql = """
+                SELECT IFF(seed.marker IS NULL, 'DATA', 'CONTROL') AS %sK,
+                       IFF(seed.marker IS NULL, NULL, ?::VARCHAR) AS %sQ,
+                       IFF(seed.marker IS NULL, NULL, ?::VARCHAR) AS %sS,
+                       IFF(seed.marker IS NULL, NULL, 'FULL'::VARCHAR) AS %sM,
+                       IFF(seed.marker IS NULL, NULL, COUNT(d.%s) OVER ()) AS %sN,
+                       d.*
+                FROM (%s) d FULL OUTER JOIN (SELECT 1 AS marker) seed ON FALSE
+                """.formatted(prefix, prefix, prefix, prefix, SnowflakeIdentifier.quote(prefix), prefix, dataSql);
         final String body = """
                 DECLARE
                     signature_value VARCHAR;
@@ -135,6 +149,7 @@ final class AnonymousTableRefresh {
                     mode VARCHAR DEFAULT '%s';
                     data_sql VARCHAR DEFAULT %s;
                     response_sql VARCHAR DEFAULT %s;
+                    full_only_sql VARCHAR DEFAULT %s;
                     data_rows RESULTSET;
                     response_rows RESULTSET;
                     source_changed EXCEPTION (-20001, 'TABLE_CACHE_SOURCE_CHANGED');
@@ -149,6 +164,9 @@ final class AnonymousTableRefresh {
                         RAISE invalid_source;
                     END IF;
                     signature_before := signature_value;
+                    IF (expected_signature <> signature_before) THEN
+                        RAISE source_changed;
+                    END IF;
                     IF (previous_signature IS NOT NULL AND previous_signature <> signature_before) THEN
                         RAISE source_changed;
                     END IF;
@@ -158,7 +176,11 @@ final class AnonymousTableRefresh {
                     IF (collision_count <> 0) THEN
                         RAISE invalid_source;
                     END IF;
-                    IF (previous_id IS NULL) THEN
+                    IF (%s) THEN
+                        SELECT CURRENT_TIMESTAMP() INTO :marker_time;
+                        boundary_id := SQLID;
+                        response_rows := (EXECUTE IMMEDIATE :full_only_sql USING (boundary_id, signature_value));
+                    ELSEIF (previous_id IS NULL) THEN
                         data_rows := (EXECUTE IMMEDIATE :data_sql);
                         data_id := SQLID;
                         boundary_id := data_id;
@@ -172,24 +194,26 @@ final class AnonymousTableRefresh {
                     IF (source_count <> 1 OR signature_value IS NULL OR signature_value <> signature_before) THEN
                         RAISE source_changed;
                     END IF;
-                    response_rows := (EXECUTE IMMEDIATE :response_sql
-                        USING (boundary_id, signature_value, mode, data_id, data_id, data_id));
+                    IF (NOT %s) THEN
+                        response_rows := (EXECUTE IMMEDIATE :response_sql
+                            USING (boundary_id, signature_value, mode, data_id, data_id, data_id));
+                    END IF;
                     RETURN TABLE(response_rows);
                 END;
-                """.formatted(delta ? "INCREMENTAL" : "FULL", literal(dataSql), literal(responseSql), signatureSql,
-                informationSchema, prefix, prefix, prefix, prefix, prefix, prefix, signatureSql);
+                """.formatted(delta ? "INCREMENTAL" : "FULL", literal(dataSql), literal(responseSql), literal(fullOnlySql), signatureSql,
+                informationSchema, prefix, prefix, prefix, prefix, prefix, prefix, fullOnly ? "TRUE" : "FALSE", signatureSql, fullOnly ? "TRUE" : "FALSE");
         // Quote the body too: a valid source identifier can itself contain the dollar delimiter.
         return """
                 WITH refresh_cache AS PROCEDURE (
-                    previous_id VARCHAR, previous_signature VARCHAR, source_schema VARCHAR, source_name VARCHAR)
+                    previous_id VARCHAR, previous_signature VARCHAR, source_schema VARCHAR, source_name VARCHAR, expected_signature VARCHAR)
                 RETURNS TABLE() LANGUAGE SQL AS %s
-                CALL refresh_cache(?, ?, ?, ?)
+                CALL refresh_cache(?, ?, ?, ?, ?)
                 """.formatted(literal(body));
     }
 
     private final class PendingRefresh implements AutoCloseable {
         private final TableCacheStore store;
-        private final boolean delta;
+        private boolean delta;
         private final long started;
         private final Map<String, Record> upserts = new HashMap<>();
         private final Set<String> deletes = new LinkedHashSet<>();
@@ -198,9 +222,8 @@ final class AnonymousTableRefresh {
         private CacheCheckpoint checkpoint;
         private long received;
 
-        private PendingRefresh(final TableCacheStore store, final boolean delta, final long started) {
+        private PendingRefresh(final TableCacheStore store, final long started) {
             this.store = store;
-            this.delta = delta;
             this.started = started;
         }
 

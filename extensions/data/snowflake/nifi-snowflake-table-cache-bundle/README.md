@@ -12,19 +12,52 @@ service. See the repository's support disclaimer and Apache 2.0 license.
 | Property | Meaning |
 |---|---|
 | Snowflake Connection Service | Existing `DBCPService` with access to the reference table |
-| Source Table | Fully qualified native table; views, temporary, external, Iceberg, dynamic and hybrid tables are not supported |
+| Source Table | Fully qualified table or view; see the source modes below |
 | Key Columns | Comma-separated lookup columns; supply each as a LookupRecord coordinate |
 | Value Columns | Columns to return, or `*`; all returned values are strings |
 | Storage Mode | Heap (default) or Embedded (RocksDB) |
 | Storage Directory | Dedicated writable directory per Embedded service and node |
 | Refresh Interval | Delay after each refresh completes; default one hour; zero disables scheduled refresh |
-| Incremental Refresh | Opt-in Snowflake `CHANGES` reads; requires change tracking and suitable retention |
+| Incremental Refresh | Allow `CHANGES` on eligible tables; false forces full reloads; full-only sources always reload |
+
+### Source modes
+
+| Source | When Incremental Refresh is true |
+|---|---|
+| Standard permanent or transient table | Initial full load, then bounded changes |
+| Native dynamic table with resolved INCREMENTAL mode | Initial full load, then bounded changes to its materialized output |
+| Snowflake-managed Iceberg v2/v3 table | Initial full load, then bounded changes |
+| View | Full reload every time; no change tracking required |
+| Hybrid table | Full reload every time |
+| Native dynamic table with resolved FULL mode | Full reload every time |
+
+Incremental Refresh=false forces full reloads for all supported sources. Each
+refresh checks source metadata and reports the actual FULL/INCREMENTAL mode in
+the refresh log. Missing change tracking, privileges or history are not evidence
+that an otherwise incremental table is a full-only source.
+
+Temporary tables, external tables, materialized views, dynamic Iceberg tables,
+externally managed Iceberg tables and other dynamic-table refresh modes are not
+qualified by this bundle. Do not infer support solely from a change-tracking flag.
+Managed Iceberg qualification covers Snowflake writes, not external writers.
+
+View queries may include joins and aggregates, provided their result has unique,
+non-null lookup keys. The service re-evaluates the entire view on every refresh;
+unchanged DDL never skips a query. View dependency changes are reflected in the
+next successful full result, without reconstructing a delta. Views over external
+systems remain subject to their source's consistency and availability semantics.
+For dynamic tables the cache reads the latest published output; it neither
+triggers a DT refresh nor removes the DT's own freshness lag.
 
 Use an existing connection service whose runtime identity has only the required
-database/schema usage, reference-table SELECT, and warehouse access. Change
+database/schema usage, source SELECT, warehouse access and source metadata visibility.
+DT capability inspection requires a visible `refresh_mode` in SHOW DYNAMIC TABLES;
+additional MONITOR privileges may be needed for that metadata. Least-privilege
+runtime qualification is still required; the live source tests use a lab role. Change
 tracking must be configured by an authorized table owner. The cache does not
 create streams, tasks, source tables, stored procedures or grants. Each refresh
-submits an anonymous SQL procedure through the existing JDBC connection. That
+reads source metadata (including SHOW for DT/Iceberg capabilities) and submits
+an anonymous SQL procedure through the same JDBC connection. That
 call performs multiple child queries; it is not one transaction or one snapshot.
 Borrowed connections must use auto-commit and have no caller-owned transaction;
 the service rejects auto-commit-disabled connections rather than committing or
@@ -59,9 +92,14 @@ against an unchanged source row. Composite keys use length-prefixed encoding.
   **without an age limit**. Detected source discontinuity blocks lookups until a
   full reload succeeds. This is not guaranteed real-time revocation: source checks
   are optimistic and do not lock DDL or detect every policy/session change.
-- Full reloads replace the cache. Each node stores the full SELECT's exact child
-  query ID, or the explicit endpoint of an incremental read, with its rows,
-  schema and source signature. The outer anonymous CALL ID is not the checkpoint.
+- Full reloads replace the cache. For incremental-capable sources with incremental
+  mode enabled, each node stores the full SELECT's exact child query ID, or the
+  explicit endpoint of an incremental read, with its rows, schema and source
+  signature. The outer anonymous CALL ID is not the checkpoint.
+  Full-only reads return one query directly without RESULT_SCAN; their stored
+  marker ID is diagnostic only, not a resumable snapshot boundary. This avoids
+  dependence on persisted hybrid-table query results. The complete response still
+  includes a control row for an empty source and a checked data-row count.
   Missing historical statements/time travel and source-signature changes attempt
   an aligned full reload. Other SQL/protocol failures surface without silently
   treating a failed incremental refresh as a successful full load.
@@ -82,6 +120,9 @@ Heap needs room for both the old and new maps during refresh. RocksDB uses disk,
 native memory and the operating-system page cache. Incremental changes are first
 collected in JVM heap; Embedded is not a bounded-memory guarantee for large deltas.
 Full reloads temporarily keep old and new on-disk generations.
+Full-only responses use a window count, which can require warehouse buffering;
+full-scan cost grows with source size. This path has correctness tests, not a
+large-table performance qualification.
 
 Use a dedicated persistent directory, never a directory belonging to NiFi state,
 another service, or a different reference source. Do not assume a writable path
@@ -94,9 +135,11 @@ Mismatches fail enablement; existing generations are not deleted on open errors.
 The query-ID checkpoint format is `table-cache-v2`; use a fresh directory for
 older caches. No migration or timestamp-checkpoint compatibility is provided.
 
-The source signature checks table creation/DDL metadata, retention, account,
-user and primary role before and after the data query. Incremental mode requires
-at least one day of retention. The guard does not cover every masking/row-access
+The source signature checks object type, creation/DDL metadata, retention, account,
+user and primary role before and after the data query. The anonymous procedure
+also verifies the signature observed during capability selection. Only effective
+incremental mode requires at least one day of retention. Full-only sources need
+no Time Travel or change tracking. The guard does not cover every masking/row-access
 policy, secondary-role or session-setting change. Keep the connection evaluation
 context stable. A signature is not an authorization guarantee, and historical
 query IDs remain subject to Snowflake's statement lookup and data-retention limits.
@@ -133,6 +176,13 @@ The test helper reads the named `~/.snowflake/config.toml` connection with a TOM
 parser; `SNOWFLAKE_IT_*` settings can override it using an approved secret provider.
 It never needs credentials committed in this repository. JDBC is test-only;
 the deployed service obtains connections from the supplied DBCP service.
+
+`SourceTypesProtocolIT` additionally requires `SNOWFLAKE_TYPES_IT=true` and a
+dedicated permanent database/schema (hybrid tables cannot live in a transient
+database). It creates unique view, hybrid, DT and managed Iceberg fixtures, uses
+the configured warehouse for controlled DT refreshes, and drops its fixtures.
+It does not create external volumes or catalog integrations. An explicitly
+selected capability that is unavailable fails the test rather than being skipped.
 
 ## Install and release boundary
 

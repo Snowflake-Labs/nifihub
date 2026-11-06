@@ -23,6 +23,7 @@ import org.junit.jupiter.params.provider.ValueSource;
 
 import java.math.BigDecimal;
 import java.nio.file.Path;
+import java.sql.Connection;
 import java.sql.SQLException;
 import java.util.List;
 import java.util.Map;
@@ -69,6 +70,19 @@ class TestAnonymousTableRefresh {
         assertFalse(sql.contains("CURRENT_STATEMENT()"));
         assertFalse(sql.contains("LAST_QUERY_ID()"));
         assertFalse(sql.contains("CHANGES(INFORMATION"));
+        assertTrue(sql.contains("mode VARCHAR DEFAULT 'FULL'"));
+    }
+
+    @Test
+    void fullOnlySqlReturnsTheSourceDirectlyWithoutExecutingResultScanBranch() {
+        final String sql = procedureBody(reader().sql(FIELDS, false, "TCFIXTURE", true));
+        assertTrue(sql.contains("mode VARCHAR DEFAULT 'FULL'"));
+        assertTrue(sql.contains("IF (TRUE) THEN"));
+        assertTrue(sql.contains("IF (NOT TRUE) THEN"));
+        assertTrue(sql.contains("EXECUTE IMMEDIATE :full_only_sql USING (boundary_id, signature_value)"));
+        assertTrue(sql.contains("FULL OUTER JOIN (SELECT 1 AS marker) seed ON FALSE"));
+        assertTrue(sql.contains("COUNT(d.\"TCFIXTURE\") OVER ()"));
+        assertFalse(sql.contains("CHANGES(INFORMATION"));
     }
 
     @Test
@@ -78,6 +92,7 @@ class TestAnonymousTableRefresh {
         try (TableCacheStore store = new HeapTableCacheStore()) {
             assertThrows(SQLException.class, () -> reader().refresh(connection, store, false));
             assertTrue(connection.calls().isEmpty());
+            assertTrue(connection.metadataCalls().isEmpty());
             assertTrue(connection.resourcesClosed());
             assertFalse(store.isHydrated());
         }
@@ -102,9 +117,11 @@ class TestAnonymousTableRefresh {
         assertEquals(2, sql.split(Pattern.quote("FROM \"DB\".INFORMATION_SCHEMA.TABLES"), -1).length - 1);
         assertTrue(sql.contains("CURRENT_ACCOUNT(), CURRENT_USER(), CURRENT_ROLE()"));
         assertTrue(sql.contains("CREATED IS NOT NULL AND LAST_DDL IS NOT NULL"));
-        assertTrue(sql.contains("TABLE_TYPE = 'BASE TABLE' AND IS_TEMPORARY = 'NO'"));
-        assertTrue(sql.contains("IS_ICEBERG = 'NO' AND IS_DYNAMIC = 'NO' AND IS_HYBRID = 'NO'"));
-        assertTrue(sql.contains("RETENTION_TIME >= 1"));
+        assertTrue(sql.contains("TABLE_TYPE IN ('BASE TABLE', 'VIEW') AND IS_TEMPORARY = 'NO'"));
+        assertTrue(sql.contains(SourceMetadata.SIGNATURE));
+        assertTrue(sql.contains("CURRENT_ACCOUNT(), CURRENT_USER(), CURRENT_ROLE(), TABLE_TYPE, IS_ICEBERG, IS_DYNAMIC, IS_HYBRID"));
+        assertFalse(sql.contains("RETENTION_TIME >= 1"), "capability and retention qualification belong to preflight");
+        assertTrue(sql.contains("IF (expected_signature <> signature_before) THEN"));
         assertTrue(sql.contains("IF (previous_signature IS NOT NULL AND previous_signature <> signature_before) THEN"));
         assertFalse(sql.contains("previous_id IS NOT NULL"), "full loads must check the saved signature without a query boundary");
         assertTrue(sql.contains("signature_value <> signature_before"));
@@ -114,7 +131,7 @@ class TestAnonymousTableRefresh {
         while (sourceQueries.find()) {
             assertEquals("TABLE_SCHEMA = :source_schema AND TABLE_NAME = :source_name", sourceQueries.group(1).trim(),
                     "object count must include unsupported same-name objects, including temporary shadows");
-            assertTrue(sourceQueries.group().contains("IFF(TABLE_TYPE = 'BASE TABLE' AND IS_TEMPORARY = 'NO'"));
+            assertTrue(sourceQueries.group().contains("IFF(TABLE_TYPE IN ('BASE TABLE', 'VIEW') AND IS_TEMPORARY = 'NO'"));
             assertTrue(sourceQueries.group().contains("RETENTION_TIME)), 256), NULL))"));
             sourceQueryCount++;
         }
@@ -155,10 +172,19 @@ class TestAnonymousTableRefresh {
         final RefreshResponseConnectionService.Call delta = jdbc.calls().getLast();
         assertNull(full.parameters().get(1));
         assertNull(full.parameters().get(2));
-        assertEquals(Map.of(1, FIRST_ID, 2, signature, 3, schemaName, 4, tableName), delta.parameters());
+        assertEquals(Map.of(1, FIRST_ID, 2, signature, 3, schemaName, 4, tableName, 5, signature), delta.parameters());
         assertFalse(delta.sql().contains(FIRST_ID));
         assertFalse(delta.sql().contains(signature));
-        assertTrue(delta.sql().contains("CALL refresh_cache(?, ?, ?, ?)"));
+        assertEquals(signature, full.parameters().get(5));
+        assertEquals(2, jdbc.connectionCount(), "metadata and refresh must reuse one connection per refresh");
+        assertEquals(2, jdbc.metadataCalls().size());
+        for (final RefreshResponseConnectionService.Call metadata : jdbc.metadataCalls()) {
+            assertEquals(Map.of(1, schemaName, 2, tableName), metadata.parameters());
+            assertFalse(metadata.sql().contains(schemaName));
+            assertFalse(metadata.sql().contains(tableName));
+            assertTrue(metadata.sql().contains("WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?"));
+        }
+        assertTrue(delta.sql().contains("CALL refresh_cache(?, ?, ?, ?, ?)"));
         assertTrue(procedureBody(delta.sql()).contains("\"s''); SELECT ''injected\".\"t\"\"; DROP TABLE victim; --\""));
         assertTrue(jdbc.resourcesClosed());
     }
@@ -342,7 +368,7 @@ class TestAnonymousTableRefresh {
 
     static Stream<Arguments> closeFailures() {
         return Stream.of("HEAP", "EMBEDDED_KV").flatMap(mode -> Stream.of(false, true).flatMap(delta ->
-                Stream.of("resultSet", "statement", "connection").map(resource -> Arguments.of(mode, delta, resource))));
+                Stream.of("resultSet", "statement", "connection", "metadataResultSet", "metadataStatement").map(resource -> Arguments.of(mode, delta, resource))));
     }
 
     @ParameterizedTest
@@ -358,6 +384,300 @@ class TestAnonymousTableRefresh {
             assertEquals("original", store.get("a").orElseThrow().getAsString("V"));
             assertEquals(new CacheCheckpoint(FIRST_ID, SIGNATURE), store.checkpoint());
             assertEquals(1L, store.size());
+        }
+        assertTrue(jdbc.resourcesClosed());
+    }
+
+    static Stream<Arguments> sourceCapabilities() {
+        return Stream.of(false, true).flatMap(requested -> Stream.of("standard", "transient", "managedIceberg", "dynamicIncremental", "view", "hybrid", "dynamicFull")
+                .map(type -> Arguments.of(type, requested)));
+    }
+
+    @ParameterizedTest
+    @MethodSource("sourceCapabilities")
+    void metadataSelectsOnlyQualifiedRequestedIncrementalSources(final String type, final boolean requested) throws Exception {
+        final RefreshResponseConnectionService jdbc = new RefreshResponseConnectionService();
+        jdbc.sourceType(type);
+        final boolean incremental = requested && Set.of("standard", "transient", "managedIceberg", "dynamicIncremental").contains(type);
+        jdbc.enqueue(response(FIELDS, control(2, FIRST_ID, SIGNATURE, "FULL", 1L), data("INSERT", "a", "old")));
+        jdbc.enqueue(response(FIELDS, control(2, SECOND_ID, SIGNATURE, incremental ? "INCREMENTAL" : "FULL", 1L), data("INSERT", "b", "new")));
+        final AnonymousTableRefresh refresh = new AnonymousTableRefresh("DB.PUBLIC.REF", List.of("K"), List.of("V"), false, requested);
+        try (final TableCacheStore store = new HeapTableCacheStore()) {
+            refresh.refresh(jdbc, store, false);
+            assertEquals(incremental, refresh.refresh(jdbc, store, true).incremental());
+            assertEquals(incremental ? 2L : 1L, store.size());
+            assertEquals(new CacheCheckpoint(SECOND_ID, SIGNATURE), store.checkpoint());
+        }
+        assertEquals(2, jdbc.calls().size(), "metadata calls must not consume anonymous refresh steps");
+        assertEquals(0, jdbc.remainingSteps());
+        assertEquals(2, jdbc.connectionCount(), "preflight, optional SHOW and refresh share one connection");
+        final boolean needsShow = Set.of("managedIceberg", "dynamicIncremental", "dynamicFull").contains(type);
+        assertEquals("managedIceberg".equals(type) ? 6 : needsShow ? 4 : 2, jdbc.metadataCalls().size());
+        final RefreshResponseConnectionService.Call call = jdbc.calls().getLast();
+        assertEquals(incremental, call.incremental());
+        assertEquals(incremental ? FIRST_ID : null, call.parameters().get(1));
+        assertEquals(SIGNATURE, call.parameters().get(2));
+        assertEquals(SIGNATURE, call.parameters().get(5));
+        final String body = procedureBody(call.sql());
+        assertTrue(body.contains("mode VARCHAR DEFAULT '%s'".formatted(incremental ? "INCREMENTAL" : "FULL")));
+        assertTrue(body.contains("IF (%s) THEN".formatted(incremental ? "FALSE" : "TRUE")));
+        assertTrue(jdbc.resourcesClosed());
+    }
+
+    static Stream<Arguments> rejectedSources() {
+        return Stream.of(false, true).flatMap(requested -> Stream.of("temporary", "invalid", "external", "missing", "ambiguous",
+                "dynamicIceberg", "externalIceberg", "dynamicAuto").map(type -> Arguments.of(type, requested)));
+    }
+
+    @ParameterizedTest
+    @MethodSource("rejectedSources")
+    void rejectsUnqualifiedMetadataWithoutReadingOrPublishing(final String type, final boolean requested) throws Exception {
+        final RefreshResponseConnectionService jdbc = new RefreshResponseConnectionService();
+        jdbc.enqueue(response(FIELDS, control(2, FIRST_ID, SIGNATURE, "FULL", 1L), data("INSERT", "a", "original")));
+        jdbc.enqueue(response(FIELDS, control(2, SECOND_ID, SIGNATURE, "FULL", 1L), data("INSERT", "b", "uncommitted")));
+        final AnonymousTableRefresh refresh = new AnonymousTableRefresh("DB.PUBLIC.REF", List.of("K"), List.of("V"), false, requested);
+        try (final TableCacheStore store = new HeapTableCacheStore()) {
+            refresh.refresh(jdbc, store, false);
+            jdbc.sourceType(type);
+            final SQLException error = assertThrows(SQLException.class, () -> refresh.refresh(jdbc, store, true));
+            assertEquals(-20002, error.getErrorCode());
+            assertTrue(error.getMessage().contains("TABLE_CACHE_INVALID_SOURCE"));
+            assertEquals(new CacheCheckpoint(FIRST_ID, SIGNATURE), store.checkpoint());
+            assertEquals(1L, store.size());
+            assertEquals("original", store.get("a").orElseThrow().getAsString("V"));
+            assertTrue(store.get("b").isEmpty());
+            assertEquals(1, jdbc.calls().size());
+            assertEquals(1, jdbc.remainingSteps());
+        }
+        assertTrue(jdbc.resourcesClosed());
+    }
+
+    @ParameterizedTest
+    @MethodSource("sourceCapabilities")
+    void retainedHistoryIsRequiredOnlyForRequestedIncrementalCapability(final String type, final boolean requested) throws Exception {
+        final RefreshResponseConnectionService jdbc = new RefreshResponseConnectionService();
+        jdbc.sourceType(type);
+        jdbc.metadataRows(new Object[]{"view".equals(type) ? "VIEW" : "BASE TABLE", "NO", "managedIceberg".equals(type) ? "YES" : "NO",
+                type.startsWith("dynamic") ? "YES" : "NO", "hybrid".equals(type) ? "YES" : "NO", 0L, SIGNATURE});
+        try (final Connection connection = jdbc.getConnection()) {
+            if (requested && Set.of("standard", "transient", "managedIceberg", "dynamicIncremental").contains(type)) {
+                final SQLException error = assertThrows(SQLException.class, () -> SourceMetadata.read(connection, List.of("DB", "PUBLIC", "REF"), true));
+                assertEquals(-20002, error.getErrorCode());
+                assertTrue(error.getMessage().contains("retained history"));
+            } else {
+                assertEquals(new SourceMetadata(SIGNATURE, false), SourceMetadata.read(connection, List.of("DB", "PUBLIC", "REF"), requested));
+            }
+        }
+        assertTrue(jdbc.calls().isEmpty());
+        assertTrue(jdbc.resourcesClosed());
+    }
+
+    static Stream<Arguments> incompleteMetadata() {
+        return Stream.concat(Stream.of(0, 1, 2, 3, 4).flatMap(column -> Stream.of(Arguments.of(column, null), Arguments.of(column, "invalid"))),
+                Stream.of(Arguments.of(6, null)));
+    }
+
+    @ParameterizedTest
+    @MethodSource("incompleteMetadata")
+    void rejectsMissingOrInvalidSourceTypeFields(final int column, final String value) throws Exception {
+        final RefreshResponseConnectionService jdbc = new RefreshResponseConnectionService();
+        final Object[] row = {"BASE TABLE", "NO", "NO", "NO", "NO", 1L, SIGNATURE};
+        row[column] = value;
+        jdbc.metadataRows(row);
+        try (final Connection connection = jdbc.getConnection()) {
+            final SQLException error = assertThrows(SQLException.class, () -> SourceMetadata.read(connection, List.of("DB", "PUBLIC", "REF"), false));
+            assertEquals(-20002, error.getErrorCode());
+        }
+        assertTrue(jdbc.calls().isEmpty());
+        assertTrue(jdbc.resourcesClosed());
+    }
+
+    static Stream<Arguments> invalidCapabilityRows() {
+        return Stream.of("dynamicIncremental", "managedIceberg").flatMap(type -> Stream.of("missing", "ambiguous", "nullProperty", "wrongDatabase", "wrongSchema", "wrongName")
+                .map(fault -> Arguments.of(type, fault)));
+    }
+
+    @ParameterizedTest
+    @MethodSource("invalidCapabilityRows")
+    void rejectsMissingOrAmbiguousShowMetadata(final String type, final String fault) throws Exception {
+        final RefreshResponseConnectionService jdbc = new RefreshResponseConnectionService();
+        jdbc.sourceType(type);
+        final Object[] row = {"DB", "PUBLIC", "REF", "INCREMENTAL", "SNOWFLAKE", "2"};
+        switch (fault) {
+            case "missing" -> jdbc.capabilityRows();
+            case "ambiguous" -> jdbc.capabilityRows(row, row);
+            case "nullProperty" -> {
+                row["managedIceberg".equals(type) ? 4 : 3] = null;
+                jdbc.capabilityRows(row);
+            }
+            default -> {
+                final int column = switch (fault) {
+                    case "wrongDatabase" -> 0;
+                    case "wrongSchema" -> 1;
+                    case "wrongName" -> 2;
+                    default -> throw new IllegalArgumentException(fault);
+                };
+                row[column] = "OTHER";
+                jdbc.capabilityRows(row);
+            }
+        }
+        try (final Connection connection = jdbc.getConnection()) {
+            final SQLException error = assertThrows(SQLException.class, () -> SourceMetadata.read(connection, List.of("DB", "PUBLIC", "REF"), true));
+            assertEquals(-20002, error.getErrorCode());
+        }
+        assertEquals(2, jdbc.metadataCalls().size());
+        assertTrue(jdbc.calls().isEmpty());
+        assertTrue(jdbc.resourcesClosed());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"dynamicIncremental", "managedIceberg"})
+    void showUsesLiteralPrefixAndExactCaseSensitiveObjectMatch(final String type) throws Exception {
+        final RefreshResponseConnectionService jdbc = new RefreshResponseConnectionService();
+        jdbc.sourceType(type);
+        final String name = "t_%'\\suffix";
+        jdbc.capabilityRows(new Object[]{"Db", "s\"chema", name, "INCREMENTAL", "SNOWFLAKE", "3"});
+        try (final Connection connection = jdbc.getConnection()) {
+            assertTrue(SourceMetadata.read(connection, List.of("Db", "s\"chema", name), true).incremental());
+        }
+        final String show = jdbc.metadataCalls().getLast().sql();
+        assertEquals("SHOW %s TABLES IN SCHEMA \"Db\".\"s\"\"chema\" STARTS WITH 't_%%''\\\\suffix' LIMIT 1"
+                .formatted("managedIceberg".equals(type) ? "ICEBERG" : "DYNAMIC"), show);
+        assertFalse(show.contains(" LIKE "));
+        assertEquals(Map.of(1, "s\"chema", 2, name), jdbc.metadataCalls().getFirst().parameters());
+        assertTrue(jdbc.resourcesClosed());
+    }
+
+    static Stream<Arguments> nonMatchingPrefixes() {
+        return Stream.of("dynamicIncremental", "managedIceberg").flatMap(type -> Stream.of("t_%'\\suffix-longer", "T_%'\\suffix", "txx'\\suffix")
+                .map(name -> Arguments.of(type, name)));
+    }
+
+    @ParameterizedTest
+    @MethodSource("nonMatchingPrefixes")
+    void showPrefixCandidateMustMatchTheWholeLiteralName(final String type, final String candidate) throws Exception {
+        final RefreshResponseConnectionService jdbc = new RefreshResponseConnectionService();
+        jdbc.sourceType(type);
+        jdbc.capabilityRows(new Object[]{"DB", "PUBLIC", candidate, "INCREMENTAL", "SNOWFLAKE", "3"});
+        try (final Connection connection = jdbc.getConnection()) {
+            final SQLException error = assertThrows(SQLException.class,
+                    () -> SourceMetadata.read(connection, List.of("DB", "PUBLIC", "t_%'\\suffix"), true));
+            assertEquals(-20002, error.getErrorCode());
+        }
+        assertEquals(2, jdbc.metadataCalls().size());
+        assertTrue(jdbc.calls().isEmpty());
+        assertTrue(jdbc.resourcesClosed());
+    }
+
+    static Stream<Arguments> icebergVersions() {
+        return Stream.of(false, true).flatMap(requested -> Stream.of("1", "2", "3", "4", "", null).map(version -> Arguments.of(version, requested)));
+    }
+
+    @ParameterizedTest
+    @MethodSource("icebergVersions")
+    void onlyQualifiedManagedIcebergVersionsPassPreflight(final String version, final boolean requested) throws Exception {
+        final RefreshResponseConnectionService jdbc = new RefreshResponseConnectionService();
+        jdbc.sourceType("managedIceberg");
+        jdbc.capabilityRows(new Object[]{"DB", "PUBLIC", "REF", null, "SNOWFLAKE", version});
+        try (final Connection connection = jdbc.getConnection()) {
+            if ("2".equals(version) || "3".equals(version)) {
+                assertEquals(requested, SourceMetadata.read(connection, List.of("DB", "PUBLIC", "REF"), requested).incremental());
+            } else {
+                assertEquals(-20002, assertThrows(SQLException.class,
+                        () -> SourceMetadata.read(connection, List.of("DB", "PUBLIC", "REF"), requested)).getErrorCode());
+            }
+        }
+        assertEquals(3, jdbc.metadataCalls().size());
+        assertTrue(jdbc.calls().isEmpty());
+        assertTrue(jdbc.resourcesClosed());
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void metadataSqlFailuresPropagateWithoutCapabilityFallback(final boolean showFailure) throws Exception {
+        final RefreshResponseConnectionService jdbc = new RefreshResponseConnectionService();
+        final SQLException failure = new SQLException("metadata unavailable", "08006");
+        if (showFailure) {
+            jdbc.sourceType("managedIceberg");
+            jdbc.capabilityFailure(failure);
+        } else {
+            jdbc.metadataFailure(failure);
+        }
+        try (final TableCacheStore store = new HeapTableCacheStore()) {
+            assertEquals(failure, assertThrows(SQLException.class, () -> reader().refresh(jdbc, store, false)));
+            assertFalse(store.isHydrated());
+        }
+        assertTrue(jdbc.calls().isEmpty());
+        assertTrue(jdbc.resourcesClosed());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"HEAP", "EMBEDDED_KV"})
+    void preflightSignatureIsBoundAndServerMismatchLeavesPublicationIntact(final String mode) throws Exception {
+        final RefreshResponseConnectionService jdbc = new RefreshResponseConnectionService();
+        jdbc.enqueue(response(FIELDS, control(2, FIRST_ID, SIGNATURE, "FULL", 1L), data("INSERT", "a", "original")));
+        // The fixture scripts the server guard error; generated SQL assertions separately check the guard.
+        jdbc.enqueueFailure(new SQLException("TABLE_CACHE_SOURCE_CHANGED", "P0001", -20001));
+        try (final TableCacheStore store = store(mode)) {
+            reader().refresh(jdbc, store, false);
+            jdbc.metadataRows(new Object[]{"BASE TABLE", "NO", "NO", "NO", "NO", 1L, SIGNATURE});
+            assertEquals(-20001, assertThrows(SQLException.class, () -> reader().refresh(jdbc, store, true)).getErrorCode());
+            assertEquals(2, jdbc.calls().size(), "matching preflight must allow the scripted server guard to run");
+            assertEquals(0, jdbc.remainingSteps());
+            assertEquals(SIGNATURE, jdbc.calls().getLast().parameters().get(2));
+            assertEquals(SIGNATURE, jdbc.calls().getLast().parameters().get(5));
+            assertEquals(new CacheCheckpoint(FIRST_ID, SIGNATURE), store.checkpoint());
+            assertEquals("original", store.get("a").orElseThrow().getAsString("V"));
+            assertEquals(1L, store.size());
+        }
+        assertTrue(jdbc.resourcesClosed());
+    }
+
+    static Stream<Arguments> changedSignatureCapabilities() {
+        return Stream.of(false, true).flatMap(requested -> Stream.of("dynamicIncremental", "managedIceberg").map(type -> Arguments.of(type, requested)));
+    }
+
+    @ParameterizedTest
+    @MethodSource("changedSignatureCapabilities")
+    void changedPreflightSignatureIsRejectedBeforeAnyCapabilityQuery(final String type, final boolean requested) throws Exception {
+        final RefreshResponseConnectionService jdbc = new RefreshResponseConnectionService();
+        jdbc.sourceType(type);
+        jdbc.metadataRows(new Object[]{"BASE TABLE", "NO", "managedIceberg".equals(type) ? "YES" : "NO",
+                "dynamicIncremental".equals(type) ? "YES" : "NO", "NO", 1L, "changed-signature"});
+        jdbc.capabilityFailure(new SQLException("Capability metadata unavailable", "08006"));
+        try (final Connection connection = jdbc.getConnection()) {
+            final SQLException error = assertThrows(SQLException.class,
+                    () -> SourceMetadata.read(connection, List.of("DB", "PUBLIC", "REF"), requested, new CacheCheckpoint(FIRST_ID, SIGNATURE)));
+            assertEquals(-20001, error.getErrorCode());
+            assertTrue(error.getMessage().contains("TABLE_CACHE_SOURCE_CHANGED"));
+        }
+        assertEquals(1, jdbc.metadataCalls().size(), "signature change must fail before the unavailable SHOW");
+        assertTrue(jdbc.metadataCalls().getFirst().sql().startsWith("SELECT TABLE_TYPE,"));
+        assertTrue(jdbc.calls().isEmpty());
+        assertTrue(jdbc.resourcesClosed());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"HEAP", "EMBEDDED_KV"})
+    void changedPreflightPreservesTheQueuedReplacementForExplicitReload(final String mode) throws Exception {
+        final RefreshResponseConnectionService jdbc = new RefreshResponseConnectionService();
+        jdbc.enqueue(response(FIELDS, control(2, FIRST_ID, SIGNATURE, "FULL", 1L), data("INSERT", "a", "original")));
+        jdbc.enqueue(response(FIELDS, control(2, SECOND_ID, "changed-signature", "FULL", 1L), data("INSERT", "b", "replacement")));
+        try (final TableCacheStore store = store(mode)) {
+            reader().refresh(jdbc, store, false);
+            assertEquals(-20001, assertThrows(SQLException.class, () -> reader().refresh(jdbc, store, true)).getErrorCode());
+            assertEquals(1, jdbc.calls().size());
+            assertEquals(1, jdbc.remainingSteps());
+            assertEquals(new CacheCheckpoint(FIRST_ID, SIGNATURE), store.checkpoint());
+            assertEquals("original", store.get("a").orElseThrow().getAsString("V"));
+            assertFalse(reader().reload(jdbc, store).incremental());
+            assertEquals(2, jdbc.calls().size());
+            assertEquals(0, jdbc.remainingSteps());
+            assertNull(jdbc.calls().getLast().parameters().get(2));
+            assertEquals("changed-signature", jdbc.calls().getLast().parameters().get(5));
+            assertEquals(new CacheCheckpoint(SECOND_ID, "changed-signature"), store.checkpoint());
+            assertTrue(store.get("a").isEmpty());
+            assertEquals("replacement", store.get("b").orElseThrow().getAsString("V"));
         }
         assertTrue(jdbc.resourcesClosed());
     }
@@ -490,7 +810,7 @@ class TestAnonymousTableRefresh {
                     body.append('\'');
                     index++;
                 } else {
-                    assertEquals("CALL refresh_cache(?, ?, ?, ?)", sql.substring(index).trim(),
+                    assertEquals("CALL refresh_cache(?, ?, ?, ?, ?)", sql.substring(index).trim(),
                             "nothing except the bound call may escape the quoted body");
                     return body.toString();
                 }
