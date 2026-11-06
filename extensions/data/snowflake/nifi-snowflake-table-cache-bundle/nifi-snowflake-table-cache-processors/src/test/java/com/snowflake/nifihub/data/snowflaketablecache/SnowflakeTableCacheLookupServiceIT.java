@@ -1,0 +1,516 @@
+/*
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package com.snowflake.nifihub.data.snowflaketablecache;
+
+import org.apache.nifi.serialization.record.Record;
+import org.apache.nifi.util.TestRunner;
+import org.apache.nifi.util.TestRunners;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.condition.EnabledIfEnvironmentVariable;
+import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
+
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Proxy;
+import java.nio.file.Path;
+import java.sql.Connection;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
+import java.sql.SQLException;
+import java.sql.Statement;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.UUID;
+import java.util.concurrent.CyclicBarrier;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.fail;
+
+/**
+ * Live Snowflake coverage for generated anonymous SQL, statement-boundary refreshes and session guards.
+ * Scripted JDBC unit tests cover response handling but do not execute the SQL.
+ *
+ * <p><b>Skipped unless {@code SNOWFLAKE_IT_CONNECTION} names a connection</b> in
+ * {@code ~/.snowflake/config.toml}, so a normal build never requires an account:
+ *
+ * <pre>
+ *   SNOWFLAKE_IT_CONNECTION=test_connection mvn verify
+ * </pre>
+ *
+ * <p>Creates and drops its own uniquely-named table, so it can run against a shared account without
+ * colliding with anything.
+ */
+@EnabledIfEnvironmentVariable(named = SnowflakeConfigConnectionService.CONNECTION_ENV, matches = ".+")
+class SnowflakeTableCacheLookupServiceIT {
+
+    /** Long enough to cover CHANGES visibility after a commit without making a failure slow. */
+    private static final long SETTLE_TIMEOUT_MILLIS = 30_000;
+
+    @TempDir
+    Path storageDirectory;
+
+    private TestRunner runner;
+    private SnowflakeTableCacheLookupService service;
+    private SnowflakeConfigConnectionService connectionService;
+    private String table;
+    private boolean tableCreated;
+
+    @BeforeEach
+    void setUp() throws Exception {
+        connectionService = new SnowflakeConfigConnectionService();
+        try (Connection connection = connectionService.getConnection();
+             Statement statement = connection.createStatement();
+             ResultSet context = statement.executeQuery("SELECT CURRENT_DATABASE(), CURRENT_SCHEMA()")) {
+            assertTrue(context.next());
+            table = "%s.%s.TABLE_CACHE_IT_%s".formatted(SnowflakeIdentifier.quote(context.getString(1)),
+                    SnowflakeIdentifier.quote(context.getString(2)), UUID.randomUUID().toString().replace("-", ""));
+        }
+
+        execute("CREATE TABLE " + table
+                        + " (ITEM_ID STRING, LABEL STRING, REGION STRING) CHANGE_TRACKING = TRUE");
+        tableCreated = true;
+        execute("INSERT INTO " + table + " VALUES "
+                        + "('ITEM_ID001','b2b','NA'),('ITEM_ID002','b2b,advertiser','NA'),('ITEM_ID003','advertiser','EU')");
+
+        runner = TestRunners.newTestRunner(NoOpProcessor.class);
+        service = new SnowflakeTableCacheLookupService();
+    }
+
+    @AfterEach
+    void tearDown() throws Exception {
+        if (service != null) {
+            service.onDisabled();
+        }
+        if (tableCreated) {
+            execute("DROP TABLE IF EXISTS " + table);
+        }
+    }
+
+    private void enableService(final String mode) throws Exception {
+        runner.addControllerService("snowflake", connectionService);
+        runner.enableControllerService(connectionService);
+
+        runner.addControllerService("cache", service);
+        runner.setProperty(service, SnowflakeTableCacheLookupService.SNOWFLAKE_CONNECTION_SERVICE, "snowflake");
+        runner.setProperty(service, SnowflakeTableCacheLookupService.SOURCE_TABLE, table);
+        runner.setProperty(service, SnowflakeTableCacheLookupService.KEY_COLUMNS, "ITEM_ID");
+        runner.setProperty(service, SnowflakeTableCacheLookupService.VALUE_COLUMNS, "*");
+        runner.setProperty(service, SnowflakeTableCacheLookupService.REFRESH_INTERVAL, "0 sec");
+        runner.setProperty(service, SnowflakeTableCacheLookupService.INCREMENTAL_REFRESH, "true");
+        runner.setProperty(service, SnowflakeTableCacheLookupService.STORAGE_MODE, mode);
+        if (!"HEAP".equals(mode)) {
+            runner.setProperty(service, SnowflakeTableCacheLookupService.STORAGE_DIRECTORY,
+                    storageDirectory.toString());
+        }
+        runner.enableControllerService(service);
+
+        // onEnabled deliberately swallows a failed initial load so a transient outage cannot stop a
+        // flow. That is right in production and useless in a test, so surface the cause here.
+        if (!service.isHydrated()) {
+            service.refresh();
+            fail("Service enabled but the initial load produced nothing");
+        }
+    }
+
+    /**
+     * The behaviour the whole feature exists for: an inserted row, an updated row and a deleted row
+     * each reach the cache through an incremental refresh, with no full reload.
+     */
+    @ParameterizedTest
+    @ValueSource(strings = {"HEAP", "EMBEDDED_KV"})
+    void incrementalRefreshAppliesInsertsUpdatesAndDeletes(final String mode) throws Exception {
+        enableService(mode);
+        assertEquals(3L, service.size());
+        final CacheCheckpoint initialCheckpoint = service.checkpointForTest();
+        assertNotNull(initialCheckpoint, "the initial full load must record a statement checkpoint");
+
+        // ---- a brand new ITEM_ID, which is the demo case ----
+        execute("INSERT INTO " + table + " VALUES ('ITEM_ID004','fleet','JP')");
+        RefreshResult result = refreshUntil(() -> service.size() == 4L, "ITEM_ID004 to appear");
+        assertTrue(result.incremental(), "must have refreshed incrementally, not fully reloaded");
+        assertEquals("fleet", lookup("ITEM_ID004").orElseThrow().getAsString("LABEL"));
+        assertNotEquals(initialCheckpoint, service.checkpointForTest(), "checkpoint must advance");
+
+        // ---- an update: the DELETE half of the pair must not resurrect the old value ----
+        execute("UPDATE " + table + " SET LABEL = 'b2b,advertiser,fleet' WHERE ITEM_ID = 'ITEM_ID001'");
+        refreshUntil(() -> lookup("ITEM_ID001").map(r -> r.getAsString("LABEL"))
+                .filter("b2b,advertiser,fleet"::equals).isPresent(), "ITEM_ID001 to update");
+        assertEquals(4L, service.size(), "an update must not change the row count");
+
+        // ---- a revocation ----
+        execute("DELETE FROM " + table + " WHERE ITEM_ID = 'ITEM_ID003'");
+        result = refreshUntil(() -> lookup("ITEM_ID003").isEmpty(), "ITEM_ID003 to be revoked");
+        assertTrue(result.incremental());
+        assertEquals(3L, service.size());
+        assertTrue(lookup("ITEM_ID001").isPresent(), "unrelated keys must survive a delta");
+    }
+
+    /** Changing a lookup key must remove the old address as well as insert the new one. */
+    @ParameterizedTest
+    @ValueSource(strings = {"HEAP", "EMBEDDED_KV"})
+    void incrementalKeyChangeRemovesTheOldKey(final String mode) throws Exception {
+        enableService(mode);
+        execute("UPDATE " + table + " SET ITEM_ID = 'ITEM_ID900' WHERE ITEM_ID = 'ITEM_ID001'");
+        final RefreshResult result = refreshUntil(() -> lookup("ITEM_ID001").isEmpty()
+                && lookup("ITEM_ID900").isPresent(), "key change to apply");
+        assertTrue(result.incremental());
+        assertEquals(3L, service.size());
+    }
+
+    /** A refresh with nothing to do must be a no-op, not a silent full reload. */
+    @ParameterizedTest
+    @ValueSource(strings = {"HEAP", "EMBEDDED_KV"})
+    void incrementalRefreshWithNoChangesAppliesNothing(final String mode) throws Exception {
+        enableService(mode);
+        assertEquals(3L, service.size());
+
+        final RefreshResult result = service.refresh();
+
+        assertTrue(result.incremental());
+        assertEquals(0L, result.rowsUpserted());
+        assertEquals(0L, result.rowsDeleted());
+        assertEquals(3L, service.size());
+    }
+
+    /** An unknown statement checkpoint must recover through a full reload; this does not age retained history. */
+    @ParameterizedTest
+    @ValueSource(strings = {"HEAP", "EMBEDDED_KV"})
+    void unknownStatementCheckpointFallsBackToFullReload(final String mode) throws Exception {
+        enableService(mode);
+
+        // A syntactically valid ID with no backing statement exercises the missing-statement recovery path.
+        service.storeForTest().applyChanges(service.storeForTest().schema(), Map.of(), java.util.Set.of(),
+                new CacheCheckpoint("00000000-0000-0000-0000-000000000000", service.checkpointForTest().sourceSignature()));
+        execute("INSERT INTO " + table + " VALUES ('ITEM_ID005','fleet','JP')");
+
+        final RefreshResult result = service.refresh();
+
+        assertFalse(result.incremental(), "should have fallen back to a full reload");
+        assertEquals(4L, service.size());
+        assertTrue(lookup("ITEM_ID005").isPresent());
+        assertNotNull(service.checkpointForTest(), "the fallback reload must replace the invalid checkpoint");
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"HEAP", "EMBEDDED_KV"})
+    void mixedCaseValuesAndEmptyTableKeepIncrementalCheckpoints(final String mode) throws Exception {
+        execute("ALTER TABLE %s ADD COLUMN \"Mixed Label\" VARCHAR, \"quote\"\"value\" VARCHAR, KIND VARCHAR, \"cash$$value\" VARCHAR".formatted(table));
+        execute("UPDATE %s SET \"Mixed Label\" = 'one', \"quote\"\"value\" = 'two', KIND = 'user-data', \"cash$$value\" = 'three'".formatted(table));
+        enableService(mode);
+        assertEquals("one", lookup("ITEM_ID001").orElseThrow().getAsString("Mixed Label"));
+        execute("UPDATE %s SET \"Mixed Label\" = NULL, \"quote\"\"value\" = 'changed', \"cash$$value\" = 'four'".formatted(table));
+        assertTrue(service.refresh().incremental());
+        assertEquals(null, lookup("ITEM_ID001").orElseThrow().getAsString("Mixed Label"));
+        assertEquals("changed", lookup("ITEM_ID001").orElseThrow().getAsString("quote\"value"));
+        assertEquals("four", lookup("ITEM_ID001").orElseThrow().getAsString("cash$$value"));
+        assertEquals("user-data", lookup("ITEM_ID001").orElseThrow().getAsString("KIND"));
+        execute("DELETE FROM %s".formatted(table));
+        assertTrue(service.refresh().incremental());
+        assertEquals(0, service.size());
+        final CacheCheckpoint empty = service.checkpointForTest();
+        assertTrue(service.refresh().incremental());
+        assertNotEquals(empty.queryId(), service.checkpointForTest().queryId());
+        assertAtCheckpoint(service.storeForTest());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"HEAP", "EMBEDDED_KV"})
+    void sourceReplacementReloadsRatherThanContinuingOldHistory(final String mode) throws Exception {
+        enableService(mode);
+        final CacheCheckpoint previous = service.checkpointForTest();
+        execute("DROP TABLE %s".formatted(table));
+        execute("CREATE TABLE %s (ITEM_ID STRING, LABEL STRING, REGION STRING) CHANGE_TRACKING = TRUE".formatted(table));
+        execute("INSERT INTO %s VALUES ('replacement', 'new', 'APAC')".formatted(table));
+        assertFalse(service.refresh().incremental());
+        assertNotEquals(previous.sourceSignature(), service.checkpointForTest().sourceSignature());
+        assertEquals(1, service.size());
+        assertTrue(lookup("ITEM_ID001").isEmpty());
+        assertAtCheckpoint(service.storeForTest());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"HEAP", "EMBEDDED_KV"})
+    void fullSnapshotBoundaryDoesNotRetainInsertThenDelete(final String mode) throws Exception {
+        // Insert before the full query; delete after its response but before local consumption.
+        // This deterministically targets the snapshot-to-local-publication boundary without sleeps.
+        final SnowflakeConfigConnectionService writer = connectionService;
+        final AtomicBoolean intercept = new AtomicBoolean(true);
+        connectionService = new SnowflakeConfigConnectionService() {
+            @Override
+            public Connection getConnection() {
+                final Connection connection = super.getConnection();
+                return (Connection) Proxy.newProxyInstance(Connection.class.getClassLoader(), new Class<?>[]{Connection.class}, (proxy, method, arguments) -> {
+                    try {
+                        final Object result = method.invoke(connection, arguments);
+                        if (method.getName().equals("prepareStatement") && ((String) arguments[0]).startsWith("WITH refresh_cache")
+                                && intercept.compareAndSet(true, false)) {
+                            final PreparedStatement statement = (PreparedStatement) result;
+                            return Proxy.newProxyInstance(PreparedStatement.class.getClassLoader(), new Class<?>[]{PreparedStatement.class},
+                                    (statementProxy, statementMethod, statementArguments) -> {
+                                        try {
+                                            if (statementMethod.getName().equals("executeQuery")) {
+                                                executeWith(writer, "INSERT INTO %s VALUES ('boundary-row', 'ephemeral', 'NA')".formatted(table));
+                                                final Object response = statementMethod.invoke(statement, statementArguments);
+                                                executeWith(writer, "DELETE FROM %s WHERE ITEM_ID = 'boundary-row'".formatted(table));
+                                                return response;
+                                            }
+                                            return statementMethod.invoke(statement, statementArguments);
+                                        } catch (final InvocationTargetException exception) {
+                                            throw exception.getCause();
+                                        }
+                                    });
+                        }
+                        return result;
+                    } catch (final InvocationTargetException exception) {
+                        throw exception.getCause();
+                    }
+                });
+            }
+        };
+        enableService(mode);
+        assertTrue(lookup("boundary-row").isPresent());
+        assertAtCheckpoint(service.storeForTest());
+        assertTrue(service.refresh().incremental());
+        assertTrue(lookup("boundary-row").isEmpty());
+        assertAtCheckpoint(service.storeForTest());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"HEAP", "EMBEDDED_KV"})
+    void independentReadersResumeTheirOwnBoundaries(final String mode) throws Exception {
+        final AnonymousTableRefresh reader = new AnonymousTableRefresh(table, List.of("ITEM_ID"), List.of(), true, true);
+        try (TableCacheStore first = "HEAP".equals(mode) ? new HeapTableCacheStore()
+                : new RocksDbTableCacheStore(storageDirectory.resolve("first"));
+             TableCacheStore second = "HEAP".equals(mode) ? new HeapTableCacheStore()
+                     : new RocksDbTableCacheStore(storageDirectory.resolve("second"))) {
+            reader.refresh(connectionService, first, false);
+            execute("UPDATE %s SET LABEL = 'epoch-1'".formatted(table));
+            reader.refresh(connectionService, second, false);
+            assertNotEquals(first.checkpoint().queryId(), second.checkpoint().queryId());
+            assertAtCheckpoint(first);
+            assertAtCheckpoint(second);
+            final CyclicBarrier round = new CyclicBarrier(2);
+            try (final ExecutorService executor = Executors.newSingleThreadExecutor()) {
+                final Future<?> writer = executor.submit(() -> {
+                    try (Connection connection = connectionService.getConnection(); Statement statement = connection.createStatement()) {
+                        for (int batch = 0; batch < 3; batch++) {
+                            round.await(60, TimeUnit.SECONDS);
+                            final int lastEpoch = batch == 2 ? 20 : 7 + batch * 6;
+                            for (int epoch = 2 + batch * 6; epoch <= lastEpoch; epoch++) {
+                                statement.execute("UPDATE %s SET LABEL = 'epoch-%d'".formatted(table, epoch));
+                            }
+                            round.await(60, TimeUnit.SECONDS);
+                        }
+                    }
+                    return null;
+                });
+                try {
+                    for (int refresh = 0; refresh < 3; refresh++) {
+                        // Neither participant may finish all rounds before the other is scheduled.
+                        round.await(60, TimeUnit.SECONDS);
+                        reader.refresh(connectionService, first, true);
+                        assertAtCheckpoint(first);
+                        round.await(60, TimeUnit.SECONDS);
+                    }
+                    writer.get(60, TimeUnit.SECONDS);
+                } finally {
+                    writer.cancel(true);
+                    round.reset();
+                }
+            }
+            reader.refresh(connectionService, first, true);
+            reader.refresh(connectionService, second, true);
+            assertAtCheckpoint(first);
+            assertAtCheckpoint(second);
+            assertEquals("epoch-20", first.get("ITEM_ID001").orElseThrow().getAsString("LABEL"));
+            assertEquals(first.get("ITEM_ID001").orElseThrow().getAsString("LABEL"), second.get("ITEM_ID001").orElseThrow().getAsString("LABEL"));
+        }
+    }
+
+    @Test
+    void fullModeDetectsReplacementBeforeInvalidProjectionCanServeOldRows() throws Exception {
+        runner.addControllerService("snowflake", connectionService);
+        runner.enableControllerService(connectionService);
+        runner.addControllerService("cache", service);
+        runner.setProperty(service, SnowflakeTableCacheLookupService.SNOWFLAKE_CONNECTION_SERVICE, "snowflake");
+        runner.setProperty(service, SnowflakeTableCacheLookupService.SOURCE_TABLE, table);
+        runner.setProperty(service, SnowflakeTableCacheLookupService.KEY_COLUMNS, "ITEM_ID");
+        runner.setProperty(service, SnowflakeTableCacheLookupService.VALUE_COLUMNS, "LABEL");
+        runner.setProperty(service, SnowflakeTableCacheLookupService.REFRESH_INTERVAL, "0 sec");
+        runner.enableControllerService(service);
+        assertTrue(service.isHydrated());
+        final CacheCheckpoint before = service.checkpointForTest();
+        execute("DROP TABLE %s".formatted(table));
+        execute("CREATE TABLE %s (ITEM_ID VARCHAR)".formatted(table));
+        assertThrows(TableCacheException.class, service::refresh);
+        assertFalse(service.isHydrated());
+        assertThrows(org.apache.nifi.lookup.LookupFailureException.class, () -> service.lookup(Map.of("ITEM_ID", "ITEM_ID001")));
+        assertEquals(before, service.checkpointForTest());
+        assertThrows(TableCacheException.class, service::refresh);
+        assertFalse(service.isHydrated());
+    }
+
+    @Test
+    void temporaryShadowIsRejectedInTheBorrowedSession() throws Exception {
+        final AnonymousTableRefresh reader = new AnonymousTableRefresh(table, List.of("ITEM_ID"), List.of(), true, false);
+        try (Connection connection = connectionService.getConnection(); TableCacheStore store = new HeapTableCacheStore()) {
+            final Connection borrowed = (Connection) Proxy.newProxyInstance(Connection.class.getClassLoader(), new Class<?>[]{Connection.class},
+                    (proxy, method, arguments) -> {
+                        if (method.getName().equals("close")) {
+                            return null;
+                        }
+                        try {
+                            return method.invoke(connection, arguments);
+                        } catch (final InvocationTargetException exception) {
+                            throw exception.getCause();
+                        }
+                    });
+            final SnowflakeConfigConnectionService sameSession = new SnowflakeConfigConnectionService() {
+                @Override
+                public Connection getConnection() {
+                    return borrowed;
+                }
+            };
+            try (Statement statement = connection.createStatement()) {
+                statement.execute("CREATE TEMPORARY TABLE %s (ITEM_ID VARCHAR, LABEL VARCHAR, REGION VARCHAR)".formatted(table));
+                statement.execute("INSERT INTO %s VALUES ('shadow', 'wrong source', 'NA')".formatted(table));
+            }
+            final SQLException error = assertThrows(SQLException.class, () -> reader.refresh(sameSession, store, false));
+            assertTrue(error.getMessage().contains("TABLE_CACHE_INVALID_SOURCE"));
+            assertFalse(store.isHydrated());
+        }
+    }
+
+    @Test
+    void explicitCallerTransactionIsRejectedWithoutCommittingIt() throws Exception {
+        final AnonymousTableRefresh reader = new AnonymousTableRefresh(table, List.of("ITEM_ID"), List.of(), true, false);
+        try (Connection connection = connectionService.getConnection(); TableCacheStore store = new HeapTableCacheStore()) {
+            final Connection borrowed = (Connection) Proxy.newProxyInstance(Connection.class.getClassLoader(), new Class<?>[]{Connection.class},
+                    (proxy, method, arguments) -> {
+                        if (method.getName().equals("close")) {
+                            return null;
+                        }
+                        try {
+                            return method.invoke(connection, arguments);
+                        } catch (final InvocationTargetException exception) {
+                            throw exception.getCause();
+                        }
+                    });
+            final SnowflakeConfigConnectionService sameSession = new SnowflakeConfigConnectionService() {
+                @Override
+                public Connection getConnection() {
+                    return borrowed;
+                }
+            };
+            try (Statement statement = connection.createStatement()) {
+                statement.execute("BEGIN TRANSACTION");
+                try {
+                    statement.execute("INSERT INTO %s VALUES ('uncommitted', 'private', 'NA')".formatted(table));
+                    final SQLException error = assertThrows(SQLException.class, () -> reader.refresh(sameSession, store, false));
+                    assertTrue(error.getMessage().contains("TABLE_CACHE_ACTIVE_TRANSACTION") || error.getMessage().contains("auto-commit"));
+                    assertFalse(store.isHydrated());
+                    try (ResultSet transaction = statement.executeQuery("SELECT CURRENT_TRANSACTION()")) {
+                        assertTrue(transaction.next());
+                        assertNotNull(transaction.getString(1));
+                    }
+                } finally {
+                    statement.execute("ROLLBACK");
+                }
+            }
+        }
+    }
+
+    private void assertAtCheckpoint(final TableCacheStore store) throws Exception {
+        final Map<String, String> expected = new HashMap<>();
+        try (Connection connection = connectionService.getConnection();
+             PreparedStatement statement = connection.prepareStatement("SELECT ITEM_ID, LABEL FROM %s AT(STATEMENT => ?)".formatted(table))) {
+            statement.setString(1, store.checkpoint().queryId());
+            try (ResultSet rows = statement.executeQuery()) {
+                while (rows.next()) {
+                    expected.put(rows.getString(1), rows.getString(2));
+                }
+            }
+        }
+        assertEquals(expected.size(), store.size());
+        for (final Map.Entry<String, String> row : expected.entrySet()) {
+            assertEquals(row.getValue(), store.get(row.getKey()).orElseThrow().getAsString("LABEL"));
+        }
+    }
+
+    private static void executeWith(final SnowflakeConfigConnectionService connectionService, final String sql) throws SQLException {
+        try (Connection connection = connectionService.getConnection(); Statement statement = connection.createStatement()) {
+            statement.execute(sql);
+        }
+    }
+
+    // ---------- helpers ----------
+
+    private Optional<Record> lookup(final String itemId) {
+        try {
+            return service.lookup(Map.of("ITEM_ID", itemId));
+        } catch (final Exception e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+    /**
+     * Refresh until a condition holds. A commit is not necessarily visible to CHANGES the instant it
+     * returns, so a single refresh would make this test flaky for reasons that have nothing to do
+     * with the code under test.
+     */
+    private RefreshResult refreshUntil(final BooleanSupplierWithException condition,
+                                       final String description) throws Exception {
+        final long deadline = System.currentTimeMillis() + SETTLE_TIMEOUT_MILLIS;
+        RefreshResult last = null;
+        while (System.currentTimeMillis() < deadline) {
+            last = service.refresh();
+            if (condition.getAsBoolean()) {
+                return last;
+            }
+            Thread.sleep(500);
+        }
+        fail("Timed out after " + SETTLE_TIMEOUT_MILLIS + " ms waiting for " + description
+                + " (last refresh: " + last + ")");
+        return last;
+    }
+
+    private void execute(final String... statements) throws Exception {
+        try (Connection connection = connectionService.getConnection();
+             Statement statement = connection.createStatement()) {
+            for (final String sql : statements) {
+                statement.execute(sql);
+            }
+        }
+    }
+
+    @FunctionalInterface
+    private interface BooleanSupplierWithException {
+        boolean getAsBoolean() throws Exception;
+    }
+}
