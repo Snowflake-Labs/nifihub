@@ -34,6 +34,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
@@ -73,6 +74,7 @@ class TestSnowflakeTableCacheLookupService {
     @BeforeEach
     void setUp() {
         connectionService = new RefreshResponseConnectionService();
+        connectionService.sourceSignature(SIGNATURE);
         runner = TestRunners.newTestRunner(NoOpProcessor.class);
         service = new SnowflakeTableCacheLookupService();
     }
@@ -109,6 +111,7 @@ class TestSnowflakeTableCacheLookupService {
         assertEquals(SIGNATURE, call.parameters().get(5));
         assertEquals(Map.of(1, "PUBLIC", 2, "REF"), connectionService.metadataCalls().getFirst().parameters());
         assertEquals(1, connectionService.connectionCount());
+        assertEquals(1, connectionService.sessionCalls().size());
     }
 
     @ParameterizedTest
@@ -245,43 +248,16 @@ class TestSnowflakeTableCacheLookupService {
     }
 
     static Stream<Arguments> sourceErrors() {
-        return Stream.of("HEAP", "EMBEDDED_KV").flatMap(mode -> Stream.of("positiveChanged", "negativeChanged", "positiveInvalid", "negativeInvalid",
-                "changedMarker", "invalidMarker", "chained").map(error -> Arguments.of(mode, error)));
-    }
-
-    @ParameterizedTest
-    @MethodSource("sourceErrors")
-    void sourceErrorsInvalidateServingAndAttemptOnlyOneFullReload(final String mode, final String error) throws Exception {
-        initialLoad(mode, true);
-        connectionService.enqueueFailure(sourceFailure(error));
-        connectionService.enqueueFailure(new SQLException("Reload temporarily unavailable", "08006"));
-        assertThrows(TableCacheException.class, () -> service.refresh());
-        assertEquals(3, connectionService.calls().size());
-        assertTrue(connectionService.calls().get(1).incremental());
-        assertFalse(connectionService.calls().get(2).incremental());
-        assertNull(connectionService.calls().get(2).parameters().get(1));
-        assertNull(connectionService.calls().get(2).parameters().get(2));
-        assertFalse(service.isHydrated());
-        assertTrue(service.storeForTest().isHydrated(), "physical rows remain intact but must not be served");
-        assertEquals(3L, service.size());
-        assertEquals(new CacheCheckpoint(FIRST_ID, SIGNATURE), service.checkpointForTest());
-        assertThrows(LookupFailureException.class, () -> lookup("ITEM_ID001"));
-        connectionService.enqueue(full(SECOND_ID, "replacement-source", data("INSERT", "replacement", "validated", "EU")));
-        assertFalse(service.refresh().incremental(), "retry after invalidation must not resume the old checkpoint");
-        assertTrue(service.isHydrated());
-        assertFalse(connectionService.calls().getLast().incremental());
-        assertNull(connectionService.calls().getLast().parameters().get(1));
-        assertNull(connectionService.calls().getLast().parameters().get(2));
-        assertEquals("validated", lookup("replacement").getAsString("LABEL"));
-        assertTrue(service.lookup(Map.of("ITEM_ID", "ITEM_ID001")).isEmpty());
-        assertEquals(new CacheCheckpoint(SECOND_ID, "replacement-source"), service.checkpointForTest());
+        return Stream.of("HEAP", "EMBEDDED_KV").flatMap(mode -> Stream.of(false, true).flatMap(incremental ->
+                Stream.of("positiveChanged", "negativeChanged", "positiveInvalid", "negativeInvalid", "changedMarker", "invalidMarker", "chained")
+                        .map(error -> Arguments.of(mode, incremental, error))));
     }
 
     @ParameterizedTest
     @ValueSource(strings = {"HEAP", "EMBEDDED_KV"})
     void sourceReplacementCanRecoverInTheSameRefresh(final String mode) throws Exception {
         initialLoad(mode, true);
-        connectionService.enqueueFailure(sourceFailure("changedMarker"));
+        connectionService.enqueueFailure(sourceFailure("changedMarker"), () -> connectionService.sourceSignature("replacement"));
         connectionService.enqueue(full(SECOND_ID, "replacement", data("INSERT", "new", "replacement-value", "EU")));
         assertFalse(service.refresh().incremental());
         assertEquals(3, connectionService.calls().size(), "queued SQL failure must be consumed before the replacement reload");
@@ -296,12 +272,14 @@ class TestSnowflakeTableCacheLookupService {
 
     @ParameterizedTest
     @MethodSource("sourceErrors")
-    void fullRefreshSourceFailureKeepsRowsButGatesLookupsAcrossFailedReload(final String mode, final String error) throws Exception {
-        initialLoad(mode, false);
+    void sourceFailureGatesLookupsThroughOneImmediateReloadAndLaterRetries(final String mode, final boolean incremental, final String error) throws Exception {
+        initialLoad(mode, incremental);
         connectionService.enqueueFailure(sourceFailure(error));
         connectionService.enqueueFailure(new SQLException("Deferred reload temporarily unavailable", "08006"));
         assertThrows(TableCacheException.class, () -> service.refresh());
         assertEquals(3, connectionService.calls().size(), "source change attempts one immediate full reload");
+        assertEquals(incremental, connectionService.calls().get(1).incremental());
+        assertFalse(connectionService.calls().get(2).incremental());
         assertEquals(0, connectionService.remainingSteps());
         assertNull(connectionService.calls().getLast().parameters().get(1));
         assertNull(connectionService.calls().getLast().parameters().get(2));
@@ -324,6 +302,7 @@ class TestSnowflakeTableCacheLookupService {
         assertEquals("b2b", service.storeForTest().get("ITEM_ID001").orElseThrow().getAsString("LABEL"));
         assertThrows(LookupFailureException.class, () -> lookup("ITEM_ID001"));
 
+        connectionService.sourceSignature("replacement");
         connectionService.enqueue(full(SECOND_ID, "replacement", data("INSERT", "new", "validated", "EU")));
         assertFalse(service.refresh().incremental());
         assertNull(connectionService.calls().getLast().parameters().get(1));
@@ -333,9 +312,10 @@ class TestSnowflakeTableCacheLookupService {
         assertEquals(1L, service.size());
         assertTrue(service.lookup(Map.of("ITEM_ID", "ITEM_ID001")).isEmpty());
         assertEquals("validated", lookup("new").getAsString("LABEL"));
-        connectionService.enqueue(full(THIRD_ID, "replacement", data("INSERT", "new", "revalidated", "EU")));
-        service.refresh();
-        assertNull(connectionService.calls().getLast().parameters().get(1));
+        connectionService.enqueue(response(FIELDS, control(3, THIRD_ID, "replacement", incremental ? "INCREMENTAL" : "FULL", 1L),
+                data("INSERT", "new", "revalidated", "EU")));
+        assertEquals(incremental, service.refresh().incremental());
+        assertEquals(incremental ? SECOND_ID : null, connectionService.calls().getLast().parameters().get(1));
         assertEquals("replacement", connectionService.calls().getLast().parameters().get(2));
         assertEquals(new CacheCheckpoint(THIRD_ID, "replacement"), service.checkpointForTest());
     }
@@ -500,7 +480,8 @@ class TestSnowflakeTableCacheLookupService {
         assertEquals(FIRST_ID, connectionService.calls().getLast().parameters().get(1));
         assertEquals(SIGNATURE, connectionService.calls().getLast().parameters().get(5));
         assertEquals(2, connectionService.connectionCount());
-        assertEquals("managedIceberg".equals(type) ? 6 : 4, connectionService.metadataCalls().size());
+        assertEquals(4, connectionService.metadataCalls().size(), "one capability SHOW per refresh");
+        assertEquals(2, connectionService.sessionCalls().size());
     }
 
     @ParameterizedTest
@@ -549,8 +530,7 @@ class TestSnowflakeTableCacheLookupService {
         connectionService.sourceType(type);
         initialLoad(mode, incremental);
         final int metadataBefore = connectionService.metadataCalls().size();
-        connectionService.metadataRows(new Object[]{"BASE TABLE", "NO", "managedIceberg".equals(type) ? "YES" : "NO",
-                "dynamicIncremental".equals(type) ? "YES" : "NO", "NO", 1L, "replacement-source"});
+        connectionService.sourceSignature("replacement-source");
         final SQLException unavailable = new SQLException("Capability metadata unavailable", "08006");
         connectionService.capabilityFailure(unavailable);
         connectionService.enqueue(full(SECOND_ID, "replacement-source", data("INSERT", "new", "validated", "EU")));
@@ -589,7 +569,7 @@ class TestSnowflakeTableCacheLookupService {
     void restartWithChangedSourceReplacesRatherThanServesPersistedRows() throws Exception {
         initialLoad("EMBEDDED_KV", true);
         runner.disableControllerService(service);
-        connectionService.enqueueFailure(sourceFailure("changedMarker"));
+        connectionService.enqueueFailure(sourceFailure("changedMarker"), () -> connectionService.sourceSignature("replacement"));
         connectionService.enqueue(full(SECOND_ID, "replacement", data("INSERT", "new", "validated", "NA")));
         runner.enableControllerService(service);
         assertTrue(service.isHydrated());
@@ -679,7 +659,7 @@ class TestSnowflakeTableCacheLookupService {
 
     @ParameterizedTest
     @MethodSource("backendsAndRefreshModes")
-    void concurrentReadersSeeOldDataUntilRefreshCommits(final String mode, final boolean incremental) throws Exception {
+    void concurrentReadersSeeOldDataWhileQueryExecutionIsBlocked(final String mode, final boolean incremental) throws Exception {
         initialLoad(mode, incremental);
         final CountDownLatch entered = new CountDownLatch(1);
         final CountDownLatch release = new CountDownLatch(1);
@@ -706,6 +686,64 @@ class TestSnowflakeTableCacheLookupService {
         } finally {
             release.countDown();
         }
+    }
+
+    static Stream<Arguments> publicationCloseBoundaries() {
+        return backendsAndRefreshModes().flatMap(arguments -> Stream.of("resultSet", "statement", "connection").flatMap(resource ->
+                Stream.of(false, true).map(failClose -> Arguments.of(arguments.get()[0], arguments.get()[1], resource, failClose))));
+    }
+
+    @ParameterizedTest
+    @MethodSource("publicationCloseBoundaries")
+    void consumedRefreshRemainsUnpublishedUntilJdbcClosureSucceeds(final String mode, final boolean incremental,
+                                                                  final String resource, final boolean failClose) throws Exception {
+        initialLoad(mode, incremental);
+        final CacheCheckpoint before = service.checkpointForTest();
+        final CountDownLatch entered = new CountDownLatch(1);
+        final CountDownLatch release = new CountDownLatch(1);
+        connectionService.enqueue(response(FIELDS, control(3, SECOND_ID, SIGNATURE, incremental ? "INCREMENTAL" : "FULL", 2L),
+                data("INSERT", "ITEM_ID001", "replacement", "EU"), data("INSERT", "new", "added", "EU")));
+        connectionService.blockOnClose(resource, entered, release);
+        if (failClose) {
+            connectionService.failOnClose(resource);
+        }
+        try (final ExecutorService executor = Executors.newFixedThreadPool(2)) {
+            final Future<RefreshResult> refresh = executor.submit(() -> service.refresh());
+            try {
+                assertTrue(entered.await(5, TimeUnit.SECONDS), "refresh must consume the response and reach JDBC closure");
+                assertFalse(refresh.isDone());
+                assertEquals(0, connectionService.remainingSteps());
+                final Future<?> reader = executor.submit(() -> {
+                    assertTrue(service.isHydrated());
+                    assertEquals(3L, service.size());
+                    assertEquals("b2b", lookup("ITEM_ID001").getAsString("LABEL"));
+                    assertTrue(service.lookup(Map.of("ITEM_ID", "new")).isEmpty());
+                    assertEquals(before, service.checkpointForTest());
+                    return null;
+                });
+                reader.get(5, TimeUnit.SECONDS);
+            } finally {
+                release.countDown();
+            }
+            if (failClose) {
+                final ExecutionException failure = assertThrows(ExecutionException.class, () -> refresh.get(5, TimeUnit.SECONDS));
+                assertTrue(failure.getCause() instanceof TableCacheException);
+                assertTrue(service.isHydrated());
+                assertEquals(3L, service.size());
+                assertEquals("b2b", lookup("ITEM_ID001").getAsString("LABEL"));
+                assertTrue(service.lookup(Map.of("ITEM_ID", "new")).isEmpty());
+                assertEquals(before, service.checkpointForTest());
+            } else {
+                assertEquals(incremental, refresh.get(5, TimeUnit.SECONDS).incremental());
+                assertEquals(incremental ? 4L : 2L, service.size());
+                assertEquals("replacement", lookup("ITEM_ID001").getAsString("LABEL"));
+                assertEquals("added", lookup("new").getAsString("LABEL"));
+                assertEquals(new CacheCheckpoint(SECOND_ID, SIGNATURE), service.checkpointForTest());
+            }
+        } finally {
+            release.countDown();
+        }
+        assertTrue(connectionService.resourcesClosed());
     }
 
     @Test
@@ -777,7 +815,7 @@ class TestSnowflakeTableCacheLookupService {
         initialLoad("HEAP", true);
         final CountDownLatch entered = new CountDownLatch(1);
         final CountDownLatch release = new CountDownLatch(1);
-        connectionService.enqueueFailure(sourceFailure("changedMarker"));
+        connectionService.enqueueFailure(sourceFailure("changedMarker"), () -> connectionService.sourceSignature("replacement"));
         connectionService.enqueueBlocked(full(SECOND_ID, "replacement", data("INSERT", "new", "validated", "EU")), entered, release);
         try (final ExecutorService executor = Executors.newSingleThreadExecutor()) {
             final Future<RefreshResult> refresh = executor.submit(() -> service.refresh());

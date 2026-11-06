@@ -13,24 +13,34 @@
  */
 package com.snowflake.nifihub.data.snowflaketablecache;
 
+import org.apache.nifi.serialization.SimpleRecordSchema;
+import org.apache.nifi.serialization.record.MapRecord;
+import org.apache.nifi.serialization.record.Record;
+import org.apache.nifi.serialization.record.RecordField;
+import org.apache.nifi.serialization.record.RecordFieldType;
+import org.apache.nifi.serialization.record.RecordSchema;
+
 import java.io.ByteArrayOutputStream;
 import java.nio.ByteBuffer;
+import java.nio.charset.CharacterCodingException;
+import java.nio.charset.CodingErrorAction;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Set;
 
 /**
- * Length-prefixed encoding for a row's values.
+ * Length-prefixed encoding and detached records for the cache's string/null values.
  *
  * <p>Format: {@code [int count]} then, per value, {@code [int length][utf8 bytes]} with a length of
  * {@code -1} meaning null.
  *
- * <p>Length-prefixed rather than delimiter-separated on purpose: a delimiter can appear inside a
- * value, and silently splitting a routing destination in half is the kind of bug that surfaces as
- * mysterious mis-routing months later.
- *
- * <p>Field <em>names</em> are not stored per row — they come from the schema held by the store, so
- * they are not repeated 40 million times.
+ * <p>Field names are stored once per schema, not per encoded row.
  */
 final class RowCodec {
 
@@ -53,20 +63,108 @@ final class RowCodec {
     }
 
     static List<String> decode(final byte[] encoded) {
+        return decode(encoded, -1);
+    }
+
+    static List<String> decode(final byte[] encoded, final int expectedCount) {
         final ByteBuffer buffer = ByteBuffer.wrap(encoded);
+        if (buffer.remaining() < Integer.BYTES) {
+            throw new IllegalArgumentException("Row value count is missing");
+        }
         final int count = buffer.getInt();
+        if (expectedCount >= 0 && count != expectedCount) {
+            throw new IllegalArgumentException("Row value count does not match expected count");
+        }
+        if (count < 0 || count > buffer.remaining() / Integer.BYTES) {
+            throw new IllegalArgumentException("Row value count is invalid");
+        }
         final List<String> values = new ArrayList<>(count);
-        for (int i = 0; i < count; i++) {
+        for (int index = 0; index < count; index++) {
+            if (buffer.remaining() < Integer.BYTES) {
+                throw new IllegalArgumentException("Row value length is missing");
+            }
             final int length = buffer.getInt();
-            if (length < 0) {
+            if (length == -1) {
                 values.add(null);
             } else {
-                final byte[] bytes = new byte[length];
-                buffer.get(bytes);
-                values.add(new String(bytes, StandardCharsets.UTF_8));
+                if (length < 0 || length > buffer.remaining()) {
+                    throw new IllegalArgumentException("Row value length is invalid");
+                }
+                final ByteBuffer bytes = buffer.slice();
+                bytes.limit(length);
+                try {
+                    values.add(StandardCharsets.UTF_8.newDecoder()
+                            .onMalformedInput(CodingErrorAction.REPORT)
+                            .onUnmappableCharacter(CodingErrorAction.REPORT)
+                            .decode(bytes).toString());
+                } catch (final CharacterCodingException e) {
+                    throw new IllegalArgumentException("Row value is not valid UTF-8", e);
+                }
+                buffer.position(buffer.position() + length);
             }
         }
+        if (buffer.hasRemaining()) {
+            throw new IllegalArgumentException("Row has trailing bytes");
+        }
         return values;
+    }
+
+    static List<String> fieldNames(final RecordSchema schema) {
+        Objects.requireNonNull(schema, "Schema is required");
+        for (final RecordField field : schema.getFields()) {
+            if (!RecordFieldType.STRING.getDataType().equals(field.getDataType())) {
+                throw new IllegalArgumentException("Cache schema fields must be strings");
+            }
+        }
+        return fieldNames(schema.getFieldNames());
+    }
+
+    static List<String> fieldNames(final List<String> names) {
+        if (names.isEmpty()) {
+            throw new IllegalArgumentException("Cache schema must not be empty");
+        }
+        final Set<String> unique = new HashSet<>();
+        for (final String name : names) {
+            if (name == null || name.isEmpty() || !unique.add(name)) {
+                throw new IllegalArgumentException("Cache field names must be nonempty and unique");
+            }
+        }
+        return List.copyOf(names);
+    }
+
+    static RecordSchema schema(final List<String> fieldNames) {
+        final List<RecordField> fields = new ArrayList<>(fieldNames.size());
+        for (final String name : fieldNames) {
+            fields.add(new RecordField(name, RecordFieldType.STRING.getDataType()));
+        }
+        return new SimpleRecordSchema(fields);
+    }
+
+    static List<String> values(final List<String> fieldNames, final Record record) {
+        if (record == null || !fieldNames.equals(record.getSchema().getFieldNames())) {
+            throw new IllegalArgumentException("Row schema does not match cache schema");
+        }
+        final List<String> values = new ArrayList<>(fieldNames.size());
+        for (final String name : fieldNames) {
+            final Object value = record.getValue(name);
+            if (value != null && !(value instanceof String)) {
+                throw new IllegalArgumentException("Cache values must be strings or null");
+            }
+            values.add((String) value);
+        }
+        // Unlike List.copyOf, this preserves SQL null values.
+        return Collections.unmodifiableList(values);
+    }
+
+    static Record record(final List<String> fieldNames, final List<String> values) {
+        if (fieldNames.size() != values.size()) {
+            throw new IllegalArgumentException("Row value count does not match cache schema");
+        }
+        final Map<String, Object> asMap = new HashMap<>(fieldNames.size());
+        for (int index = 0; index < fieldNames.size(); index++) {
+            asMap.put(fieldNames.get(index), values.get(index));
+        }
+        return new MapRecord(schema(fieldNames), asMap);
     }
 
     private static void writeInt(final ByteArrayOutputStream out, final int value) {

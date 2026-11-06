@@ -18,6 +18,7 @@ import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
+import java.util.ArrayList;
 import java.util.List;
 
 /** Resolves qualified source variants without treating arbitrary SQL failures as full-only capability. */
@@ -34,6 +35,7 @@ record SourceMetadata(String signature, boolean incremental) {
     }
 
     static SourceMetadata read(final Connection connection, final List<String> source, final boolean requested, final CacheCheckpoint previous) throws SQLException {
+        validateSession(connection);
         final String sql = """
                 SELECT TABLE_TYPE, IS_TEMPORARY, IS_ICEBERG, IS_DYNAMIC, IS_HYBRID, RETENTION_TIME,
                        IFF(CREATED IS NOT NULL AND LAST_DDL IS NOT NULL, %s, NULL)
@@ -78,17 +80,18 @@ record SourceMetadata(String signature, boolean incremental) {
             if (iceberg) {
                 throw invalid("Dynamic Iceberg tables are not yet qualified");
             }
-            final String mode = property(connection, source, "DYNAMIC", "refresh_mode");
+            final String mode = properties(connection, source, "DYNAMIC", List.of("refresh_mode")).getFirst();
             if (!"FULL".equals(mode) && !"INCREMENTAL".equals(mode)) {
                 throw invalid("Dynamic table refresh mode %s is not qualified".formatted(mode));
             }
             supportedIncremental = "INCREMENTAL".equals(mode);
         } else if (iceberg) {
-            final String catalog = property(connection, source, "ICEBERG", "catalog_name");
+            final List<String> properties = properties(connection, source, "ICEBERG", List.of("catalog_name", "iceberg_table_format_version"));
+            final String catalog = properties.getFirst();
             if (!"SNOWFLAKE".equals(catalog)) {
                 throw invalid("Externally managed Iceberg tables are not yet qualified");
             }
-            final String version = property(connection, source, "ICEBERG", "iceberg_table_format_version");
+            final String version = properties.get(1);
             if (!"2".equals(version) && !"3".equals(version)) {
                 throw invalid("Iceberg version %s is not qualified".formatted(version));
             }
@@ -102,6 +105,26 @@ record SourceMetadata(String signature, boolean incremental) {
         return new SourceMetadata(signature, requested && supportedIncremental);
     }
 
+    private static void validateSession(final Connection connection) throws SQLException {
+        // Metadata equality is case-sensitive even when quoted SQL identifiers are folded to uppercase.
+        // Inspect the borrowed session instead of changing a setting owned by the connection pool.
+        try (Statement statement = connection.createStatement();
+                ResultSet rows = statement.executeQuery("SHOW PARAMETERS LIKE 'QUOTED_IDENTIFIERS_IGNORE_CASE' IN SESSION")) {
+            int matches = 0;
+            while (rows.next()) {
+                if ("QUOTED_IDENTIFIERS_IGNORE_CASE".equals(rows.getString("key"))) {
+                    if (!"false".equalsIgnoreCase(rows.getString("value"))) {
+                        throw new SQLException("Cache refresh requires QUOTED_IDENTIFIERS_IGNORE_CASE=FALSE");
+                    }
+                    matches++;
+                }
+            }
+            if (matches != 1) {
+                throw new SQLException("Cannot verify QUOTED_IDENTIFIERS_IGNORE_CASE for the borrowed session");
+            }
+        }
+    }
+
     private static boolean flag(final String value) throws SQLException {
         if (!"YES".equals(value) && !"NO".equals(value)) {
             throw invalid("Source type metadata is incomplete");
@@ -109,26 +132,28 @@ record SourceMetadata(String signature, boolean incremental) {
         return "YES".equals(value);
     }
 
-    private static String property(final Connection connection, final List<String> source, final String type, final String property) throws SQLException {
+    private static List<String> properties(final Connection connection, final List<String> source, final String type, final List<String> names) throws SQLException {
         // The exact name sorts before every longer name sharing its prefix; LIMIT 1 avoids
         // SHOW's result limit and STARTS WITH treats percent/underscore characters literally.
         final String sql = "SHOW %s TABLES IN SCHEMA %s.%s STARTS WITH %s LIMIT 1".formatted(type,
                 SnowflakeIdentifier.quote(source.get(0)), SnowflakeIdentifier.quote(source.get(1)),
                 "'%s'".formatted(source.get(2).replace("\\", "\\\\").replace("'", "''")));
         try (Statement statement = connection.createStatement(); ResultSet rows = statement.executeQuery(sql)) {
-            String value = null;
+            final List<String> values = new ArrayList<>(names.size());
             int count = 0;
             while (rows.next()) {
                 if (source.get(0).equals(rows.getString("database_name")) && source.get(1).equals(rows.getString("schema_name"))
                         && source.get(2).equals(rows.getString("name"))) {
-                    value = rows.getString(property);
+                    for (final String name : names) {
+                        values.add(rows.getString(name));
+                    }
                     count++;
                 }
             }
-            if (count != 1 || value == null) {
+            if (count != 1 || values.contains(null)) {
                 throw invalid("Source capability metadata is missing or ambiguous");
             }
-            return value;
+            return values;
         }
     }
 

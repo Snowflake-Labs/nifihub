@@ -13,11 +13,7 @@
  */
 package com.snowflake.nifihub.data.snowflaketablecache;
 
-import org.apache.nifi.serialization.SimpleRecordSchema;
-import org.apache.nifi.serialization.record.MapRecord;
 import org.apache.nifi.serialization.record.Record;
-import org.apache.nifi.serialization.record.RecordField;
-import org.apache.nifi.serialization.record.RecordFieldType;
 import org.apache.nifi.serialization.record.RecordSchema;
 import org.rocksdb.CompressionType;
 import org.rocksdb.Options;
@@ -30,7 +26,6 @@ import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
-import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.channels.FileLock;
 import java.nio.channels.OverlappingFileLockException;
@@ -38,10 +33,8 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
-import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Comparator;
-import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
@@ -56,21 +49,12 @@ import java.util.stream.Stream;
  *
  * <p>Footprint depends on keys, values, compression and RocksDB's native buffers.
  *
- * <h2>Why generation directories</h2>
- * A full load must <em>replace</em> contents, not merge — otherwise a row deleted upstream lingers
- * forever, which for an entitlement table means a revoked key keeps working. Doing that atomically
- * inside one database would need either a whole-keyspace delete range in the same write batch as all
- * puts (potentially too large to hold in memory) or a non-atomic delete-then-load window during
- * which readers see an empty cache.
- *
- * <p>So each full load writes a fresh {@code gen-<n>} directory and commit swaps the open handle to
+ * <p>Each full load writes a fresh {@code gen-<n>} directory and commit swaps the open handle to
  * it under a write lock, while lookups hold a read lock — no reader can be using a handle that is
- * being closed. Transient cost is 2× disk for one generation.
+ * being closed. Both generations remain on disk until publication completes.
  *
  * <p>Incremental changes, by contrast, are applied <b>in place</b> to the live generation as a single
- * RocksDB {@code WriteBatch}, which is atomic. Generations therefore are not immutable snapshots —
- * which costs nothing for a future stage-snapshot feature, since RocksDB {@code Checkpoint} is
- * designed to snapshot a live database.
+ * RocksDB {@code WriteBatch}, which is atomic.
  *
  * <p>On open, an existing newest generation is adopted, which is what makes a restart warm rather
  * than a rebuild.
@@ -171,12 +155,8 @@ public class RocksDbTableCacheStore implements TableCacheStore {
             if (current == null) {
                 throw new IllegalStateException("Cannot apply changes before an initial load");
             }
-            // Positional encoding means an incremental batch must describe the same fields, in the
-            // same order, as the load that created this generation. Otherwise decoding would silently
-            // shift values between columns.
-            if (!current.fieldNames.equals(schema.getFieldNames())) {
-                throw new IllegalStateException("Schema changed since the last full load: stored "
-                        + current.fieldNames + " but delta carries " + schema.getFieldNames());
+            if (!current.fieldNames.equals(RowCodec.fieldNames(schema))) {
+                throw new IllegalStateException("Schema changed since the last full load");
             }
             current.applyChanges(upserts, deletes, checkpoint);
         } finally {
@@ -228,7 +208,7 @@ public class RocksDbTableCacheStore implements TableCacheStore {
     public RecordSchema schema() {
         lock.readLock().lock();
         try {
-            return current == null ? null : current.schema;
+            return current == null ? null : RowCodec.schema(current.fieldNames);
         } finally {
             lock.readLock().unlock();
         }
@@ -239,18 +219,8 @@ public class RocksDbTableCacheStore implements TableCacheStore {
         lock.readLock().lock();
         try {
             return current == null
-                    ? "rocksdb (empty) at " + baseDirectory
-                    : "rocksdb gen-" + current.number + " at " + baseDirectory;
-        } finally {
-            lock.readLock().unlock();
-        }
-    }
-
-    /** Bytes on disk for the live generation. Useful for staying inside a storage budget. */
-    public long diskBytes() {
-        lock.readLock().lock();
-        try {
-            return current == null ? 0L : directorySize(current.path);
+                    ? "rocksdb (empty) at %s".formatted(baseDirectory)
+                    : "rocksdb gen-%s at %s".formatted(current.number, baseDirectory);
         } finally {
             lock.readLock().unlock();
         }
@@ -277,8 +247,6 @@ public class RocksDbTableCacheStore implements TableCacheStore {
         }
     }
 
-    // ---------- full load ----------
-
     private final class RocksBulkLoad implements BulkLoad {
 
         private static final int BATCH_ROWS = 100_000;
@@ -299,7 +267,7 @@ public class RocksDbTableCacheStore implements TableCacheStore {
         RocksBulkLoad(final long number, final RecordSchema schema) {
             this.number = number;
             this.path = generationPath(number);
-            this.fieldNames = schema.getFieldNames();
+            this.fieldNames = RowCodec.fieldNames(schema);
             try {
                 Files.createDirectory(path);
                 options = new Options()
@@ -312,7 +280,7 @@ public class RocksDbTableCacheStore implements TableCacheStore {
                 batch = new WriteBatch();
             } catch (final IOException | RocksDBException e) {
                 closeQuietly();
-                throw new IllegalStateException("Failed to open RocksDB generation at " + path, e);
+                throw new IllegalStateException("Failed to open RocksDB generation at %s".formatted(path), e);
             }
         }
 
@@ -324,18 +292,19 @@ public class RocksDbTableCacheStore implements TableCacheStore {
             if (key == null || value == null) {
                 throw new IllegalArgumentException("Source keys and records must be non-null");
             }
+            final byte[] encodedValue = RowCodec.encode(RowCodec.values(fieldNames, value));
             try {
                 final byte[] encodedKey = dataKey(key);
                 if (!pendingKeys.add(key) || db.get(encodedKey) != null) {
                     throw new IllegalArgumentException("Source keys must be unique");
                 }
-                batch.put(encodedKey, encode(fieldNames, value));
+                batch.put(encodedKey, encodedValue);
                 staged++;
                 if (staged % BATCH_ROWS == 0) {
                     flush();
                 }
             } catch (final RocksDBException e) {
-                throw new IllegalStateException("Failed to stage row for key " + key, e);
+                throw new IllegalStateException("Failed to stage cache row", e);
             }
         }
 
@@ -420,15 +389,12 @@ public class RocksDbTableCacheStore implements TableCacheStore {
         }
     }
 
-    // ---------- a live generation ----------
-
     private static final class Generation {
 
         private final Path path;
         private final long number;
         private final Options options;
         private final RocksDB db;
-        private final RecordSchema schema;
         private final List<String> fieldNames;
 
         private volatile long rowCount;
@@ -441,14 +407,12 @@ public class RocksDbTableCacheStore implements TableCacheStore {
             this.number = number;
             this.options = options;
             this.db = db;
-            this.fieldNames = fieldNames;
+            this.fieldNames = RowCodec.fieldNames(fieldNames);
+            if (rowCount < 0) {
+                throw new IllegalArgumentException("Cache row count must not be negative");
+            }
             this.rowCount = rowCount;
             this.checkpoint = checkpoint;
-            final List<RecordField> fields = new ArrayList<>(fieldNames.size());
-            for (final String name : fieldNames) {
-                fields.add(new RecordField(name, RecordFieldType.STRING.getDataType()));
-            }
-            this.schema = new SimpleRecordSchema(fields);
         }
 
         static Generation open(final Path path, final long number) throws RocksDBException {
@@ -489,7 +453,7 @@ public class RocksDbTableCacheStore implements TableCacheStore {
                     if (db.get(key) == null) {
                         delta++;
                     }
-                    batch.put(key, encode(fieldNames, entry.getValue()));
+                    batch.put(key, RowCodec.encode(RowCodec.values(fieldNames, entry.getValue())));
                 }
                 for (final String deleteKey : deletes) {
                     if (upserts.containsKey(deleteKey)) {
@@ -510,7 +474,7 @@ public class RocksDbTableCacheStore implements TableCacheStore {
                 rowCount = newCount;
                 checkpoint = newCheckpoint;
             } catch (final RocksDBException e) {
-                throw new IllegalStateException("Failed to apply changes to generation " + number, e);
+                throw new IllegalStateException("Failed to apply changes to generation %s".formatted(number), e);
             }
         }
 
@@ -520,14 +484,9 @@ public class RocksDbTableCacheStore implements TableCacheStore {
                 if (encoded == null) {
                     return Optional.empty();
                 }
-                final List<String> values = RowCodec.decode(encoded);
-                final Map<String, Object> asMap = new HashMap<>(fieldNames.size());
-                for (int i = 0; i < fieldNames.size() && i < values.size(); i++) {
-                    asMap.put(fieldNames.get(i), values.get(i));
-                }
-                return Optional.of(new MapRecord(schema, asMap));
-            } catch (final RocksDBException e) {
-                throw new IllegalStateException("RocksDB lookup failed for key " + key, e);
+                return Optional.of(RowCodec.record(fieldNames, RowCodec.decode(encoded, fieldNames.size())));
+            } catch (final RocksDBException | IllegalArgumentException e) {
+                throw new IllegalStateException("RocksDB lookup failed", e);
             }
         }
 
@@ -545,49 +504,18 @@ public class RocksDbTableCacheStore implements TableCacheStore {
     }
 
     private static CacheCheckpoint decodeCheckpoint(final byte[] encoded) {
-        // Bound lengths before RowCodec allocates; reject truncated or noncanonical metadata.
-        final ByteBuffer buffer = ByteBuffer.wrap(encoded);
-        if (buffer.remaining() < Integer.BYTES || buffer.getInt() != 2) {
-            throw new IllegalArgumentException("Checkpoint must contain exactly two strings");
-        }
-        for (int index = 0; index < 2; index++) {
-            if (buffer.remaining() < Integer.BYTES) {
-                throw new IllegalArgumentException("Checkpoint string length is missing");
-            }
-            final int length = buffer.getInt();
-            if (length <= 0 || length > buffer.remaining()) {
-                throw new IllegalArgumentException("Checkpoint string length is invalid");
-            }
-            buffer.position(buffer.position() + length);
-        }
-        if (buffer.hasRemaining()) {
-            throw new IllegalArgumentException("Checkpoint has trailing bytes");
-        }
-        final List<String> values = RowCodec.decode(encoded);
-        final CacheCheckpoint checkpoint = new CacheCheckpoint(values.get(0), values.get(1));
-        if (!Arrays.equals(encoded, encodeCheckpoint(checkpoint))) {
-            throw new IllegalArgumentException("Checkpoint encoding is invalid");
-        }
-        return checkpoint;
+        final List<String> values = RowCodec.decode(encoded, 2);
+        return new CacheCheckpoint(values.get(0), values.get(1));
     }
 
     private static byte[] dataKey(final String key) {
         // Separate arbitrary user keys from the metadata namespace, including embedded NUL bytes.
-        return ("\u0001" + key).getBytes(StandardCharsets.UTF_8);
+        Objects.requireNonNull(key, "Cache key must be non-null");
+        return "\u0001%s".formatted(key).getBytes(StandardCharsets.UTF_8);
     }
-
-    private static byte[] encode(final List<String> fieldNames, final Record value) {
-        final List<String> values = new ArrayList<>(fieldNames.size());
-        for (final String fieldName : fieldNames) {
-            values.add(value == null ? null : value.getAsString(fieldName));
-        }
-        return RowCodec.encode(values);
-    }
-
-    // ---------- filesystem helpers ----------
 
     private Path generationPath(final long number) {
-        return baseDirectory.resolve(GENERATION_PREFIX + number);
+        return baseDirectory.resolve("%s%s".formatted(GENERATION_PREFIX, number));
     }
 
     private List<Long> generationNumbers() {
@@ -607,20 +535,6 @@ public class RocksDbTableCacheStore implements TableCacheStore {
                     .toList();
         } catch (final IOException e) {
             throw new UncheckedIOException(e);
-        }
-    }
-
-    private static long directorySize(final Path path) {
-        try (Stream<Path> files = Files.walk(path)) {
-            return files.filter(Files::isRegularFile).mapToLong(f -> {
-                try {
-                    return Files.size(f);
-                } catch (final IOException e) {
-                    return 0L;
-                }
-            }).sum();
-        } catch (final IOException e) {
-            return 0L;
         }
     }
 

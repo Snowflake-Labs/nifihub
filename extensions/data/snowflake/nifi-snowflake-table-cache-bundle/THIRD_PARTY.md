@@ -13,7 +13,7 @@ It contains 15 native binaries and no embedded license/notice files. This bundle
 supplies the notices at the NAR's `META-INF/NOTICE`, `META-INF/LICENSE` and
 `META-INF/licenses/`. Do not distribute an extracted JNI JAR without those notices.
 
-NiFi APIs and SLF4J are provided by the runtime, not bundled. H2, Snowflake JDBC,
+NiFi APIs and SLF4J are provided by the runtime, not bundled. Snowflake JDBC,
 TOML and test frameworks are test-only. Their licenses are not claimed to be
 covered by this runtime inventory because their binaries are not distributed.
 

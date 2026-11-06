@@ -37,7 +37,9 @@ import java.nio.file.Path;
 import java.util.AbstractMap;
 import java.util.AbstractSet;
 import java.util.Arrays;
+import java.util.HashMap;
 import java.util.Iterator;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -62,6 +64,90 @@ class TestCacheCheckpointStores {
 
     @TempDir
     Path storageDirectory;
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void bulkLoadDetachesInputRecord(final boolean embedded) throws Exception {
+        try (final TableCacheStore store = store(embedded)) {
+            final RecordSchema inputSchema = schema("VALUE");
+            final Record input = record(inputSchema, "original");
+            try (final TableCacheStore.BulkLoad load = store.beginBulkLoad(inputSchema)) {
+                load.put("old", input);
+                input.setValue("VALUE", "changed before commit");
+                load.commit(INITIAL);
+            }
+            input.setValue("VALUE", "changed after commit");
+            assertInitial(store);
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void bulkLoadDetachesInputSchema(final boolean embedded) throws Exception {
+        try (final TableCacheStore store = store(embedded)) {
+            final RecordSchema inputSchema = schema("VALUE");
+            try (final TableCacheStore.BulkLoad load = store.beginBulkLoad(inputSchema)) {
+                inputSchema.renameField("VALUE", "CHANGED");
+                load.put("old", record(SCHEMA, "original"));
+                load.commit(INITIAL);
+            }
+            assertInitial(store);
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void deltaDetachesInputRecordAndSchema(final boolean embedded) throws Exception {
+        try (final TableCacheStore store = store(embedded)) {
+            loadInitial(store);
+            final RecordSchema inputSchema = schema("VALUE");
+            final Record input = record(inputSchema, "updated");
+            store.applyChanges(inputSchema, Map.of("old", input), Set.of(), NEXT);
+            input.setValue("VALUE", "changed");
+            inputSchema.removeField("VALUE");
+            assertEquals(NEXT, store.checkpoint());
+            assertEquals(List.of("VALUE"), store.schema().getFieldNames());
+            assertEquals("updated", store.get("old").orElseThrow().getAsString("VALUE"));
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void lookupDetachesReturnedRecord(final boolean embedded) throws Exception {
+        try (final TableCacheStore store = store(embedded)) {
+            loadInitial(store);
+            store.get("old").orElseThrow().setValue("VALUE", "changed");
+            assertInitial(store);
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void lookupDetachesReturnedSchema(final boolean embedded) throws Exception {
+        try (final TableCacheStore store = store(embedded)) {
+            final RecordSchema inputSchema = schema("VALUE");
+            try (final TableCacheStore.BulkLoad load = store.beginBulkLoad(inputSchema)) {
+                load.put("old", record(inputSchema, "original"));
+                load.commit(INITIAL);
+            }
+            store.get("old").orElseThrow().getSchema().removeField("VALUE");
+            assertInitial(store);
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void schemaAccessorDetachesReturnedSchema(final boolean embedded) throws Exception {
+        try (final TableCacheStore store = store(embedded)) {
+            final RecordSchema inputSchema = schema("VALUE");
+            try (final TableCacheStore.BulkLoad load = store.beginBulkLoad(inputSchema)) {
+                load.put("old", record(inputSchema, "original"));
+                load.commit(INITIAL);
+            }
+            store.schema().renameField("VALUE", "CHANGED");
+            assertInitial(store);
+        }
+    }
 
     @Test
     void acceptsHexadecimalQueryShapeWithoutRestrictingUuidVersion() {
@@ -403,6 +489,153 @@ class TestCacheCheckpointStores {
                 invalidUtf8).map(encoded -> Arguments.of((Object) encoded));
     }
 
+    @ParameterizedTest
+    @MethodSource("invalidSchemaEncodings")
+    void invalidSchemaFailsOpenWithoutDeletingCommittedData(final byte[] encoded) throws Exception {
+        createPersistedStore();
+        final byte[] key = metadataKey("schema");
+        try (final Options options = new Options();
+             final RocksDB database = RocksDB.open(options, generationPath().toString())) {
+            database.put(key, encoded);
+        }
+        assertRejectedDirectoryPreserved();
+        try (final Options options = new Options();
+             final RocksDB database = RocksDB.open(options, generationPath().toString())) {
+            assertArrayEquals(encoded, database.get(key));
+            database.put(key, RowCodec.encode(List.of("VALUE")));
+        }
+        try (final TableCacheStore reopened = store(true)) {
+            assertInitial(reopened);
+        }
+    }
+
+    static Stream<Arguments> invalidSchemaEncodings() {
+        return Stream.concat(TestRowCodec.invalidEncodings(), Stream.of(
+                RowCodec.encode(List.of()),
+                RowCodec.encode(Arrays.asList((String) null)),
+                RowCodec.encode(List.of("")),
+                RowCodec.encode(List.of("VALUE", "VALUE"))).map(encoded -> Arguments.of((Object) encoded)));
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"-1", "-9223372036854775808", "9223372036854775808", "not-a-count", ""})
+    void invalidCountFailsOpenWithoutDeletingCommittedData(final String count) throws Exception {
+        createPersistedStore();
+        final byte[] key = metadataKey("count");
+        final byte[] encoded = count.getBytes(StandardCharsets.UTF_8);
+        try (final Options options = new Options();
+             final RocksDB database = RocksDB.open(options, generationPath().toString())) {
+            database.put(key, encoded);
+        }
+        assertRejectedDirectoryPreserved();
+        try (final Options options = new Options();
+             final RocksDB database = RocksDB.open(options, generationPath().toString())) {
+            assertArrayEquals(encoded, database.get(key));
+            database.put(key, "1".getBytes(StandardCharsets.UTF_8));
+        }
+        try (final TableCacheStore reopened = store(true)) {
+            assertInitial(reopened);
+        }
+    }
+
+    @ParameterizedTest
+    @MethodSource("invalidRowEncodings")
+    void corruptRowFailsLookupWithoutChangingCommittedPair(final byte[] encoded) throws Exception {
+        createPersistedStore();
+        final String lookupKey = "private-lookup-key";
+        final byte[] key = ("\u0001%s".formatted(lookupKey)).getBytes(StandardCharsets.UTF_8);
+        try (final Options options = new Options();
+             final RocksDB database = RocksDB.open(options, generationPath().toString())) {
+            database.put(key, encoded);
+        }
+        try (final TableCacheStore reopened = store(true)) {
+            final IllegalStateException failure = assertThrows(IllegalStateException.class, () -> reopened.get(lookupKey));
+            assertFalse(failure.toString().contains(lookupKey));
+            assertInitial(reopened);
+        }
+        try (final Options options = new Options();
+             final RocksDB database = RocksDB.open(options, generationPath().toString())) {
+            assertArrayEquals(encoded, database.get(key));
+        }
+    }
+
+    static Stream<Arguments> invalidRowEncodings() {
+        return Stream.concat(TestRowCodec.invalidEncodings(), Stream.of(
+                RowCodec.encode(List.of()),
+                RowCodec.encode(List.of("too", "many"))).map(encoded -> Arguments.of((Object) encoded)));
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void mismatchedRowSchemaCannotPublishPartialLoadOrDelta(final boolean embedded) throws Exception {
+        try (final TableCacheStore store = store(embedded)) {
+            loadInitial(store);
+            final Record invalid = record(REPLACEMENT_SCHEMA, "wrong field");
+            try (final TableCacheStore.BulkLoad load = store.beginBulkLoad(SCHEMA)) {
+                load.put("new", record(SCHEMA, "staged"));
+                assertThrows(IllegalArgumentException.class, () -> load.put("invalid", invalid));
+            }
+            assertInitial(store);
+            final Map<String, Record> upserts = new LinkedHashMap<>();
+            upserts.put("new", record(SCHEMA, "staged"));
+            upserts.put("invalid", invalid);
+            assertThrows(IllegalArgumentException.class, () -> store.applyChanges(SCHEMA, upserts, Set.of("old"), NEXT));
+            assertInitial(store);
+            assertTrue(store.get("new").isEmpty());
+        }
+        if (embedded) {
+            try (final TableCacheStore reopened = store(true)) {
+                assertInitial(reopened);
+            }
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void nullAndEmptyValuesRemainDistinctAndDetached(final boolean embedded) throws Exception {
+        final RecordSchema schema = new SimpleRecordSchema(List.of(
+                new RecordField("NULL", RecordFieldType.STRING.getDataType()),
+                new RecordField("EMPTY", RecordFieldType.STRING.getDataType())));
+        final Map<String, Object> values = new HashMap<>();
+        values.put("NULL", null);
+        values.put("EMPTY", "");
+        try (final TableCacheStore store = store(embedded)) {
+            try (final TableCacheStore.BulkLoad load = store.beginBulkLoad(schema)) {
+                load.put("key", new MapRecord(schema, values));
+                load.commit(INITIAL);
+            }
+            values.put("NULL", "changed");
+            final Record result = store.get("key").orElseThrow();
+            assertNull(result.getValue("NULL"));
+            assertEquals("", result.getValue("EMPTY"));
+            result.setValue("EMPTY", "changed");
+            assertEquals("", store.get("key").orElseThrow().getValue("EMPTY"));
+        }
+        if (embedded) {
+            try (final TableCacheStore reopened = store(true)) {
+                assertNull(reopened.get("key").orElseThrow().getValue("NULL"));
+                assertEquals("", reopened.get("key").orElseThrow().getValue("EMPTY"));
+            }
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void invalidSchemaOrValueCannotChangeCommittedPair(final boolean embedded) throws Exception {
+        try (final TableCacheStore store = store(embedded)) {
+            loadInitial(store);
+            assertThrows(IllegalArgumentException.class, () -> store.beginBulkLoad(new SimpleRecordSchema(List.of())));
+            final RecordSchema numericSchema = new SimpleRecordSchema(List.of(new RecordField("VALUE", RecordFieldType.INT.getDataType())));
+            assertThrows(IllegalArgumentException.class, () -> store.beginBulkLoad(numericSchema));
+            final Record invalid = new MapRecord(SCHEMA, Map.of("VALUE", new StringBuilder("mutable")));
+            try (final TableCacheStore.BulkLoad load = store.beginBulkLoad(SCHEMA)) {
+                assertThrows(IllegalArgumentException.class, () -> load.put("invalid", invalid));
+            }
+            assertThrows(IllegalArgumentException.class, () -> store.applyChanges(SCHEMA, Map.of("invalid", invalid), Set.of("old"), NEXT));
+            assertInitial(store);
+        }
+    }
+
     @Test
     void defaultFormatIdentityIsV2AndOldIdentityIsPreservedOnRejection() throws Exception {
         createPersistedStore();
@@ -412,6 +645,10 @@ class TestCacheCheckpointStores {
         Files.write(identityPath, oldIdentity);
         assertRejectedDirectoryPreserved();
         assertArrayEquals(oldIdentity, Files.readAllBytes(identityPath));
+        Files.write(identityPath, RowCodec.encode(List.of("table-cache-v2", "standalone")));
+        try (final TableCacheStore reopened = store(true)) {
+            assertInitial(reopened);
+        }
     }
 
     @Test
@@ -421,6 +658,10 @@ class TestCacheCheckpointStores {
         Files.delete(identityPath);
         assertRejectedDirectoryPreserved();
         assertFalse(Files.exists(identityPath));
+        Files.write(identityPath, RowCodec.encode(List.of("table-cache-v2", "standalone")));
+        try (final TableCacheStore reopened = store(true)) {
+            assertInitial(reopened);
+        }
     }
 
     @Test
@@ -521,7 +762,7 @@ class TestCacheCheckpointStores {
     }
 
     private static Record record(final RecordSchema schema, final String value) {
-        return new MapRecord(schema, Map.of(schema.getFieldNames().getFirst(), value));
+        return new MapRecord(schema, new HashMap<>(Map.of(schema.getFieldNames().getFirst(), value)));
     }
 
     private static void loadInitial(final TableCacheStore store) {

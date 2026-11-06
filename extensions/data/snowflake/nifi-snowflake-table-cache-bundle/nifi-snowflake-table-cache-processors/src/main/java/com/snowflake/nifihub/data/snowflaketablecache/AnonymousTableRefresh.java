@@ -116,41 +116,73 @@ final class AnonymousTableRefresh {
                 FROM %s.TABLES
                 WHERE TABLE_SCHEMA = :source_schema AND TABLE_NAME = :source_name;
                 """.formatted(SourceMetadata.SIGNATURE, informationSchema);
-        // The prefix is chosen per request and checked against actual source columns before reading.
-        // Payload aliases therefore cannot be confused with control columns after RESULT_SCAN.
-        final String responseSql = """
-                SELECT 'CONTROL' AS %sK, ?::VARCHAR AS %sQ, ?::VARCHAR AS %sS,
-                       ?::VARCHAR AS %sM, (SELECT COUNT(*) FROM TABLE(RESULT_SCAN(?))) AS %sN, d.*
-                FROM (SELECT 1) seed LEFT JOIN TABLE(RESULT_SCAN(?)) d ON FALSE
-                UNION ALL
-                SELECT 'DATA', NULL::VARCHAR, NULL::VARCHAR, NULL::VARCHAR, NULL::NUMBER, d.*
-                FROM TABLE(RESULT_SCAN(?)) d
-                """.formatted(prefix, prefix, prefix, prefix, prefix);
-        // A full-only source needs no resumable offset. Return one query directly: hybrid query
-        // results are not always available to RESULT_SCAN. The marker is diagnostic, not a snapshot ID.
-        final String fullOnlySql = """
-                SELECT IFF(seed.marker IS NULL, 'DATA', 'CONTROL') AS %sK,
-                       IFF(seed.marker IS NULL, NULL, ?::VARCHAR) AS %sQ,
-                       IFF(seed.marker IS NULL, NULL, ?::VARCHAR) AS %sS,
-                       IFF(seed.marker IS NULL, NULL, 'FULL'::VARCHAR) AS %sM,
-                       IFF(seed.marker IS NULL, NULL, COUNT(d.%s) OVER ()) AS %sN,
-                       d.*
-                FROM (%s) d FULL OUTER JOIN (SELECT 1 AS marker) seed ON FALSE
-                """.formatted(prefix, prefix, prefix, prefix, SnowflakeIdentifier.quote(prefix), prefix, dataSql);
+        final String declarations;
+        final String readSql;
+        final String responseSql;
+        if (fullOnly) {
+            // Full-only sources return one query directly, without RESULT_SCAN. Their marker is
+            // diagnostic rather than a resumable snapshot ID.
+            final String fullOnlySql = """
+                    SELECT IFF(seed.marker IS NULL, 'DATA', 'CONTROL') AS %sK,
+                           IFF(seed.marker IS NULL, NULL, ?::VARCHAR) AS %sQ,
+                           IFF(seed.marker IS NULL, NULL, ?::VARCHAR) AS %sS,
+                           IFF(seed.marker IS NULL, NULL, 'FULL'::VARCHAR) AS %sM,
+                           IFF(seed.marker IS NULL, NULL, COUNT(d.%s) OVER ()) AS %sN,
+                           d.*
+                    FROM (%s) d FULL OUTER JOIN (SELECT 1 AS marker) seed ON FALSE
+                    """.formatted(prefix, prefix, prefix, prefix, SnowflakeIdentifier.quote(prefix), prefix, dataSql);
+            declarations = """
+                    marker_time TIMESTAMP_LTZ;
+                    full_only_sql VARCHAR DEFAULT %s;
+                    """.formatted(literal(fullOnlySql));
+            readSql = """
+                    SELECT CURRENT_TIMESTAMP() INTO :marker_time;
+                    boundary_id := SQLID;
+                    response_rows := (EXECUTE IMMEDIATE :full_only_sql USING (boundary_id, signature_value));
+                    """;
+            responseSql = "";
+        } else {
+            // The per-request prefix is checked against source columns before reading, so payload
+            // aliases cannot be confused with control columns after RESULT_SCAN.
+            final String resultScanSql = """
+                    SELECT 'CONTROL' AS %sK, ?::VARCHAR AS %sQ, ?::VARCHAR AS %sS,
+                           ?::VARCHAR AS %sM, (SELECT COUNT(*) FROM TABLE(RESULT_SCAN(?))) AS %sN, d.*
+                    FROM (SELECT 1) seed LEFT JOIN TABLE(RESULT_SCAN(?)) d ON FALSE
+                    UNION ALL
+                    SELECT 'DATA', NULL::VARCHAR, NULL::VARCHAR, NULL::VARCHAR, NULL::NUMBER, d.*
+                    FROM TABLE(RESULT_SCAN(?)) d
+                    """.formatted(prefix, prefix, prefix, prefix, prefix);
+            declarations = """
+                    %s
+                    data_id VARCHAR;
+                    mode VARCHAR DEFAULT '%s';
+                    data_sql VARCHAR DEFAULT %s;
+                    response_sql VARCHAR DEFAULT %s;
+                    data_rows RESULTSET;
+                    """.formatted(delta ? "marker_time TIMESTAMP_LTZ;" : "", delta ? "INCREMENTAL" : "FULL", literal(dataSql), literal(resultScanSql));
+            readSql = delta ? """
+                    SELECT CURRENT_TIMESTAMP() INTO :marker_time;
+                    boundary_id := SQLID;
+                    data_rows := (EXECUTE IMMEDIATE :data_sql USING (previous_id, boundary_id));
+                    data_id := SQLID;
+                    """ : """
+                    data_rows := (EXECUTE IMMEDIATE :data_sql);
+                    data_id := SQLID;
+                    boundary_id := data_id;
+                    """;
+            responseSql = """
+                    response_rows := (EXECUTE IMMEDIATE :response_sql
+                        USING (boundary_id, signature_value, mode, data_id, data_id, data_id));
+                    """;
+        }
         final String body = """
                 DECLARE
                     signature_value VARCHAR;
                     signature_before VARCHAR;
                     source_count INTEGER;
                     collision_count INTEGER;
-                    marker_time TIMESTAMP_LTZ;
                     boundary_id VARCHAR;
-                    data_id VARCHAR;
-                    mode VARCHAR DEFAULT '%s';
-                    data_sql VARCHAR DEFAULT %s;
-                    response_sql VARCHAR DEFAULT %s;
-                    full_only_sql VARCHAR DEFAULT %s;
-                    data_rows RESULTSET;
+                    %s
                     response_rows RESULTSET;
                     source_changed EXCEPTION (-20001, 'TABLE_CACHE_SOURCE_CHANGED');
                     invalid_source EXCEPTION (-20002, 'TABLE_CACHE_INVALID_SOURCE');
@@ -176,32 +208,15 @@ final class AnonymousTableRefresh {
                     IF (collision_count <> 0) THEN
                         RAISE invalid_source;
                     END IF;
-                    IF (%s) THEN
-                        SELECT CURRENT_TIMESTAMP() INTO :marker_time;
-                        boundary_id := SQLID;
-                        response_rows := (EXECUTE IMMEDIATE :full_only_sql USING (boundary_id, signature_value));
-                    ELSEIF (previous_id IS NULL) THEN
-                        data_rows := (EXECUTE IMMEDIATE :data_sql);
-                        data_id := SQLID;
-                        boundary_id := data_id;
-                    ELSE
-                        SELECT CURRENT_TIMESTAMP() INTO :marker_time;
-                        boundary_id := SQLID;
-                        data_rows := (EXECUTE IMMEDIATE :data_sql USING (previous_id, boundary_id));
-                        data_id := SQLID;
-                    END IF;
+                    %s
                     %s
                     IF (source_count <> 1 OR signature_value IS NULL OR signature_value <> signature_before) THEN
                         RAISE source_changed;
                     END IF;
-                    IF (NOT %s) THEN
-                        response_rows := (EXECUTE IMMEDIATE :response_sql
-                            USING (boundary_id, signature_value, mode, data_id, data_id, data_id));
-                    END IF;
+                    %s
                     RETURN TABLE(response_rows);
                 END;
-                """.formatted(delta ? "INCREMENTAL" : "FULL", literal(dataSql), literal(responseSql), literal(fullOnlySql), signatureSql,
-                informationSchema, prefix, prefix, prefix, prefix, prefix, prefix, fullOnly ? "TRUE" : "FALSE", signatureSql, fullOnly ? "TRUE" : "FALSE");
+                """.formatted(declarations, signatureSql, informationSchema, prefix, prefix, prefix, prefix, prefix, prefix, readSql, signatureSql, responseSql);
         // Quote the body too: a valid source identifier can itself contain the dollar delimiter.
         return """
                 WITH refresh_cache AS PROCEDURE (

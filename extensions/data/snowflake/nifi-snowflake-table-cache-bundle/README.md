@@ -14,7 +14,7 @@ service. See the repository's support disclaimer and Apache 2.0 license.
 | Snowflake Connection Service | Existing `DBCPService` with access to the reference table |
 | Source Table | Fully qualified table or view; see the source modes below |
 | Key Columns | Comma-separated lookup columns; supply each as a LookupRecord coordinate |
-| Value Columns | Columns to return, or `*`; all returned values are strings |
+| Value Columns | Columns to return, or `*`; returned values are strings or null |
 | Storage Mode | Heap (default) or Embedded (RocksDB) |
 | Storage Directory | Dedicated writable directory per Embedded service and node |
 | Refresh Interval | Delay after each refresh completes; default one hour; zero disables scheduled refresh |
@@ -47,21 +47,7 @@ unchanged DDL never skips a query. View dependency changes are reflected in the
 next successful full result, without reconstructing a delta. Views over external
 systems remain subject to their source's consistency and availability semantics.
 For dynamic tables the cache reads the latest published output; it neither
-triggers a DT refresh nor removes the DT's own freshness lag.
-
-Use an existing connection service whose runtime identity has only the required
-database/schema usage, source SELECT, warehouse access and source metadata visibility.
-DT capability inspection requires a visible `refresh_mode` in SHOW DYNAMIC TABLES;
-additional MONITOR privileges may be needed for that metadata. Least-privilege
-runtime qualification is still required; the live source tests use a lab role. Change
-tracking must be configured by an authorized table owner. The cache does not
-create streams, tasks, source tables, stored procedures or grants. Each refresh
-reads source metadata (including SHOW for DT/Iceberg capabilities) and submits
-an anonymous SQL procedure through the same JDBC connection. That
-call performs multiple child queries; it is not one transaction or one snapshot.
-Borrowed connections must use auto-commit and have no caller-owned transaction;
-the service rejects auto-commit-disabled connections rather than committing or
-rolling back another component's work. Use a pool that resets session state.
+triggers a dynamic-table refresh nor removes its own freshness lag.
 
 Use Snowflake identifier syntax in table and column properties: unquoted names
 are uppercase, while double-quoted names preserve case and punctuation. For
@@ -71,9 +57,10 @@ the surrounding quotes. SQL expressions and arbitrary source queries are not
 accepted. Value Columns `*` includes all source columns; explicit projections
 also include the configured key columns.
 
-Enable the connection service before the cache. In `LookupRecord`, configure
-record reader/writer services, choose this lookup service, map a key column such
-as `ITEM_ID` to `/item_id`, and write the returned record at `/reference`.
+1. Enable the database connection pool (`DBCPService`) before the cache.
+2. In `LookupRecord`, configure record reader/writer services and choose this lookup service.
+3. Map a key column such as `ITEM_ID` to `/item_id` and write the returned record at `/reference`.
+
 For example, a reference row `ITEM_ID=example-1, LABEL=blue` enriches
 `{"item_id":"example-1"}` with a reference record containing string values.
 An unknown key is unmatched, not a lookup failure.
@@ -82,6 +69,39 @@ Keys must be unique and non-null in the source, including every composite-key
 part. Full loads reject duplicates or nulls without publishing a partial cache.
 Keep uniqueness enforced upstream: an incremental delta cannot detect a duplicate
 against an unchanged source row. Composite keys use length-prefixed encoding.
+
+## Security and connection requirements
+
+Restrict controller-service configuration to trusted NiFi administrators. Table
+and column properties select identifiers, not arbitrary SQL; identifiers are
+parsed and double-quoted, and query/checkpoint values are bound or escaped.
+Lookup coordinates are local cache keys and never enter SQL. Do not strip
+punctuation from valid quoted identifiers. Use explicit Value Columns when the
+cache should not include every source column.
+
+Use an existing connection service whose runtime identity has only the required
+database/schema usage, source SELECT, warehouse access and source metadata visibility.
+Dynamic-table capability inspection requires a visible `refresh_mode` in
+SHOW DYNAMIC TABLES; additional MONITOR privileges may be needed. Qualify those
+privileges on the intended runtime; live source tests use a lab role. Change
+tracking must be configured by an authorized table owner. The cache does not
+create streams, tasks, source tables, permanent stored procedures or grants.
+
+Each refresh reads session/source metadata and submits an anonymous SQL procedure
+through the same Java Database Connectivity (JDBC) connection. That call performs
+multiple child queries; it is not one transaction or one snapshot. Borrowed
+connections must use auto-commit, have no caller-owned transaction, and use
+`QUOTED_IDENTIFIERS_IGNORE_CASE=FALSE`. The service rejects incompatible settings
+without changing them, committing or rolling back another component's work.
+Case folding can otherwise make metadata validation and a quoted SELECT refer to
+different objects. Use a pool that resets session state and keep its evaluation
+context stable.
+
+The cache uses the connection service's identity, not each lookup caller's
+identity. Restrict access to flows that consume it accordingly. Lookups return
+detached records and schemas, so consumer mutation cannot change the cached copy.
+This isolation does not provide per-record authorization or real-time revocation;
+see the stale-data behavior below.
 
 ## Refresh and failure semantics
 
@@ -109,7 +129,7 @@ against an unchanged source row. Composite keys use length-prefixed encoding.
   expected number of data rows must arrive before any cache change is published;
   an empty table or delta still carries a checkpoint.
 - Initial-load failures are retried only when the refresh interval is positive.
-- Every value is a string, including numeric and semi-structured values. Convert
+- Non-null values are strings, including numeric and semi-structured values. Convert
   downstream when native types are required.
 - Nodes refresh independently and can serve different valid point-in-time
   snapshots. There is no primary-only reader, shared cursor or cache replication.
@@ -127,7 +147,11 @@ large-table performance qualification.
 Use a dedicated persistent directory, never a directory belonging to NiFi state,
 another service, or a different reference source. Do not assume a writable path
 is persistent. Backup/recovery, permissions and capacity belong to the runtime
-operator. Keep source credentials out of paths and logs.
+operator. Restrict the directory and its parents to trusted operating-system users;
+cache files contain source values and are not encrypted by this service. Local
+filesystem tampering is outside the cache's trust boundary. Keep source credentials
+out of paths and logs. Component errors omit lookup keys, but JDBC/native exception
+causes may include database diagnostics; protect runtime logs too.
 
 Embedded mode locks its directory and checks a versioned identity containing the
 connection-service ID, source expression, key/value columns and incremental mode.
@@ -169,6 +193,15 @@ From the repository root, with Java 21:
 Normal builds use deterministic JDBC response fixtures and temporary RocksDB
 directories and do not need an account. Fixtures test response handling, not
 Snowflake syntax or change-tracking semantics.
+
+| Test layer | Contract |
+|---|---|
+| Identifier and codec tests | Identifier grammar/escaping; bounded persistence decoding |
+| Store tests (Heap and RocksDB) | Atomic publication, detached records/schema, corruption and restart behavior |
+| Reader fixtures | Metadata/session validation, complete responses and JDBC closure before publication |
+| Controller-service tests | LookupRecord integration, serving/recovery gates and refresh concurrency |
+| Live JDBC tests | Production-generated SQL, native values, child checkpoints and supported-source behavior |
+
 Live tests are skipped unless `SNOWFLAKE_IT_CONNECTION` explicitly selects a test
 connection. They create and drop unique fixture tables, so use a dedicated test
 database/schema and explicitly scoped warehouse/role, not production.
@@ -177,10 +210,21 @@ parser; `SNOWFLAKE_IT_*` settings can override it using an approved secret provi
 It never needs credentials committed in this repository. JDBC is test-only;
 the deployed service obtains connections from the supplied DBCP service.
 
+For a named test connection already configured with authentication, replace the
+example scope names below, then run `verify`. These settings contain no secrets:
+
+```bash
+SNOWFLAKE_IT_CONNECTION='test-connection' \
+SNOWFLAKE_IT_DATABASE='DEDICATED_PERMANENT_TEST_DATABASE' \
+SNOWFLAKE_IT_SCHEMA=PUBLIC SNOWFLAKE_IT_WAREHOUSE='TEST_WAREHOUSE' \
+SNOWFLAKE_TYPES_IT=true \
+./mvnw verify -f extensions/data/snowflake/nifi-snowflake-table-cache-bundle/pom.xml
+```
+
 `SourceTypesProtocolIT` additionally requires `SNOWFLAKE_TYPES_IT=true` and a
 dedicated permanent database/schema (hybrid tables cannot live in a transient
-database). It creates unique view, hybrid, DT and managed Iceberg fixtures, uses
-the configured warehouse for controlled DT refreshes, and drops its fixtures.
+database). It creates unique view, hybrid, dynamic-table and managed Iceberg fixtures,
+uses the configured warehouse for controlled dynamic-table refreshes, and drops its fixtures.
 It does not create external volumes or catalog integrations. An explicitly
 selected capability that is unavailable fails the test rather than being skipped.
 

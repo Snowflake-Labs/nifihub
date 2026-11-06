@@ -17,6 +17,7 @@ import org.apache.nifi.serialization.record.Record;
 import org.apache.nifi.serialization.record.RecordSchema;
 
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
@@ -34,7 +35,7 @@ import java.util.Set;
 public class HeapTableCacheStore implements TableCacheStore {
 
     /** Contents, schema and checkpoint swapped together, so they can never disagree. */
-    private record Snapshot(Map<String, Record> contents, RecordSchema schema, CacheCheckpoint checkpoint) {
+    private record Snapshot(Map<String, List<String>> contents, List<String> fieldNames, CacheCheckpoint checkpoint) {
     }
 
     private volatile Snapshot snapshot = null;
@@ -52,15 +53,16 @@ public class HeapTableCacheStore implements TableCacheStore {
         if (current == null) {
             throw new IllegalStateException("Cannot apply changes before an initial load");
         }
-        if (!current.schema().getFieldNames().equals(schema.getFieldNames())) {
+        if (!current.fieldNames().equals(RowCodec.fieldNames(schema))) {
             throw new IllegalStateException("Schema changed since the last full load");
         }
-        // Copy-on-write. At heap-mode sizes this is cheap, and it makes the delta atomically
-        // visible without any locking on the read path.
-        final Map<String, Record> next = new HashMap<>(current.contents());
+        final Map<String, List<String>> next = new HashMap<>(current.contents());
         next.keySet().removeAll(deletes);
-        next.putAll(upserts);
-        snapshot = new Snapshot(next, schema, checkpoint);
+        for (final Map.Entry<String, Record> entry : upserts.entrySet()) {
+            Objects.requireNonNull(entry.getKey(), "Source keys must be non-null");
+            next.put(entry.getKey(), RowCodec.values(current.fieldNames(), entry.getValue()));
+        }
+        snapshot = new Snapshot(next, current.fieldNames(), checkpoint);
     }
 
     @Override
@@ -69,7 +71,8 @@ public class HeapTableCacheStore implements TableCacheStore {
         if (current == null) {
             return Optional.empty();
         }
-        return Optional.ofNullable(current.contents().get(key));
+        final List<String> values = current.contents().get(key);
+        return values == null ? Optional.empty() : Optional.of(RowCodec.record(current.fieldNames(), values));
     }
 
     @Override
@@ -92,7 +95,7 @@ public class HeapTableCacheStore implements TableCacheStore {
     @Override
     public RecordSchema schema() {
         final Snapshot current = snapshot;
-        return current == null ? null : current.schema();
+        return current == null ? null : RowCodec.schema(current.fieldNames());
     }
 
     @Override
@@ -106,11 +109,11 @@ public class HeapTableCacheStore implements TableCacheStore {
     }
 
     private final class HeapBulkLoad implements BulkLoad {
-        private final RecordSchema schema;
-        private Map<String, Record> staged = new HashMap<>();
+        private final List<String> fieldNames;
+        private Map<String, List<String>> staged = new HashMap<>();
 
         HeapBulkLoad(final RecordSchema schema) {
-            this.schema = schema;
+            this.fieldNames = RowCodec.fieldNames(schema);
         }
 
         @Override
@@ -118,9 +121,10 @@ public class HeapTableCacheStore implements TableCacheStore {
             if (staged == null) {
                 throw new IllegalStateException("Bulk load already completed");
             }
-            if (key == null || value == null || staged.putIfAbsent(key, value) != null) {
+            if (key == null || value == null || staged.containsKey(key)) {
                 throw new IllegalArgumentException("Source keys must be unique and non-null");
             }
+            staged.put(key, RowCodec.values(fieldNames, value));
         }
 
         @Override
@@ -129,7 +133,7 @@ public class HeapTableCacheStore implements TableCacheStore {
                 throw new IllegalStateException("Bulk load already completed");
             }
             Objects.requireNonNull(checkpoint, "Checkpoint is required");
-            snapshot = new Snapshot(staged, schema, checkpoint);
+            snapshot = new Snapshot(staged, fieldNames, checkpoint);
             staged = null;
         }
 

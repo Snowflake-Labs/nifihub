@@ -52,12 +52,14 @@ final class RefreshResponseConnectionService extends AbstractControllerService i
     private final Queue<Step> steps = new ConcurrentLinkedQueue<>();
     private final List<Call> calls = new CopyOnWriteArrayList<>();
     private final List<Call> metadataCalls = new CopyOnWriteArrayList<>();
+    private final List<Call> sessionCalls = new CopyOnWriteArrayList<>();
+    private volatile List<Object[]> sessionParameterRows = Collections.singletonList(new Object[]{"QUOTED_IDENTIFIERS_IGNORE_CASE", "false"});
     private volatile String sourceType = "standard";
     private volatile List<Object[]> sourceRows;
     private volatile List<Object[]> capabilityRows;
     private volatile SQLException metadataFailure;
     private volatile SQLException capabilityFailure;
-    private volatile String lastSignature = "source-signature";
+    private volatile String sourceSignature = "source-signature";
     private final AtomicInteger openedConnections = new AtomicInteger();
     private final AtomicInteger closedConnections = new AtomicInteger();
     private final AtomicInteger openedStatements = new AtomicInteger();
@@ -67,6 +69,7 @@ final class RefreshResponseConnectionService extends AbstractControllerService i
     private final AtomicInteger activeExecutions = new AtomicInteger();
     private final AtomicInteger maximumExecutions = new AtomicInteger();
     private volatile String closeFailure;
+    private volatile CloseBlock closeBlock;
     private boolean autoCommit = true;
 
     void autoCommit(final boolean enabled) {
@@ -75,6 +78,29 @@ final class RefreshResponseConnectionService extends AbstractControllerService i
 
     void failOnClose(final String resource) {
         closeFailure = resource;
+    }
+
+    void sourceSignature(final String signature) {
+        sourceSignature = signature;
+    }
+
+    void sessionParameterValue(final String value) {
+        sessionParameterRows(new Object[]{"QUOTED_IDENTIFIERS_IGNORE_CASE", value});
+    }
+
+    void sessionParameterRows(final Object[]... rows) {
+        sessionParameterRows = Arrays.stream(rows).map(Object[]::clone).toList();
+    }
+
+    List<Call> sessionCalls() {
+        return List.copyOf(sessionCalls);
+    }
+
+    void blockOnClose(final String resource, final CountDownLatch entered, final CountDownLatch release) {
+        closeBlock = new CloseBlock(resource, entered, release);
+    }
+
+    private record CloseBlock(String resource, CountDownLatch entered, CountDownLatch release) {
     }
 
     void sourceType(final String type) {
@@ -123,7 +149,7 @@ final class RefreshResponseConnectionService extends AbstractControllerService i
         }
     }
 
-    private record Step(Response response, SQLException failure, CountDownLatch entered, CountDownLatch release) {
+    private record Step(Response response, SQLException failure, CountDownLatch entered, CountDownLatch release, Runnable beforeFailure) {
     }
 
     static Response response(final List<String> fields, final Object[]... rows) {
@@ -154,15 +180,19 @@ final class RefreshResponseConnectionService extends AbstractControllerService i
     }
 
     void enqueue(final Response response) {
-        steps.add(new Step(response, null, null, null));
+        steps.add(new Step(response, null, null, null, null));
     }
 
     void enqueueFailure(final SQLException failure) {
-        steps.add(new Step(null, failure, null, null));
+        enqueueFailure(failure, null);
+    }
+
+    void enqueueFailure(final SQLException failure, final Runnable beforeFailure) {
+        steps.add(new Step(null, failure, null, null, beforeFailure));
     }
 
     void enqueueBlocked(final Response response, final CountDownLatch entered, final CountDownLatch release) {
-        steps.add(new Step(response, null, entered, release));
+        steps.add(new Step(response, null, entered, release, null));
     }
 
     List<Call> calls() {
@@ -190,7 +220,7 @@ final class RefreshResponseConnectionService extends AbstractControllerService i
         return proxy(Connection.class, (instance, method, arguments) -> switch (method.getName()) {
             case "getAutoCommit" -> autoCommit;
             case "prepareStatement" -> statement((String) arguments[0]);
-            case "createStatement" -> capabilityStatement();
+            case "createStatement" -> metadataStatement();
             case "close" -> closeOnce(closed, closedConnections, "connection");
             case "isClosed" -> closed.get();
             default -> throw unsupported(method.getName());
@@ -225,19 +255,7 @@ final class RefreshResponseConnectionService extends AbstractControllerService i
         if (sourceRows != null) {
             return resultSet(SOURCE_COLUMNS, sourceRows, -1, "metadataResultSet");
         }
-        // Keep the last signature for scripted SQL failures: looking ahead would reject preflight before
-        // the intended anonymous-call failure. Explicit metadataRows overrides model preflight changes.
-        // Never consume a refresh step or mirror corrupt protocol signatures into valid metadata.
-        final Step next = steps.peek();
-        if (next != null && next.response() != null) {
-            for (final Object[] row : next.response().rows()) {
-                if ("CONTROL".equals(row[0]) && row[2] instanceof String signature && !signature.isBlank()) {
-                    lastSignature = signature;
-                    break;
-                }
-            }
-        }
-        final Object[] row = {"BASE TABLE", "NO", "NO", "NO", "NO", 1L, lastSignature};
+        final Object[] row = {"BASE TABLE", "NO", "NO", "NO", "NO", 1L, sourceSignature};
         switch (sourceType) {
             case "standard", "transient" -> {
                 // Both native table variants expose the same capability fields read by preflight.
@@ -265,12 +283,21 @@ final class RefreshResponseConnectionService extends AbstractControllerService i
         return resultSet(SOURCE_COLUMNS, Collections.singletonList(row), -1, "metadataResultSet");
     }
 
-    private Statement capabilityStatement() {
+    private Statement metadataStatement() {
         openedStatements.incrementAndGet();
         final AtomicBoolean closed = new AtomicBoolean();
+        final AtomicBoolean session = new AtomicBoolean();
         return proxy(Statement.class, (instance, method, arguments) -> switch (method.getName()) {
-            case "executeQuery" -> readCapability((String) arguments[0]);
-            case "close" -> closeOnce(closed, closedStatements, "metadataStatement");
+            case "executeQuery" -> {
+                final String sql = (String) arguments[0];
+                session.set("SHOW PARAMETERS LIKE 'QUOTED_IDENTIFIERS_IGNORE_CASE' IN SESSION".equals(sql));
+                if (session.get()) {
+                    sessionCalls.add(new Call(sql, Map.of()));
+                    yield resultSet(List.of("key", "value"), sessionParameterRows, -1, "sessionResultSet");
+                }
+                yield readCapability(sql);
+            }
+            case "close" -> closeOnce(closed, closedStatements, session.get() ? "sessionStatement" : "metadataStatement");
             case "isClosed" -> closed.get();
             default -> throw unsupported(method.getName());
         });
@@ -324,6 +351,9 @@ final class RefreshResponseConnectionService extends AbstractControllerService i
                 }
             }
             if (step.failure() != null) {
+                if (step.beforeFailure() != null) {
+                    step.beforeFailure().run();
+                }
                 throw step.failure();
             }
             final List<String> labels = new ArrayList<>(PREFIX);
@@ -381,6 +411,18 @@ final class RefreshResponseConnectionService extends AbstractControllerService i
 
     private Object closeOnce(final AtomicBoolean closed, final AtomicInteger counter, final String resource) throws SQLException {
         if (closed.compareAndSet(false, true)) {
+            final CloseBlock block = closeBlock;
+            if (block != null && resource.equals(block.resource())) {
+                block.entered().countDown();
+                try {
+                    if (!block.release().await(10, TimeUnit.SECONDS)) {
+                        throw new SQLException("Test did not release blocked %s close".formatted(resource));
+                    }
+                } catch (final InterruptedException exception) {
+                    Thread.currentThread().interrupt();
+                    throw new SQLException("Interrupted fixture close", exception);
+                }
+            }
             counter.incrementAndGet();
             if (resource.equals(closeFailure)) {
                 throw new SQLException("Scripted %s close failure".formatted(resource), "08006");

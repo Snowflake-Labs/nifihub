@@ -37,13 +37,12 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
-import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.CyclicBarrier;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -54,8 +53,8 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
 
 /**
- * Integration test for the one behaviour unit tests cannot reach: incremental refresh through
- * Snowflake's {@code CHANGES} clause, which H2 does not implement.
+ * Live Snowflake coverage for generated anonymous SQL, statement-boundary refreshes and session guards.
+ * Scripted JDBC unit tests cover response handling but do not execute the SQL.
  *
  * <p><b>Skipped unless {@code SNOWFLAKE_IT_CONNECTION} names a connection</b> in
  * {@code ~/.snowflake/config.toml}, so a normal build never requires an account:
@@ -148,15 +147,15 @@ class SnowflakeTableCacheLookupServiceIT {
     void incrementalRefreshAppliesInsertsUpdatesAndDeletes(final String mode) throws Exception {
         enableService(mode);
         assertEquals(3L, service.size());
-        final CacheCheckpoint initialWatermark = service.checkpointForTest();
-        assertNotNull(initialWatermark, "the initial full load must record a watermark");
+        final CacheCheckpoint initialCheckpoint = service.checkpointForTest();
+        assertNotNull(initialCheckpoint, "the initial full load must record a statement checkpoint");
 
         // ---- a brand new ITEM_ID, which is the demo case ----
         execute("INSERT INTO " + table + " VALUES ('ITEM_ID004','fleet','JP')");
         RefreshResult result = refreshUntil(() -> service.size() == 4L, "ITEM_ID004 to appear");
         assertTrue(result.incremental(), "must have refreshed incrementally, not fully reloaded");
         assertEquals("fleet", lookup("ITEM_ID004").orElseThrow().getAsString("LABEL"));
-        assertNotEquals(initialWatermark, service.checkpointForTest(), "watermark must advance");
+        assertNotEquals(initialCheckpoint, service.checkpointForTest(), "checkpoint must advance");
 
         // ---- an update: the DELETE half of the pair must not resurrect the old value ----
         execute("UPDATE " + table + " SET LABEL = 'b2b,advertiser,fleet' WHERE ITEM_ID = 'ITEM_ID001'");
@@ -199,27 +198,23 @@ class SnowflakeTableCacheLookupServiceIT {
         assertEquals(3L, service.size());
     }
 
-    /**
-     * An unusable watermark must degrade to a correct full reload rather than to a wrong cache. This
-     * is what protects a node that has been down longer than the table's time travel retention.
-     */
+    /** An unknown statement checkpoint must recover through a full reload; this does not age retained history. */
     @ParameterizedTest
     @ValueSource(strings = {"HEAP", "EMBEDDED_KV"})
-    void watermarkOutsideRetentionFallsBackToFullReload(final String mode) throws Exception {
+    void unknownStatementCheckpointFallsBackToFullReload(final String mode) throws Exception {
         enableService(mode);
 
-        // Well before the table existed, which Snowflake rejects with "Time travel data is not
-        // available" — the same error a long-absent node would hit.
+        // A syntactically valid ID with no backing statement exercises the missing-statement recovery path.
         service.storeForTest().applyChanges(service.storeForTest().schema(), Map.of(), java.util.Set.of(),
                 new CacheCheckpoint("00000000-0000-0000-0000-000000000000", service.checkpointForTest().sourceSignature()));
         execute("INSERT INTO " + table + " VALUES ('ITEM_ID005','fleet','JP')");
 
         final RefreshResult result = service.refresh();
 
-        assertTrue(!result.incremental(), "should have fallen back to a full reload");
+        assertFalse(result.incremental(), "should have fallen back to a full reload");
         assertEquals(4L, service.size());
         assertTrue(lookup("ITEM_ID005").isPresent());
-        assertNotNull(service.checkpointForTest(), "the fallback reload must reset the watermark");
+        assertNotNull(service.checkpointForTest(), "the fallback reload must replace the invalid checkpoint");
     }
 
     @ParameterizedTest
@@ -320,28 +315,34 @@ class SnowflakeTableCacheLookupServiceIT {
             assertNotEquals(first.checkpoint().queryId(), second.checkpoint().queryId());
             assertAtCheckpoint(first);
             assertAtCheckpoint(second);
-            final CountDownLatch writerStarted = new CountDownLatch(1);
-            final AtomicInteger writes = new AtomicInteger();
-            try (ExecutorService executor = Executors.newSingleThreadExecutor()) {
+            final CyclicBarrier round = new CyclicBarrier(2);
+            try (final ExecutorService executor = Executors.newSingleThreadExecutor()) {
                 final Future<?> writer = executor.submit(() -> {
                     try (Connection connection = connectionService.getConnection(); Statement statement = connection.createStatement()) {
-                        for (int epoch = 2; epoch <= 20; epoch++) {
-                            statement.execute("UPDATE %s SET LABEL = 'epoch-%d'".formatted(table, epoch));
-                            writes.incrementAndGet();
-                            writerStarted.countDown();
+                        for (int batch = 0; batch < 3; batch++) {
+                            round.await(60, TimeUnit.SECONDS);
+                            final int lastEpoch = batch == 2 ? 20 : 7 + batch * 6;
+                            for (int epoch = 2 + batch * 6; epoch <= lastEpoch; epoch++) {
+                                statement.execute("UPDATE %s SET LABEL = 'epoch-%d'".formatted(table, epoch));
+                            }
+                            round.await(60, TimeUnit.SECONDS);
                         }
-                    } catch (final SQLException exception) {
-                        throw new IllegalStateException(exception);
                     }
+                    return null;
                 });
-                assertTrue(writerStarted.await(30, TimeUnit.SECONDS));
-                final int writesBefore = writes.get();
-                for (int refresh = 0; refresh < 3; refresh++) {
-                    reader.refresh(connectionService, first, true);
-                    assertAtCheckpoint(first);
+                try {
+                    for (int refresh = 0; refresh < 3; refresh++) {
+                        // Neither participant may finish all rounds before the other is scheduled.
+                        round.await(60, TimeUnit.SECONDS);
+                        reader.refresh(connectionService, first, true);
+                        assertAtCheckpoint(first);
+                        round.await(60, TimeUnit.SECONDS);
+                    }
+                    writer.get(60, TimeUnit.SECONDS);
+                } finally {
+                    writer.cancel(true);
+                    round.reset();
                 }
-                writer.get(60, TimeUnit.SECONDS);
-                assertTrue(writes.get() > writesBefore, "writer must overlap the reader's refresh sequence");
             }
             reader.refresh(connectionService, first, true);
             reader.refresh(connectionService, second, true);

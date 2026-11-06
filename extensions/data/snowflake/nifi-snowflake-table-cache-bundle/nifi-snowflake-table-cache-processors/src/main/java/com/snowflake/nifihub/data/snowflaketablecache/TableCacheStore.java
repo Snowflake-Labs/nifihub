@@ -24,10 +24,9 @@ import java.util.Set;
 /**
  * Storage backend for a materialized table cache.
  *
- * <p>Two write paths, and both must be <em>atomic</em>: readers concurrent with a write continue to
- * see the previous contents until it completes. That is what lets a refresh run while lookups are
- * being served, and what prevents a reader from observing a half-applied change — which for an
- * entitlement dataset would be a correctness bug, not a performance one.
+ * <p>Both write paths atomically publish complete contents with their checkpoint. Concurrent
+ * lookups never observe a partial write. Writes accept flat string/null records; implementations
+ * detach input records and schemas so later caller mutation cannot affect published contents.
  *
  * <ul>
  *   <li>{@link #beginBulkLoad} — replace everything. Used for the initial load and for recovery.</li>
@@ -58,7 +57,7 @@ public interface TableCacheStore extends Closeable {
     void applyChanges(RecordSchema schema, Map<String, Record> upserts, Set<String> deletes,
                       CacheCheckpoint checkpoint);
 
-    /** Look up a single composite key. Empty if absent. */
+    /** Look up a single composite key. Returns a detached record and schema, or empty if absent. */
     Optional<Record> get(String key);
 
     /** Number of entries currently visible to readers. */
@@ -71,7 +70,7 @@ public interface TableCacheStore extends Closeable {
     CacheCheckpoint checkpoint();
 
     /**
-     * Schema the current contents were loaded with, or null if not hydrated. An incremental delta
+     * Detached schema of the current contents, or null if not hydrated. An incremental delta
      * must carry the same fields in the same order, because on-disk backends encode positionally.
      */
     RecordSchema schema();

@@ -18,6 +18,8 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.condition.EnabledIfEnvironmentVariable;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.sql.Connection;
 import java.sql.PreparedStatement;
@@ -25,7 +27,6 @@ import java.sql.ResultSet;
 import java.sql.ResultSetMetaData;
 import java.sql.SQLException;
 import java.sql.Statement;
-import java.sql.Types;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
@@ -38,22 +39,21 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
-/** Standalone JDBC protocol qualification; deliberately independent of cache reader and store APIs. */
+/** Production SQL qualification with JDBC oracles independent of cache reader and store APIs. */
 @EnabledIfEnvironmentVariable(named = SnowflakeConfigConnectionService.CONNECTION_ENV, matches = ".+")
 class AnonymousRefreshProtocolIT {
     private static final List<String> SOURCE_LABELS = List.of("Id", "MiXeD", "quote\"name", "NullValue", "Amount",
             "Enabled", "Payload", "KIND", "CHECKPOINT", "__NIFI_CACHE_ACTION");
-    private static final String ACTION_BASE = "__NIFI_CACHE_ACTION";
-    private static final int SOURCE_OFFSET = 3;
+    private static final String PREFIX = "TCPROTOCOL";
+    private static final int SOURCE_OFFSET = 6;
 
     private Connection connection;
     private String table;
     private boolean tableCreated;
     private List<Column> sourceColumns;
+    private List<Column> markerColumns;
     private String projection;
-    private String actionAlias;
     private String deltaSql;
-    private String refreshSql;
 
     @BeforeEach
     void setUp() throws SQLException {
@@ -77,14 +77,15 @@ class AnonymousRefreshProtocolIT {
             sourceColumns = columns(rows.getMetaData());
         }
         assertEquals(SOURCE_LABELS, sourceColumns.stream().map(Column::label).toList());
-        actionAlias = uniqueActionAlias(SOURCE_LABELS);
-        assertNotEquals(ACTION_BASE, actionAlias, "The source intentionally occupies the first reserved alias");
+        try (final Statement statement = connection.createStatement();
+                final ResultSet rows = statement.executeQuery("SELECT CURRENT_TIMESTAMP()")) {
+            markerColumns = columns(rows.getMetaData());
+        }
         projection = SOURCE_LABELS.stream().map(AnonymousRefreshProtocolIT::quoteIdentifier).collect(Collectors.joining(", "));
         deltaSql = """
                 SELECT METADATA$ACTION::VARCHAR AS %s, %s FROM IDENTIFIER(?)
                 CHANGES(INFORMATION => DEFAULT) AT(STATEMENT => ?) END(STATEMENT => ?)
-                """.formatted(quoteIdentifier(actionAlias), projection);
-        refreshSql = anonymousSql();
+                """.formatted(quoteIdentifier(PREFIX), projection);
     }
 
     @AfterEach
@@ -100,11 +101,16 @@ class AnonymousRefreshProtocolIT {
         }
     }
 
-    @Test
-    void fullResponsePreservesEmptySchemaNativeStringsAndDuplicateLabels() throws SQLException {
-        final Response empty = refresh(null);
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void fullResponsePreservesEmptySchemaNativeStringsAndControlLikeLabels(final boolean fullOnly) throws SQLException {
+        final Response empty = refresh(null, fullOnly);
         assertTrue(empty.data().isEmpty());
-        assertDataScan(empty.checkpoint(), empty.data());
+        if (fullOnly) {
+            assertEndpointMarker(empty.checkpoint());
+        } else {
+            assertDataScan(empty.checkpoint(), empty.data());
+        }
 
         insert("full");
         final List<String> expected = sourceRow("full");
@@ -119,9 +125,13 @@ class AnonymousRefreshProtocolIT {
         assertEquals("source checkpoint", expected.get(8));
         assertEquals("DELETE", expected.get(9));
 
-        final Response full = refresh(null);
+        final Response full = refresh(fullOnly ? empty : null, fullOnly);
         assertSingleChange(full, "INSERT", expected);
-        assertDataScan(full.checkpoint(), full.data());
+        if (fullOnly) {
+            assertEndpointMarker(full.checkpoint());
+        } else {
+            assertDataScan(full.checkpoint(), full.data());
+        }
         assertNotEquals(empty.checkpoint(), full.checkpoint());
     }
 
@@ -130,7 +140,7 @@ class AnonymousRefreshProtocolIT {
         final Response initial = refresh(null);
         insert("inside");
         final List<String> inside = sourceRow("inside");
-        final Response first = refresh(initial.checkpoint());
+        final Response first = refresh(initial);
         assertSingleChange(first, "INSERT", inside);
         assertEndpointMarker(first.checkpoint());
 
@@ -145,15 +155,15 @@ class AnonymousRefreshProtocolIT {
                 assertEquals(first.data(), readData(rows));
             }
         }
-        final Response second = refresh(first.checkpoint());
+        final Response second = refresh(first);
         assertSingleChange(second, "INSERT", outside);
         assertEndpointMarker(second.checkpoint());
         assertNotEquals(first.checkpoint(), second.checkpoint());
 
         execute("DELETE FROM %s WHERE \"Id\" = 'inside'".formatted(table));
-        final Response deleted = refresh(second.checkpoint());
+        final Response deleted = refresh(second);
         assertSingleChange(deleted, "DELETE", inside);
-        final Response empty = refresh(deleted.checkpoint());
+        final Response empty = refresh(deleted);
         assertTrue(empty.data().isEmpty());
         assertEndpointMarker(empty.checkpoint());
         assertNotEquals(deleted.checkpoint(), empty.checkpoint(), "An empty delta still advances its endpoint");
@@ -172,6 +182,61 @@ class AnonymousRefreshProtocolIT {
             }
             assertTrue(reader.refresh(new SnowflakeConfigConnectionService(), store, true).incremental());
             assertEquals(1L, store.size());
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void injectionShapedIdentifiersAndValuesRemainLiteral(final boolean fullOnly) throws Exception {
+        final List<String> source = SnowflakeIdentifier.parse(table, '.');
+        final String name = "quoted'\\$$\"; SELECT 'injected'; --%s".formatted(UUID.randomUUID().toString().replace("-", ""));
+        final String unusualTable = "%s.%s.%s".formatted(quoteIdentifier(source.get(0)), quoteIdentifier(source.get(1)), quoteIdentifier(name));
+        final String valueColumn = "value'\\$$\"; --";
+        final String key = "'); SELECT 'not SQL'; --";
+        execute("CREATE TABLE %s (ITEM_ID VARCHAR, %s VARCHAR) CHANGE_TRACKING=TRUE".formatted(unusualTable, quoteIdentifier(valueColumn)));
+        try {
+            try (PreparedStatement insert = connection.prepareStatement("INSERT INTO %s VALUES (?, ?)".formatted(unusualTable))) {
+                insert.setString(1, key);
+                insert.setString(2, "literal");
+                assertEquals(1, insert.executeUpdate());
+            }
+            final AnonymousTableRefresh reader = new AnonymousTableRefresh(unusualTable, List.of("ITEM_ID"), List.of(valueColumn), false, !fullOnly);
+            try (TableCacheStore store = new HeapTableCacheStore()) {
+                reader.refresh(new SnowflakeConfigConnectionService(), store, false);
+                assertEquals("literal", store.get(key).orElseThrow().getAsString(valueColumn));
+                assertEquals(!fullOnly, reader.refresh(new SnowflakeConfigConnectionService(), store, true).incremental());
+                assertEquals("literal", store.get(key).orElseThrow().getAsString(valueColumn));
+                assertEquals(1L, store.size());
+            }
+        } finally {
+            execute("DROP TABLE %s".formatted(unusualTable));
+        }
+    }
+
+    @Test
+    void productionReaderRejectsCaseFoldedIdentifiers() throws Exception {
+        final SnowflakeConfigConnectionService caseFolded = new SnowflakeConfigConnectionService() {
+            @Override
+            public Connection getConnection() {
+                final Connection borrowed = super.getConnection();
+                try (Statement statement = borrowed.createStatement()) {
+                    statement.execute("ALTER SESSION SET QUOTED_IDENTIFIERS_IGNORE_CASE=TRUE");
+                    return borrowed;
+                } catch (final SQLException exception) {
+                    try {
+                        borrowed.close();
+                    } catch (final SQLException closeFailure) {
+                        exception.addSuppressed(closeFailure);
+                    }
+                    throw new IllegalStateException(exception);
+                }
+            }
+        };
+        final AnonymousTableRefresh reader = new AnonymousTableRefresh(table, List.of("Id"), List.of(), true, true);
+        try (TableCacheStore store = new HeapTableCacheStore()) {
+            final SQLException error = org.junit.jupiter.api.Assertions.assertThrows(SQLException.class, () -> reader.refresh(caseFolded, store, false));
+            assertTrue(error.getMessage().contains("QUOTED_IDENTIFIERS_IGNORE_CASE=FALSE"));
+            assertFalse(store.isHydrated());
         }
     }
 
@@ -202,65 +267,39 @@ class AnonymousRefreshProtocolIT {
         }
     }
 
-    private String anonymousSql() {
-        return """
-                WITH refresh AS PROCEDURE(source_table VARCHAR, previous_query_id VARCHAR)
-                RETURNS TABLE()
-                LANGUAGE SQL
-                AS $$
-                DECLARE
-                    endpoint_id VARCHAR;
-                    data_id VARCHAR;
-                    delta_sql VARCHAR DEFAULT '%s';
-                    response_sql VARCHAR;
-                    endpoint_rows RESULTSET;
-                    data_rows RESULTSET;
-                    response_rows RESULTSET;
-                BEGIN
-                    IF (previous_query_id IS NULL) THEN
-                        data_rows := (SELECT 'INSERT'::VARCHAR AS %s, %s FROM IDENTIFIER(:source_table));
-                        data_id := SQLID;
-                        endpoint_id := data_id;
-                    ELSE
-                        endpoint_rows := (SELECT CURRENT_TIMESTAMP() AS ENDPOINT_TIME);
-                        endpoint_id := SQLID;
-                        data_rows := (EXECUTE IMMEDIATE :delta_sql USING(source_table, previous_query_id, endpoint_id));
-                        data_id := SQLID;
-                    END IF;
-                    response_sql := 'SELECT ''CONTROL'' AS KIND, ?::VARCHAR AS CHECKPOINT, d.*
-                        FROM (SELECT 1) c LEFT JOIN TABLE(RESULT_SCAN(?)) d ON FALSE
-                        UNION ALL SELECT ''DATA'', NULL::VARCHAR, d.* FROM TABLE(RESULT_SCAN(?)) d';
-                    response_rows := (EXECUTE IMMEDIATE :response_sql USING(endpoint_id, data_id, data_id));
-                    RETURN TABLE(response_rows);
-                END;
-                $$
-                CALL refresh(?,?)
-                """.formatted(deltaSql.replace("'", "''"), quoteIdentifier(actionAlias), projection);
+    private Response refresh(final Response previous) throws SQLException {
+        return refresh(previous, false);
     }
 
-    private Response refresh(final String previous) throws SQLException {
+    private Response refresh(final Response previous, final boolean fullOnly) throws SQLException {
+        final List<String> source = SnowflakeIdentifier.parse(table, '.');
+        final SourceMetadata sourceMetadata = SourceMetadata.read(connection, source, !fullOnly);
+        assertEquals(!fullOnly, sourceMetadata.incremental());
+        final boolean delta = previous != null && sourceMetadata.incremental();
+        final AnonymousTableRefresh reader = new AnonymousTableRefresh(table, List.of("Id"), List.of(), true, !fullOnly);
+        final String sql = reader.sql(SOURCE_LABELS, delta, PREFIX, !sourceMetadata.incremental());
         final List<String> checkpoints = new ArrayList<>();
         final List<List<String>> data = new ArrayList<>();
-        try (final PreparedStatement statement = connection.prepareStatement(refreshSql)) {
-            statement.setString(1, table);
-            if (previous == null) {
-                statement.setNull(2, Types.VARCHAR);
-            } else {
-                statement.setString(2, previous);
-            }
+        long expectedCount = -1;
+        try (final PreparedStatement statement = connection.prepareStatement(sql)) {
+            statement.setString(1, delta ? previous.checkpoint() : null);
+            statement.setString(2, previous == null ? null : previous.sourceSignature());
+            statement.setString(3, source.get(1));
+            statement.setString(4, source.get(2));
+            statement.setString(5, sourceMetadata.signature());
             try (final ResultSet rows = statement.executeQuery()) {
                 // Driver-specific access is only the independent oracle; the protocol reads standard JDBC columns.
                 final String outerId = statement.unwrap(SnowflakePreparedStatement.class).getQueryID();
                 assertNotNull(outerId);
                 final List<Column> metadata = columns(rows.getMetaData());
                 assertEquals(SOURCE_OFFSET + sourceColumns.size(), metadata.size());
-                assertEquals("KIND", metadata.get(0).label());
-                assertEquals("CHECKPOINT", metadata.get(1).label());
-                assertEquals(actionAlias, metadata.get(2).label());
+                assertEquals(List.of("TCPROTOCOLK", "TCPROTOCOLQ", "TCPROTOCOLS", "TCPROTOCOLM", "TCPROTOCOLN", PREFIX),
+                        metadata.subList(0, SOURCE_OFFSET).stream().map(Column::label).toList());
                 assertEquals(sourceColumns, metadata.subList(SOURCE_OFFSET, metadata.size()),
-                        "Source labels and native JDBC types must survive duplicate control names");
-                assertEquals(2L, metadata.stream().filter(column -> "KIND".equals(column.label())).count());
-                assertEquals(2L, metadata.stream().filter(column -> "CHECKPOINT".equals(column.label())).count());
+                        "Source labels and native JDBC types must survive control-like source names");
+                assertEquals(1L, metadata.stream().filter(column -> "KIND".equals(column.label())).count());
+                assertEquals(1L, metadata.stream().filter(column -> "CHECKPOINT".equals(column.label())).count());
+                assertEquals(1L, metadata.stream().filter(column -> "__NIFI_CACHE_ACTION".equals(column.label())).count());
                 while (rows.next()) {
                     final String kind = rows.getString(1);
                     if ("CONTROL".equals(kind)) {
@@ -268,22 +307,31 @@ class AnonymousRefreshProtocolIT {
                         assertNotNull(checkpoint);
                         assertFalse(checkpoint.isBlank());
                         checkpoints.add(checkpoint);
-                        for (int ordinal = 3; ordinal <= metadata.size(); ordinal++) {
+                        assertEquals(sourceMetadata.signature(), rows.getString(3));
+                        assertEquals(delta ? "INCREMENTAL" : "FULL", rows.getString(4));
+                        final java.math.BigDecimal count = rows.getBigDecimal(5);
+                        assertNotNull(count);
+                        expectedCount = count.longValueExact();
+                        assertTrue(expectedCount >= 0);
+                        for (int ordinal = SOURCE_OFFSET; ordinal <= metadata.size(); ordinal++) {
                             assertNull(rows.getString(ordinal), "CONTROL must not contain action or source values");
                             assertTrue(rows.wasNull());
                         }
                     } else {
                         assertEquals("DATA", kind);
-                        assertNull(rows.getString(2));
-                        assertTrue(rows.wasNull());
-                        data.add(strings(rows, 3));
+                        for (int ordinal = 2; ordinal < SOURCE_OFFSET; ordinal++) {
+                            assertNull(rows.getString(ordinal), "DATA must not contain control metadata");
+                            assertTrue(rows.wasNull());
+                        }
+                        data.add(strings(rows, SOURCE_OFFSET));
                     }
                 }
                 assertEquals(1, checkpoints.size(), "Exactly one control row, including empty results");
+                assertEquals(expectedCount, (long) data.size(), "Control count must match all returned data rows");
                 assertNotEquals(outerId, checkpoints.getFirst(), "The checkpoint must be a child SQLID, never the outer CALL");
             }
         }
-        return new Response(checkpoints.getFirst(), data);
+        return new Response(checkpoints.getFirst(), sourceMetadata.signature(), data);
     }
 
     private void assertDataScan(final String queryId, final List<List<String>> expected) throws SQLException {
@@ -300,9 +348,10 @@ class AnonymousRefreshProtocolIT {
             statement.setString(1, queryId);
             try (final ResultSet rows = statement.executeQuery()) {
                 assertEquals(1, rows.getMetaData().getColumnCount());
-                assertEquals("ENDPOINT_TIME", rows.getMetaData().getColumnLabel(1));
+                assertEquals(markerColumns, columns(rows.getMetaData()), "Endpoint must be the CURRENT_TIMESTAMP child SELECT");
                 assertTrue(rows.next());
                 assertNotNull(rows.getString(1));
+                assertNotNull(rows.getTimestamp(1));
                 assertFalse(rows.next());
             }
         }
@@ -311,7 +360,7 @@ class AnonymousRefreshProtocolIT {
     private List<List<String>> readData(final ResultSet rows) throws SQLException {
         final List<Column> metadata = columns(rows.getMetaData());
         assertEquals(1 + sourceColumns.size(), metadata.size());
-        assertEquals(actionAlias, metadata.getFirst().label());
+        assertEquals(PREFIX, metadata.getFirst().label());
         assertEquals(sourceColumns, metadata.subList(1, metadata.size()));
         final List<List<String>> data = new ArrayList<>();
         while (rows.next()) {
@@ -378,15 +427,6 @@ class AnonymousRefreshProtocolIT {
         return columns;
     }
 
-    private static String uniqueActionAlias(final List<String> labels) {
-        String candidate = ACTION_BASE;
-        int suffix = 0;
-        while (labels.contains(candidate)) {
-            candidate = "%s_%d".formatted(ACTION_BASE, ++suffix);
-        }
-        return candidate;
-    }
-
     private static String quoteIdentifier(final String identifier) {
         return "\"%s\"".formatted(identifier.replace("\"", "\"\""));
     }
@@ -394,6 +434,6 @@ class AnonymousRefreshProtocolIT {
     private record Column(String label, int jdbcType, String typeName) {
     }
 
-    private record Response(String checkpoint, List<List<String>> data) {
+    private record Response(String checkpoint, String sourceSignature, List<List<String>> data) {
     }
 }

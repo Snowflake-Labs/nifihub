@@ -60,9 +60,11 @@ class TestAnonymousTableRefresh {
         assertTrue(call.contains("RETURNS TABLE() LANGUAGE SQL"));
         final String sql = procedureBody(call);
         assertTrue(sql.contains("SELECT ''INSERT''::VARCHAR AS \"TCFIXTURE\", \"K\", \"V\" FROM \"DB\".\"PUBLIC\".\"REF\""));
-        assertTrue(sql.matches("(?s).*data_rows := \\(EXECUTE IMMEDIATE :data_sql\\);\\s*data_id := SQLID;\\s*boundary_id := data_id;.*"));
-        assertTrue(sql.contains("RETURN TABLE(response_rows)"));
-        assertTrue(sql.contains("USING (boundary_id, signature_value, mode, data_id, data_id, data_id)"));
+        final Matcher childBoundary = Pattern.compile("(\\w+) := \\(EXECUTE IMMEDIATE :(\\w+)\\);\\s*(\\w+) := SQLID;\\s*(\\w+) := \\3;").matcher(sql);
+        assertTrue(childBoundary.find(), "the full snapshot checkpoint must be its child query ID");
+        assertTrue(sql.matches("(?s).*RETURN TABLE\\(\\w+\\);.*"));
+        assertTrue(sql.matches("(?s).*USING \\(%s, \\w+, \\w+, %s, %s, %s\\).*"
+                .formatted(childBoundary.group(4), childBoundary.group(3), childBoundary.group(3), childBoundary.group(3))));
         assertTrue(sql.contains("''CONTROL'' AS TCFIXTUREK"));
         assertTrue(sql.contains("''DATA'', NULL::VARCHAR"));
         assertTrue(sql.contains("LEFT JOIN TABLE(RESULT_SCAN(?)) d ON FALSE"));
@@ -70,19 +72,22 @@ class TestAnonymousTableRefresh {
         assertFalse(sql.contains("CURRENT_STATEMENT()"));
         assertFalse(sql.contains("LAST_QUERY_ID()"));
         assertFalse(sql.contains("CHANGES(INFORMATION"));
-        assertTrue(sql.contains("mode VARCHAR DEFAULT 'FULL'"));
+        assertTrue(sql.matches("(?s).*\\w+ VARCHAR DEFAULT 'FULL';.*"));
+        assertFalse(sql.contains("FULL OUTER JOIN"));
+        assertFalse(sql.contains("CURRENT_TIMESTAMP()"), "resumable full reads use the snapshot child, not a diagnostic marker");
     }
 
     @Test
-    void fullOnlySqlReturnsTheSourceDirectlyWithoutExecutingResultScanBranch() {
+    void fullOnlySqlContainsOnlyTheDirectSourceResponse() {
         final String sql = procedureBody(reader().sql(FIELDS, false, "TCFIXTURE", true));
-        assertTrue(sql.contains("mode VARCHAR DEFAULT 'FULL'"));
-        assertTrue(sql.contains("IF (TRUE) THEN"));
-        assertTrue(sql.contains("IF (NOT TRUE) THEN"));
-        assertTrue(sql.contains("EXECUTE IMMEDIATE :full_only_sql USING (boundary_id, signature_value)"));
+        assertTrue(sql.contains("''FULL''::VARCHAR"));
         assertTrue(sql.contains("FULL OUTER JOIN (SELECT 1 AS marker) seed ON FALSE"));
         assertTrue(sql.contains("COUNT(d.\"TCFIXTURE\") OVER ()"));
+        assertEquals(1, sql.split(Pattern.quote("EXECUTE IMMEDIATE"), -1).length - 1, "the full-only source must be read once");
+        assertFalse(sql.contains("RESULT_SCAN"));
         assertFalse(sql.contains("CHANGES(INFORMATION"));
+        assertFalse(sql.contains("IF (TRUE)"));
+        assertFalse(sql.contains("IF (NOT TRUE)"));
     }
 
     @Test
@@ -103,9 +108,12 @@ class TestAnonymousTableRefresh {
         final String sql = procedureBody(reader().sql(FIELDS, true, "TCFIXTURE"));
         assertTrue(sql.contains("CHANGES(INFORMATION => DEFAULT) AT(STATEMENT => ?) END(STATEMENT => ?)"));
         assertTrue(sql.contains("METADATA$ACTION AS \"TCFIXTURE\""));
-        assertTrue(sql.matches("(?s).*SELECT CURRENT_TIMESTAMP\\(\\) INTO :marker_time;\\s*boundary_id := SQLID;.*"));
-        assertTrue(sql.contains("EXECUTE IMMEDIATE :data_sql USING (previous_id, boundary_id)"));
-        assertTrue(sql.contains("mode VARCHAR DEFAULT 'INCREMENTAL'"));
+        final Matcher boundary = Pattern.compile("SELECT CURRENT_TIMESTAMP\\(\\) INTO :(\\w+);\\s*(\\w+) := SQLID;").matcher(sql);
+        assertTrue(boundary.find(), "delta must capture an explicit end statement before reading changes");
+        assertTrue(sql.matches("(?s).*EXECUTE IMMEDIATE :\\w+ USING \\(previous_id, %s\\).*".formatted(boundary.group(2))));
+        assertTrue(sql.matches("(?s).*\\w+ VARCHAR DEFAULT 'INCREMENTAL';.*"));
+        assertFalse(sql.contains("FULL OUTER JOIN"));
+        assertEquals(1, sql.split(Pattern.quote("CHANGES(INFORMATION"), -1).length - 1, "inactive full-only SQL must not duplicate the delta read");
         assertFalse(sql.contains("AT(TIMESTAMP"));
         assertFalse(sql.contains("END(TIMESTAMP"));
     }
@@ -121,10 +129,14 @@ class TestAnonymousTableRefresh {
         assertTrue(sql.contains(SourceMetadata.SIGNATURE));
         assertTrue(sql.contains("CURRENT_ACCOUNT(), CURRENT_USER(), CURRENT_ROLE(), TABLE_TYPE, IS_ICEBERG, IS_DYNAMIC, IS_HYBRID"));
         assertFalse(sql.contains("RETENTION_TIME >= 1"), "capability and retention qualification belong to preflight");
-        assertTrue(sql.contains("IF (expected_signature <> signature_before) THEN"));
-        assertTrue(sql.contains("IF (previous_signature IS NOT NULL AND previous_signature <> signature_before) THEN"));
+        final Matcher expectedSignature = Pattern.compile("IF \\(expected_signature <> (\\w+)\\) THEN\\s*RAISE (\\w+);").matcher(sql);
+        assertTrue(expectedSignature.find(), "the first source check must reject a preflight signature mismatch");
+        assertTrue(sql.matches("(?s).*IF \\(previous_signature IS NOT NULL AND previous_signature <> %s\\) THEN\\s*RAISE %s;.*"
+                .formatted(expectedSignature.group(1), expectedSignature.group(2))));
         assertFalse(sql.contains("previous_id IS NOT NULL"), "full loads must check the saved signature without a query boundary");
-        assertTrue(sql.contains("signature_value <> signature_before"));
+        assertTrue(Pattern.compile("IF \\(\\w+ <> 1 OR (\\w+) IS NULL OR \\1 <> %s\\) THEN\\s*RAISE %s;"
+                .formatted(expectedSignature.group(1), expectedSignature.group(2))).matcher(sql).find(),
+                "the post-read signature must still match the first source check");
         final Matcher sourceQueries = Pattern.compile("SELECT COUNT\\(\\*\\), MAX\\(IFF\\(.*?FROM \\\"DB\\\"\\.INFORMATION_SCHEMA\\.TABLES\\s+WHERE ([^;]+);",
                 Pattern.DOTALL).matcher(sql);
         int sourceQueryCount = 0;
@@ -162,6 +174,7 @@ class TestAnonymousTableRefresh {
                 "DB.%s.%s".formatted(SnowflakeIdentifier.quote(schemaName), SnowflakeIdentifier.quote(tableName)),
                 List.of("K"), List.of("V"), false, true);
         final RefreshResponseConnectionService jdbc = new RefreshResponseConnectionService();
+        jdbc.sourceSignature(signature);
         jdbc.enqueue(response(FIELDS, control(2, FIRST_ID, signature, "FULL", 1L), data("INSERT", "a", "old")));
         jdbc.enqueue(response(FIELDS, control(2, SECOND_ID, signature, "INCREMENTAL", 0L)));
         try (final TableCacheStore store = new HeapTableCacheStore()) {
@@ -196,6 +209,7 @@ class TestAnonymousTableRefresh {
         final String replacementSignature = "replacement-scope";
         final AnonymousTableRefresh refresh = new AnonymousTableRefresh("DB.PUBLIC.REF", List.of("K"), List.of("V"), false, false);
         final RefreshResponseConnectionService jdbc = new RefreshResponseConnectionService();
+        jdbc.sourceSignature(signature);
         jdbc.enqueue(response(FIELDS, control(2, FIRST_ID, signature, "FULL", 1L), data("INSERT", "a", "original")));
         jdbc.enqueueFailure(new SQLException("TABLE_CACHE_SOURCE_CHANGED", "P0001", -20001));
         jdbc.enqueueFailure(new SQLException("Replacement read unavailable", "08006"));
@@ -221,6 +235,7 @@ class TestAnonymousTableRefresh {
             assertEquals(1L, store.size());
             assertEquals("original", store.get("a").orElseThrow().getAsString("V"));
 
+            jdbc.sourceSignature(replacementSignature);
             assertFalse(refresh.reload(jdbc, store).incremental());
             assertNull(jdbc.calls().getLast().parameters().get(1));
             assertNull(jdbc.calls().getLast().parameters().get(2));
@@ -368,7 +383,8 @@ class TestAnonymousTableRefresh {
 
     static Stream<Arguments> closeFailures() {
         return Stream.of("HEAP", "EMBEDDED_KV").flatMap(mode -> Stream.of(false, true).flatMap(delta ->
-                Stream.of("resultSet", "statement", "connection", "metadataResultSet", "metadataStatement").map(resource -> Arguments.of(mode, delta, resource))));
+                Stream.of("resultSet", "statement", "connection", "metadataResultSet", "metadataStatement", "sessionResultSet", "sessionStatement")
+                        .map(resource -> Arguments.of(mode, delta, resource))));
     }
 
     @ParameterizedTest
@@ -385,6 +401,64 @@ class TestAnonymousTableRefresh {
             assertEquals(new CacheCheckpoint(FIRST_ID, SIGNATURE), store.checkpoint());
             assertEquals(1L, store.size());
         }
+        assertTrue(jdbc.resourcesClosed());
+    }
+
+    @Test
+    void metadataSignatureDoesNotDependOnQueuedRefreshResponses() throws Exception {
+        final RefreshResponseConnectionService jdbc = new RefreshResponseConnectionService();
+        jdbc.enqueue(response(FIELDS, control(2, SECOND_ID, "replacement", "FULL", 0L)));
+        try (final Connection connection = jdbc.getConnection()) {
+            assertEquals(SIGNATURE, SourceMetadata.read(connection, List.of("DB", "PUBLIC", "REF"), true).signature());
+            jdbc.sourceSignature("explicit-source");
+            assertEquals("explicit-source", SourceMetadata.read(connection, List.of("DB", "PUBLIC", "REF"), true).signature());
+        }
+        assertEquals(1, jdbc.remainingSteps());
+        assertTrue(jdbc.calls().isEmpty());
+        assertTrue(jdbc.resourcesClosed());
+    }
+
+    static Stream<Arguments> invalidSessionParameters() {
+        return Stream.of(false, true).flatMap(requested -> Stream.of("true", "TRUE", "", "invalid", "0", "null", "missing", "wrongKey", "duplicate")
+                .map(fault -> Arguments.of(requested, fault)));
+    }
+
+    @ParameterizedTest
+    @MethodSource("invalidSessionParameters")
+    void rejectsUnsafeOrUnverifiableIdentifierSettingsBeforeReadingSource(final boolean requested, final String fault) throws Exception {
+        final RefreshResponseConnectionService jdbc = new RefreshResponseConnectionService();
+        jdbc.enqueue(response(FIELDS, control(2, FIRST_ID, SIGNATURE, "FULL", 1L), data("INSERT", "a", "unpublished")));
+        switch (fault) {
+            case "missing" -> jdbc.sessionParameterRows();
+            case "wrongKey" -> jdbc.sessionParameterRows(new Object[]{"UNRELATED_PARAMETER", "false"});
+            case "duplicate" -> jdbc.sessionParameterRows(new Object[]{"QUOTED_IDENTIFIERS_IGNORE_CASE", "false"},
+                    new Object[]{"QUOTED_IDENTIFIERS_IGNORE_CASE", "false"});
+            default -> jdbc.sessionParameterValue("null".equals(fault) ? null : fault);
+        }
+        final AnonymousTableRefresh refresh = new AnonymousTableRefresh("DB.PUBLIC.REF", List.of("K"), List.of("V"), false, requested);
+        try (final TableCacheStore store = new HeapTableCacheStore()) {
+            final SQLException error = assertThrows(SQLException.class, () -> refresh.refresh(jdbc, store, false));
+            assertTrue(error.getMessage().contains("QUOTED_IDENTIFIERS_IGNORE_CASE"));
+            assertFalse(store.isHydrated());
+            assertNull(store.checkpoint());
+        }
+        assertEquals(1, jdbc.sessionCalls().size());
+        assertTrue(jdbc.metadataCalls().isEmpty(), "session qualification must precede source and capability queries");
+        assertTrue(jdbc.calls().isEmpty());
+        assertEquals(1, jdbc.remainingSteps());
+        assertTrue(jdbc.resourcesClosed());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"false", "FALSE"})
+    void sessionGuardMatchesTheParameterKeyNotAnUnrelatedRow(final String value) throws Exception {
+        final RefreshResponseConnectionService jdbc = new RefreshResponseConnectionService();
+        jdbc.sessionParameterRows(new Object[]{"UNRELATED_PARAMETER", "true"}, new Object[]{"QUOTED_IDENTIFIERS_IGNORE_CASE", value});
+        try (final Connection connection = jdbc.getConnection()) {
+            assertEquals(new SourceMetadata(SIGNATURE, true), SourceMetadata.read(connection, List.of("DB", "PUBLIC", "REF"), true));
+        }
+        assertEquals(List.of(new RefreshResponseConnectionService.Call("SHOW PARAMETERS LIKE 'QUOTED_IDENTIFIERS_IGNORE_CASE' IN SESSION", Map.of())),
+                jdbc.sessionCalls());
         assertTrue(jdbc.resourcesClosed());
     }
 
@@ -412,15 +486,17 @@ class TestAnonymousTableRefresh {
         assertEquals(0, jdbc.remainingSteps());
         assertEquals(2, jdbc.connectionCount(), "preflight, optional SHOW and refresh share one connection");
         final boolean needsShow = Set.of("managedIceberg", "dynamicIncremental", "dynamicFull").contains(type);
-        assertEquals("managedIceberg".equals(type) ? 6 : needsShow ? 4 : 2, jdbc.metadataCalls().size());
+        assertEquals(needsShow ? 4 : 2, jdbc.metadataCalls().size(), "one capability SHOW per refresh when required");
+        assertEquals(2, jdbc.sessionCalls().size());
         final RefreshResponseConnectionService.Call call = jdbc.calls().getLast();
         assertEquals(incremental, call.incremental());
         assertEquals(incremental ? FIRST_ID : null, call.parameters().get(1));
         assertEquals(SIGNATURE, call.parameters().get(2));
         assertEquals(SIGNATURE, call.parameters().get(5));
         final String body = procedureBody(call.sql());
-        assertTrue(body.contains("mode VARCHAR DEFAULT '%s'".formatted(incremental ? "INCREMENTAL" : "FULL")));
-        assertTrue(body.contains("IF (%s) THEN".formatted(incremental ? "FALSE" : "TRUE")));
+        assertEquals(incremental, body.contains("CHANGES(INFORMATION => DEFAULT)"));
+        assertEquals(incremental, body.contains("RESULT_SCAN"));
+        assertEquals(!incremental, body.contains("FULL OUTER JOIN"));
         assertTrue(jdbc.resourcesClosed());
     }
 
@@ -587,7 +663,8 @@ class TestAnonymousTableRefresh {
                         () -> SourceMetadata.read(connection, List.of("DB", "PUBLIC", "REF"), requested)).getErrorCode());
             }
         }
-        assertEquals(3, jdbc.metadataCalls().size());
+        assertEquals(2, jdbc.metadataCalls().size(), "catalog and version must come from the same SHOW response");
+        assertEquals(1, jdbc.sessionCalls().size());
         assertTrue(jdbc.calls().isEmpty());
         assertTrue(jdbc.resourcesClosed());
     }
@@ -620,7 +697,7 @@ class TestAnonymousTableRefresh {
         jdbc.enqueueFailure(new SQLException("TABLE_CACHE_SOURCE_CHANGED", "P0001", -20001));
         try (final TableCacheStore store = store(mode)) {
             reader().refresh(jdbc, store, false);
-            jdbc.metadataRows(new Object[]{"BASE TABLE", "NO", "NO", "NO", "NO", 1L, SIGNATURE});
+            jdbc.sourceSignature(SIGNATURE);
             assertEquals(-20001, assertThrows(SQLException.class, () -> reader().refresh(jdbc, store, true)).getErrorCode());
             assertEquals(2, jdbc.calls().size(), "matching preflight must allow the scripted server guard to run");
             assertEquals(0, jdbc.remainingSteps());
@@ -642,8 +719,7 @@ class TestAnonymousTableRefresh {
     void changedPreflightSignatureIsRejectedBeforeAnyCapabilityQuery(final String type, final boolean requested) throws Exception {
         final RefreshResponseConnectionService jdbc = new RefreshResponseConnectionService();
         jdbc.sourceType(type);
-        jdbc.metadataRows(new Object[]{"BASE TABLE", "NO", "managedIceberg".equals(type) ? "YES" : "NO",
-                "dynamicIncremental".equals(type) ? "YES" : "NO", "NO", 1L, "changed-signature"});
+        jdbc.sourceSignature("changed-signature");
         jdbc.capabilityFailure(new SQLException("Capability metadata unavailable", "08006"));
         try (final Connection connection = jdbc.getConnection()) {
             final SQLException error = assertThrows(SQLException.class,
@@ -665,6 +741,7 @@ class TestAnonymousTableRefresh {
         jdbc.enqueue(response(FIELDS, control(2, SECOND_ID, "changed-signature", "FULL", 1L), data("INSERT", "b", "replacement")));
         try (final TableCacheStore store = store(mode)) {
             reader().refresh(jdbc, store, false);
+            jdbc.sourceSignature("changed-signature");
             assertEquals(-20001, assertThrows(SQLException.class, () -> reader().refresh(jdbc, store, true)).getErrorCode());
             assertEquals(1, jdbc.calls().size());
             assertEquals(1, jdbc.remainingSteps());
